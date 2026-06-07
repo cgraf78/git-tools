@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# Create git-absorb fixups, then fold them with a non-interactive autosquash rebase.
+
+set -euo pipefail
+
+_usage() {
+  cat <<'EOF'
+Usage: git absorb-and-rebase [--base <rev>]
+
+Absorb staged changes into earlier commits on the current branch, then
+autosquash the generated fixup commits without opening an editor.
+
+Options:
+  -b, --base <rev>   Rebase from this base instead of deriving one.
+  -h, --help         Show this help.
+EOF
+}
+
+_die() {
+  printf 'git absorb-and-rebase: %s\n' "$*" >&2
+  exit 2
+}
+
+_git_path_exists() {
+  local path
+  path=$(git rev-parse --git-path "$1") || return 1
+  [[ -e "$path" ]]
+}
+
+_has_unmerged_paths() {
+  [[ -n "$(git diff --name-only --diff-filter=U --)" ]]
+}
+
+_ensure_ready() {
+  git rev-parse --git-dir >/dev/null 2>&1 ||
+    _die "not inside a git repository"
+
+  git absorb --version >/dev/null 2>&1 ||
+    _die "git absorb is not installed or not on PATH"
+
+  git symbolic-ref -q --short HEAD >/dev/null ||
+    _die "detached HEAD is not supported; pass through manual git absorb/rebase instead"
+
+  if _git_path_exists rebase-merge || _git_path_exists rebase-apply ||
+    _git_path_exists MERGE_HEAD || _git_path_exists CHERRY_PICK_HEAD ||
+    _git_path_exists REVERT_HEAD; then
+    _die "repository already has an active rebase, merge, cherry-pick, or revert"
+  fi
+
+  if _has_unmerged_paths; then
+    _die "index has unresolved conflicts"
+  fi
+
+  # The index is the user's explicit fixup set. Do not auto-stage here; dirty
+  # worktrees are common, and absorbing unrelated edits rewrites the wrong commits.
+  if ! git diff --cached --quiet --; then
+    return 0
+  fi
+
+  if ! git diff --quiet --; then
+    _die "no staged changes; stage fixes first, then rerun"
+  fi
+  _die "no staged changes to absorb"
+}
+
+_commit() {
+  git rev-parse --verify -q "$1^{commit}" 2>/dev/null
+}
+
+_merge_base() {
+  local base
+  base=$(git merge-base HEAD "$1" 2>/dev/null) || return 1
+  [[ -n "$base" ]] || return 1
+  printf '%s\n' "$base"
+}
+
+_branch_base() {
+  # fork-point handles the common case where an upstream branch was rebased and
+  # Git's reflog can identify the original branch point more accurately than a
+  # plain graph merge-base. Fall back to merge-base for repos without reflogs.
+  git merge-base --fork-point "$1" HEAD 2>/dev/null ||
+    _merge_base "$1"
+}
+
+_base_from_upstream() {
+  local upstream
+  upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) ||
+    return 1
+  [[ -n "$upstream" ]] || return 1
+  _branch_base "$upstream"
+}
+
+_remote_default_candidates() {
+  local remote ref
+
+  printf '%s\n' origin/HEAD
+  while IFS= read -r ref; do
+    case "$ref" in
+      */HEAD) printf '%s\n' "$ref" ;;
+    esac
+  done < <(git for-each-ref --format='%(refname:short)' refs/remotes 2>/dev/null)
+
+  printf '%s\n' origin/main origin/master
+  while IFS= read -r remote; do
+    [[ -n "$remote" ]] || continue
+    printf '%s\n' "$remote/main" "$remote/master"
+  done < <(git remote 2>/dev/null)
+}
+
+_base_from_remote_default() {
+  local candidate seen=$'\n'
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    case "$seen" in
+      *$'\n'"$candidate"$'\n'*) continue ;;
+    esac
+    seen="${seen}${candidate}"$'\n'
+    _commit "$candidate" >/dev/null || continue
+    _branch_base "$candidate" && return 0
+  done < <(_remote_default_candidates)
+  return 1
+}
+
+_base_from_local_default() {
+  local candidate
+  for candidate in main master trunk; do
+    _commit "$candidate" >/dev/null || continue
+    _branch_base "$candidate" && return 0
+  done
+  return 1
+}
+
+_derive_base() {
+  if [[ -n "${_explicit_base:-}" ]]; then
+    _commit "$_explicit_base" ||
+      _die "base is not a commit: $_explicit_base"
+    return 0
+  fi
+
+  _base_from_upstream && return 0
+  _base_from_remote_default && return 0
+  _base_from_local_default && return 0
+
+  _die "could not determine branch base; pass --base <rev>"
+}
+
+_validate_base() {
+  local base="$1"
+  if ! git merge-base --is-ancestor "$base" HEAD; then
+    _die "base is not an ancestor of HEAD: $base"
+  fi
+  if [[ "$base" == "$(git rev-parse HEAD)" ]]; then
+    _die "HEAD is already at the selected base; there are no branch commits to rewrite"
+  fi
+}
+
+_parse_args() {
+  _explicit_base=""
+
+  while (($#)); do
+    case "$1" in
+      -b | --base)
+        local opt="$1"
+        shift
+        (($#)) || _die "$opt requires a value"
+        _explicit_base="$1"
+        shift
+        ;;
+      --base=*)
+        _explicit_base="${1#--base=}"
+        [[ -n "$_explicit_base" ]] || _die "--base requires a value"
+        shift
+        ;;
+      -h | --help)
+        _usage
+        exit 0
+        ;;
+      --)
+        shift
+        (($# == 0)) || _die "unexpected argument: $1"
+        ;;
+      *)
+        _die "unexpected argument: $1"
+        ;;
+    esac
+  done
+}
+
+_parse_args "$@"
+_ensure_ready
+
+_base=$(_derive_base)
+_validate_base "$_base"
+
+printf 'git absorb-and-rebase: base %s\n' "$_base" >&2
+
+_pre_absorb_head=$(git rev-parse HEAD)
+# Keep fixup generation delegated to git-absorb, but collapse all hunks for the
+# same target commit into one fixup so the autosquash step stays predictable.
+git absorb --one-fixup-per-commit --base "$_base"
+_post_absorb_head=$(git rev-parse HEAD)
+
+if ! git diff --cached --quiet --; then
+  if [[ "$_post_absorb_head" != "$_pre_absorb_head" ]]; then
+    # Partial absorption is worse than no absorption: autosquashing would rewrite
+    # history while unrelated staged changes ride along. Restore the pre-command
+    # HEAD and leave the user's original staged fixes intact for manual handling.
+    git reset --soft "$_pre_absorb_head"
+  fi
+  _die "git absorb did not absorb all staged changes; staged changes remain"
+fi
+
+if [[ "$_post_absorb_head" == "$_pre_absorb_head" ]]; then
+  printf 'git absorb-and-rebase: no fixup commits created; skipping rebase\n' >&2
+  exit 0
+fi
+
+# Autosquash is implemented by interactive rebase, but this command is meant to
+# be deterministic and non-editor-driven. Accept Git's generated todo as-is.
+GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash --autostash "$_base"

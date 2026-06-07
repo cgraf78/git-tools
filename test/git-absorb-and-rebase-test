@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_eq() {
+  local name="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %q\n' "$expected" >&2
+    printf '  actual:   %q\n' "$actual" >&2
+  fi
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_git_init() {
+  local repo="$1"
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+}
+
+_commit_file() {
+  local repo="$1"
+  local path="$2"
+  local content="$3"
+  local message="$4"
+
+  mkdir -p "$(dirname "$repo/$path")"
+  printf '%s\n' "$content" >"$repo/$path"
+  git -C "$repo" add "$path"
+  git -C "$repo" commit -m "$message" >/dev/null
+}
+
+echo "=== git absorb-and-rebase ==="
+
+if ! git absorb --version >/dev/null 2>&1; then
+  missing_repo=$(_tmpdir)
+  _git_init "$missing_repo"
+  _commit_file "$missing_repo" README.md base base
+  printf 'base fixed\n' >"$missing_repo/README.md"
+  git -C "$missing_repo" add README.md
+  result=$(git -C "$missing_repo" absorb-and-rebase 2>&1 || true)
+  _assert_contains "reports missing git absorb" \
+    "git absorb is not installed or not on PATH" "$result"
+else
+  repo=$(_tmpdir)
+  remote=$(_tmpdir)
+  git init --bare --initial-branch=main "$remote" >/dev/null
+  _git_init "$repo"
+  _commit_file "$repo" README.md base base
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -u origin main >/dev/null 2>&1
+  git -C "$repo" checkout -b feature >/dev/null 2>&1
+  _commit_file "$repo" app.txt alpha "add app"
+  _commit_file "$repo" other.txt beta "add other"
+  printf 'alpha fixed\n' >"$repo/app.txt"
+  git -C "$repo" add app.txt
+  result=$(GIT_SEQUENCE_EDITOR=false git -C "$repo" absorb-and-rebase 2>&1)
+  _assert_contains "derives branch base" "git absorb-and-rebase: base " "$result"
+  result=$(git -C "$repo" log --format=%s --reverse origin/main..HEAD)
+  expected="$(printf 'add app\nadd other')"
+  _assert_eq "autosquashes fixup commits" "$expected" "$result"
+  result=$(git -C "$repo" show HEAD~1:app.txt)
+  _assert_eq "folds staged fix into target commit" "alpha fixed" "$result"
+  result=$(git -C "$repo" absorb-and-rebase 2>&1 || true)
+  _assert_contains "refuses with no staged changes" \
+    "no staged changes to absorb" "$result"
+
+  remote_repo=$(_tmpdir)
+  non_origin_remote=$(_tmpdir)
+  git init --bare --initial-branch=main "$non_origin_remote" >/dev/null
+  _git_init "$remote_repo"
+  _commit_file "$remote_repo" README.md base base
+  git -C "$remote_repo" remote add upstream "$non_origin_remote"
+  git -C "$remote_repo" push upstream main >/dev/null 2>&1
+  git -C "$remote_repo" checkout -b feature >/dev/null 2>&1
+  _commit_file "$remote_repo" remote.txt "remote alpha" "add remote file"
+  printf 'remote alpha fixed\n' >"$remote_repo/remote.txt"
+  git -C "$remote_repo" add remote.txt
+  result=$(GIT_SEQUENCE_EDITOR=false git -C "$remote_repo" absorb-and-rebase 2>&1)
+  _assert_contains "derives non-origin remote base" \
+    "git absorb-and-rebase: base " "$result"
+  result=$(git -C "$remote_repo" log --format=%s --reverse upstream/main..HEAD)
+  _assert_eq "autosquashes with non-origin remote" "add remote file" "$result"
+
+  local_repo=$(_tmpdir)
+  _git_init "$local_repo"
+  _commit_file "$local_repo" README.md base base
+  git -C "$local_repo" checkout -b feature >/dev/null 2>&1
+  _commit_file "$local_repo" local.txt "local alpha" "add local file"
+  printf 'local alpha fixed\n' >"$local_repo/local.txt"
+  git -C "$local_repo" add local.txt
+  result=$(GIT_SEQUENCE_EDITOR=false git -C "$local_repo" absorb-and-rebase 2>&1)
+  _assert_contains "derives local default branch base" \
+    "git absorb-and-rebase: base " "$result"
+  result=$(git -C "$local_repo" log --format=%s --reverse main..HEAD)
+  _assert_eq "autosquashes with local default branch" "add local file" "$result"
+
+  printf 'new\n' >"$repo/new.txt"
+  git -C "$repo" add new.txt
+  result=$(git -C "$repo" absorb-and-rebase 2>&1 || true)
+  _assert_contains "fails when absorb leaves staged changes" \
+    "staged changes remain" "$result"
+
+  partial_repo=$(_tmpdir)
+  _git_init "$partial_repo"
+  _commit_file "$partial_repo" README.md base base
+  partial_base=$(git -C "$partial_repo" rev-parse HEAD)
+  _commit_file "$partial_repo" app.txt alpha "add app"
+  printf 'alpha fixed\n' >"$partial_repo/app.txt"
+  printf 'new\n' >"$partial_repo/new.txt"
+  git -C "$partial_repo" add app.txt new.txt
+  result=$(
+    git -C "$partial_repo" absorb-and-rebase --base "$partial_base" 2>&1 || true
+  )
+  _assert_contains "rejects partial absorption" \
+    "did not absorb all staged changes" "$result"
+  result=$(git -C "$partial_repo" log --format=%s -1)
+  _assert_eq "rolls back partial fixup commits" "add app" "$result"
+  result=$(git -C "$partial_repo" diff --cached --name-only)
+  expected="$(printf 'app.txt\nnew.txt')"
+  _assert_eq "keeps original staged changes after rollback" "$expected" "$result"
+fi
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

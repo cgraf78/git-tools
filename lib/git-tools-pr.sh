@@ -55,6 +55,12 @@ gt_pr_view_tsv() {
     --jq '[.number,.state,.isDraft,.mergeStateStatus,.headRefName,.baseRefName,.url,.title] | @tsv'
 }
 
+gt_pr_list_open_tsv() {
+  gh pr list --state open --limit 200 \
+    --json number,state,isDraft,mergeStateStatus,headRefName,baseRefName,url,title \
+    --jq '.[] | [.number,.state,.isDraft,.mergeStateStatus,.headRefName,.baseRefName,.url,.title] | @tsv'
+}
+
 gt_pr_checks_status() {
   local target="$1"
   local output status

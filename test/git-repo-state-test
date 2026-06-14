@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_git_init() {
+  local repo="$1"
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+  printf 'base\n' >"$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m base >/dev/null
+}
+
+_write_gh_stub() {
+  local bin="$1/gh"
+  cat >"$bin" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$1 $2" == "auth status" ]]; then
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr view" ]]; then
+  printf '7\tOPEN\tfalse\tCLEAN\tfeature/state\tmain\thttps://example/pr/7\tState PR\n'
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr checks" ]]; then
+  printf '{"pass":2}\n'
+  exit 0
+fi
+
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 99
+EOF
+  chmod +x "$bin"
+}
+
+_write_unauthenticated_gh_stub() {
+  local bin="$1/gh"
+  cat >"$bin" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$1 $2" == "auth status" ]]; then
+  exit 1
+fi
+
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 99
+EOF
+  chmod +x "$bin"
+}
+
+echo "=== git repo-state ==="
+
+repo=$(_tmpdir)
+bin_dir=$(_tmpdir)
+_git_init "$repo"
+_write_gh_stub "$bin_dir"
+
+git -C "$repo" switch -q -c feature/state
+git -C "$repo" branch --set-upstream-to main >/dev/null
+printf 'changed\n' >>"$repo/README.md"
+printf 'new\n' >"$repo/new.txt"
+git -C "$repo" stash push -u -m state-test >/dev/null
+
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" repo-state --porcelain 2>&1)
+_assert_contains "porcelain includes branch" "branch=feature/state" "$result"
+_assert_contains "porcelain includes default branch" "default=main" "$result"
+_assert_contains "porcelain includes upstream" "upstream=main" "$result"
+_assert_contains "porcelain reports clean after stash" "dirty=false" "$result"
+_assert_contains "porcelain includes stash count" "stashes=1" "$result"
+_assert_contains "porcelain includes PR number" "pr_number=7" "$result"
+_assert_contains "porcelain includes PR checks" "pr_checks=pass" "$result"
+
+printf 'again\n' >>"$repo/README.md"
+printf 'other\n' >"$repo/other.txt"
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" repo-state 2>&1)
+_assert_contains "human reports dirty worktree" "worktree: dirty" "$result"
+_assert_contains "human reports PR" "pr: #7 main -> feature/state checks=pass" "$result"
+
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" repo-state --json 2>&1)
+_assert_contains "json includes dirty boolean" '"dirty":true' "$result"
+_assert_contains "json includes PR URL" '"pr_url":"https://example/pr/7"' "$result"
+
+unauthenticated_gh=$(_tmpdir)
+_write_unauthenticated_gh_stub "$unauthenticated_gh"
+result=$(PATH="$unauthenticated_gh:$PATH" git -C "$repo" repo-state --porcelain 2>&1)
+_assert_contains "works without authenticated gh" "pr_available=false" "$result"
+
+outside=$(_tmpdir)
+result=$(PATH="$bin_dir:$PATH" git -C "$outside" repo-state 2>&1 || true)
+_assert_contains "requires git repo" "not inside a git repository" "$result"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

@@ -75,6 +75,21 @@ git pr-land 123 --keep-branch
 The default merge method is `squash`. The command refuses draft PRs, merge
 conflicts, and non-passing checks.
 
+### `git pr-land-stack`
+
+Lands a linear stack of ready GitHub PRs from parent to child.
+
+```sh
+git pr-land-stack 123
+git pr-land-stack 123 --method merge
+git pr-land-stack 123 --dry-run
+```
+
+The command composes `git pr-stack`, `git pr-land`, and `git pr-restack`. It
+refuses the whole stack before merging anything if any PR is not ready. As each
+parent lands, the next child is restacked onto the root base branch before it is
+landed.
+
 ### `git cleanup-repo`
 
 Fetches and prunes the remote, updates the repository's default branch, then
@@ -158,6 +173,7 @@ commands are invoked as:
 git cleanup-repo
 git absorb-and-rebase
 git pr-land
+git pr-land-stack
 git pr-ready
 git pr-restack
 git pr-stack
@@ -185,6 +201,7 @@ Or run the focused command test directly:
 test/git-absorb-and-rebase-test
 test/git-cleanup-repo-test
 test/git-pr-land-test
+test/git-pr-land-stack-test
 test/git-pr-ready-test
 test/git-pr-restack-test
 test/git-pr-stack-test

@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_git_init() {
+  local repo="$1"
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+  printf 'base\n' >"$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m base >/dev/null
+}
+
+_write_gh_stub() {
+  local bin="$1/gh"
+  cat >"$bin" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$1 $2" == "auth status" ]]; then
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr list" ]]; then
+  case "${GH_STACK_CASE:-linear}" in
+    linear)
+      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\tmain\thttps://example/pr/1\tParent PR\n'
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\tfeature/a\thttps://example/pr/2\tMiddle PR\n'
+      printf '3\tOPEN\tfalse\tCLEAN\tfeature/c\tfeature/b\thttps://example/pr/3\tChild PR\n'
+      ;;
+    branched)
+      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\tmain\thttps://example/pr/1\tParent PR\n'
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\tfeature/a\thttps://example/pr/2\tChild A\n'
+      printf '3\tOPEN\tfalse\tCLEAN\tfeature/c\tfeature/a\thttps://example/pr/3\tChild B\n'
+      ;;
+  esac
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr view" ]]; then
+  target=""
+  if [[ "${3:-}" != --* ]]; then
+    target="${3:-}"
+  fi
+  case "${target:-2}" in
+    1 | feature/a)
+      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\tmain\thttps://example/pr/1\tParent PR\n'
+      ;;
+    2 | feature/b | "")
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\tfeature/a\thttps://example/pr/2\tMiddle PR\n'
+      ;;
+    3 | feature/c)
+      printf '3\tOPEN\tfalse\tCLEAN\tfeature/c\tfeature/b\thttps://example/pr/3\tChild PR\n'
+      ;;
+  esac
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr checks" ]]; then
+  if [[ "${GH_NO_CHECKS_FOR:-}" == "${3:-}" ]]; then
+    printf "no checks reported on the 'feature/%s' branch\n" "${3:-unknown}"
+    exit 1
+  fi
+  case "${3:-}" in
+    3) printf '{"pass":1,"pending":1}\n'; exit 8 ;;
+    *) printf '{"pass":2}\n' ;;
+  esac
+  exit 0
+fi
+
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 99
+EOF
+  chmod +x "$bin"
+}
+
+echo "=== git pr-stack ==="
+
+repo=$(_tmpdir)
+bin_dir=$(_tmpdir)
+_git_init "$repo"
+_write_gh_stub "$bin_dir"
+
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-stack 2>&1)
+_assert_contains "prints parent first" "1. #1 main -> feature/a" "$result"
+_assert_contains "prints middle PR" "2. #2 feature/a -> feature/b" "$result"
+_assert_contains "prints child PR" "3. #3 feature/b -> feature/c" "$result"
+_assert_contains "reports child readiness" "not ready: checks pending" "$result"
+
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-stack 2 --porcelain 2>&1)
+_assert_contains "porcelain includes parent record" \
+  $'pr\t0\t1\tmain\tfeature/a\ttrue\tready\tpass' "$result"
+_assert_contains "porcelain includes pending child" \
+  $'pr\t2\t3\tfeature/b\tfeature/c\tfalse\tchecks pending\tpending' "$result"
+
+result=$(GH_NO_CHECKS_FOR=2 PATH="$bin_dir:$PATH" git -C "$repo" pr-stack 2 --porcelain 2>&1)
+_assert_contains "porcelain includes no-checks state" \
+  $'pr\t1\t2\tfeature/a\tfeature/b\tfalse\tchecks none\tnone' "$result"
+
+result=$(GH_STACK_CASE=branched PATH="$bin_dir:$PATH" git -C "$repo" pr-stack 1 2>&1 || true)
+_assert_contains "rejects branched stacks" "stack is branched at feature/a" "$result"
+
+outside=$(_tmpdir)
+result=$(PATH="$bin_dir:$PATH" git -C "$outside" pr-stack 2>&1 || true)
+_assert_contains "requires git repo" "not inside a git repository" "$result"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

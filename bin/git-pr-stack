@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# Print a linear GitHub pull-request stack in parent-to-child order.
+
+set -euo pipefail
+
+# shellcheck disable=SC2034 # consumed by lib/git-tools-pr.sh after dynamic source
+gt_command="git pr-stack"
+
+_script_path="${BASH_SOURCE[0]}"
+while [[ -L "$_script_path" ]]; do
+  _script_dir=$(cd -P -- "$(dirname -- "$_script_path")" && pwd)
+  _link=$(readlink "$_script_path")
+  case "$_link" in
+    /*) _script_path="$_link" ;;
+    *) _script_path="$_script_dir/$_link" ;;
+  esac
+done
+_root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-pr.sh"
+
+_usage() {
+  cat <<'EOF'
+Usage: git pr-stack [options] [<number|url|branch>]
+
+Discover the linear GitHub pull-request stack connected to a target PR and print
+it in parent-to-child order. Without a target, uses the PR for the current
+branch. A stack is connected when one PR's base branch is another PR's head
+branch.
+
+Options:
+      --porcelain   Print one stable tab-separated record per PR.
+  -h, --help        Show this help.
+
+Exit status:
+  0  Stack printed.
+  1  Stack could not be read or is branched.
+  2  Usage or local environment error.
+EOF
+}
+
+_target=""
+_porcelain=0
+
+while (($#)); do
+  case "$1" in
+    --porcelain)
+      _porcelain=1
+      shift
+      ;;
+    -h | --help)
+      _usage
+      exit 0
+      ;;
+    --)
+      shift
+      (($# <= 1)) || gt_usage_error "expected at most one target"
+      _target="${1:-}"
+      break
+      ;;
+    -*)
+      gt_usage_error "unexpected option: $1"
+      ;;
+    *)
+      [[ -z "$_target" ]] || gt_usage_error "expected at most one target"
+      _target="$1"
+      shift
+      ;;
+  esac
+done
+
+_number() {
+  local number _rest
+  IFS=$'\t' read -r number _rest <<<"$1"
+  printf '%s\n' "$number"
+}
+
+_state() {
+  local number state _rest
+  IFS=$'\t' read -r number state _rest <<<"$1"
+  printf '%s\n' "$state"
+}
+
+_draft() {
+  local number state draft _rest
+  IFS=$'\t' read -r number state draft _rest <<<"$1"
+  printf '%s\n' "$draft"
+}
+
+_merge_state() {
+  local number state draft merge_state _rest
+  IFS=$'\t' read -r number state draft merge_state _rest <<<"$1"
+  printf '%s\n' "$merge_state"
+}
+
+_head() {
+  local number state draft merge_state head _rest
+  IFS=$'\t' read -r number state draft merge_state head _rest <<<"$1"
+  printf '%s\n' "$head"
+}
+
+_base() {
+  local number state draft merge_state head base _rest
+  IFS=$'\t' read -r number state draft merge_state head base _rest <<<"$1"
+  printf '%s\n' "$base"
+}
+
+_url() {
+  local number state draft merge_state head base url _rest
+  IFS=$'\t' read -r number state draft merge_state head base url _rest <<<"$1"
+  printf '%s\n' "$url"
+}
+
+_title() {
+  local number state draft merge_state head base url title
+  IFS=$'\t' read -r number state draft merge_state head base url title <<<"$1"
+  printf '%s\n' "$title"
+}
+
+_find_by_number() {
+  local want="$1"
+  local record
+  for record in "${_prs[@]}"; do
+    [[ "$(_number "$record")" == "$want" ]] || continue
+    printf '%s\n' "$record"
+    return 0
+  done
+  return 1
+}
+
+_find_by_head() {
+  local want="$1"
+  local record
+  for record in "${_prs[@]}"; do
+    [[ "$(_head "$record")" == "$want" ]] || continue
+    printf '%s\n' "$record"
+    return 0
+  done
+  return 1
+}
+
+_parent_of() {
+  local record="$1"
+  _find_by_head "$(_base "$record")"
+}
+
+_child_of() {
+  local record="$1"
+  local child_base
+  local found="" count=0 candidate
+
+  child_base=$(_head "$record")
+  for candidate in "${_prs[@]}"; do
+    [[ "$(_base "$candidate")" == "$child_base" ]] || continue
+    found="$candidate"
+    count=$((count + 1))
+  done
+
+  if ((count > 1)); then
+    gt_die "stack is branched at $child_base; multiple child PRs found"
+  fi
+  [[ "$count" == 1 ]] || return 1
+  printf '%s\n' "$found"
+}
+
+_append_stack() {
+  _stack+=("$1")
+}
+
+_prepend_stack() {
+  local record="$1"
+  _stack=("$record" "${_stack[@]}")
+}
+
+_record_ready() {
+  local record="$1"
+  local checks checks_state
+
+  checks=$(gt_pr_checks_status "$(_number "$record")") || return 1
+  checks_state=$(gt_checks_ready_state "$checks")
+
+  if [[ "$(_state "$record")" != "OPEN" ]]; then
+    printf 'false\tstate %s\t%s\n' "$(_state "$record")" "$checks_state"
+  elif gt_bool "$(_draft "$record")"; then
+    printf 'false\tdraft\t%s\n' "$checks_state"
+  elif [[ "$(_merge_state "$record")" != "CLEAN" ]]; then
+    printf 'false\tmerge state %s\t%s\n' "$(_merge_state "$record")" "$checks_state"
+  elif [[ "$checks_state" != "pass" ]]; then
+    printf 'false\tchecks %s\t%s\n' "$checks_state" "$checks_state"
+  else
+    printf 'true\tready\t%s\n' "$checks_state"
+  fi
+}
+
+gt_require_repo
+gt_require_gh
+
+_prs=()
+while IFS= read -r _record; do
+  [[ -n "$_record" ]] || continue
+  _prs+=("$_record")
+done < <(gt_pr_list_open_tsv)
+
+((${#_prs[@]} > 0)) || gt_die "no open pull requests found"
+
+_target_view=$(gt_pr_view_tsv "$_target") || gt_die "could not read target pull request"
+_target_number=$(_number "$_target_view")
+_current=$(_find_by_number "$_target_number") ||
+  gt_die "target PR #$_target_number is not open"
+
+_stack=("$_current")
+
+while _parent=$(_parent_of "${_stack[0]}"); do
+  _prepend_stack "$_parent"
+done
+
+while _child=$(_child_of "${_stack[${#_stack[@]} - 1]}"); do
+  _append_stack "$_child"
+done
+
+_index=0
+for _record in "${_stack[@]}"; do
+  _ready_info=$(_record_ready "$_record") || gt_die "could not read PR checks"
+  IFS=$'\t' read -r _ready _reason _checks_state <<<"$_ready_info"
+
+  if [[ "$_porcelain" == 1 ]]; then
+    printf 'pr\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$_index" "$(_number "$_record")" "$(_base "$_record")" "$(_head "$_record")" \
+      "$_ready" "$_reason" "$_checks_state" "$(_url "$_record")"
+  else
+    printf '%s. #%s %s -> %s checks=%s ready=%s\n' \
+      "$((_index + 1))" "$(_number "$_record")" "$(_base "$_record")" \
+      "$(_head "$_record")" "$_checks_state" "$_ready"
+    printf '   %s\n' "$(_title "$_record")"
+    if [[ "$_ready" != true ]]; then
+      printf '   not ready: %s\n' "$_reason"
+    fi
+  fi
+  _index=$((_index + 1))
+done

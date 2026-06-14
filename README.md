@@ -45,6 +45,21 @@ git pr-checks --porcelain
 The command returns `0` when checks pass, `8` while checks are pending, and `1`
 when checks fail, are cancelled, or are missing.
 
+### `git repo-state`
+
+Prints a read-only repository workflow report: current branch, default branch,
+upstream divergence, dirty worktree counts, active operation, stash count, and
+current-branch PR details when GitHub data is available.
+
+```sh
+git repo-state
+git repo-state --porcelain
+git repo-state --json
+```
+
+The command does not require GitHub access. If `gh` is unavailable or
+unauthenticated, local repository state is still reported.
+
 ### `git pr-stack`
 
 Discovers the linear GitHub PR stack connected to a target PR and prints it in
@@ -197,6 +212,7 @@ git pr-land-stack
 git pr-ready
 git pr-restack
 git pr-stack
+git repo-state
 ```
 
 For a simple local install:

@@ -1,0 +1,38 @@
+.TH GIT-REPO-STATE 1 "2026-06-14" "git-tools" "User Commands"
+.SH NAME
+git-repo-state \- report repository workflow state
+.SH SYNOPSIS
+.B git repo-state
+.RI [ options ]
+.SH DESCRIPTION
+.B git repo-state
+prints a read-only repository state report: current branch, inferred default
+branch, upstream divergence, dirty worktree counts, active operation, stash
+count, and current branch pull request details when GitHub data is available.
+.PP
+The command does not require GitHub access. If
+.B gh
+is unavailable or unauthenticated, local repository state is still reported and
+pull request fields are left empty.
+.SH OPTIONS
+.TP
+.B \-\-porcelain
+Print stable
+.B key=value
+output for scripts.
+.TP
+.B \-\-json
+Print a flat JSON object.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH EXIT STATUS
+.TP
+.B 0
+State printed.
+.TP
+.B 2
+Usage or local environment error.
+.SH SEE ALSO
+.BR git-pr-checks (1),
+.BR git-cleanup-repo (1)

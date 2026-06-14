@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# Report local repository state in a shape optimized for workflow automation.
+
+set -euo pipefail
+
+# shellcheck disable=SC2034 # consumed by lib/git-tools-pr.sh after dynamic source
+gt_command="git repo-state"
+
+_script_path="${BASH_SOURCE[0]}"
+while [[ -L "$_script_path" ]]; do
+  _script_dir=$(cd -P -- "$(dirname -- "$_script_path")" && pwd)
+  _link=$(readlink "$_script_path")
+  case "$_link" in
+    /*) _script_path="$_link" ;;
+    *) _script_path="$_script_dir/$_link" ;;
+  esac
+done
+_root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-pr.sh"
+
+_usage() {
+  cat <<'EOF'
+Usage: git repo-state [options]
+
+Print a read-only repository state report: branch, default branch, upstream
+divergence, dirty worktree counts, active operation, stashes, and current branch
+pull request details when GitHub data is available.
+
+Options:
+      --porcelain   Print stable key=value output.
+      --json        Print a flat JSON object.
+  -h, --help        Show this help.
+
+Exit status:
+  0  State printed.
+  2  Usage or local environment error.
+EOF
+}
+
+_format=human
+
+while (($#)); do
+  case "$1" in
+    --porcelain)
+      _format=porcelain
+      shift
+      ;;
+    --json)
+      _format=json
+      shift
+      ;;
+    -h | --help)
+      _usage
+      exit 0
+      ;;
+    -*)
+      gt_usage_error "unexpected option: $1"
+      ;;
+    *)
+      gt_usage_error "unexpected argument: $1"
+      ;;
+  esac
+done
+
+_default_branch() {
+  local ref
+
+  ref=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)
+  if [[ -n "$ref" ]]; then
+    printf '%s\n' "${ref#origin/}"
+    return 0
+  fi
+
+  for ref in origin/main origin/master origin/trunk; do
+    if git show-ref --verify --quiet "refs/remotes/$ref"; then
+      printf '%s\n' "${ref#origin/}"
+      return 0
+    fi
+  done
+
+  for ref in main master trunk; do
+    if git show-ref --verify --quiet "refs/heads/$ref"; then
+      printf '%s\n' "$ref"
+      return 0
+    fi
+  done
+
+  printf 'unknown\n'
+}
+
+_operation() {
+  local git_dir="$1"
+
+  if [[ -d "$git_dir/rebase-merge" || -d "$git_dir/rebase-apply" ]]; then
+    printf 'rebase\n'
+  elif [[ -f "$git_dir/MERGE_HEAD" ]]; then
+    printf 'merge\n'
+  elif [[ -f "$git_dir/CHERRY_PICK_HEAD" ]]; then
+    printf 'cherry-pick\n'
+  elif [[ -f "$git_dir/REVERT_HEAD" ]]; then
+    printf 'revert\n'
+  else
+    printf 'none\n'
+  fi
+}
+
+_count_status() {
+  _dirty=false
+  _staged=0
+  _unstaged=0
+  _untracked=0
+
+  while IFS= read -r _line; do
+    [[ -n "$_line" ]] || continue
+    _dirty=true
+    case "$_line" in
+      '??'*)
+        _untracked=$((_untracked + 1))
+        ;;
+      *)
+        _x=${_line:0:1}
+        _y=${_line:1:1}
+        [[ "$_x" == " " ]] || _staged=$((_staged + 1))
+        [[ "$_y" == " " ]] || _unstaged=$((_unstaged + 1))
+        ;;
+    esac
+  done < <(git status --porcelain)
+}
+
+_upstream_state() {
+  _upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+  _ahead=""
+  _behind=""
+
+  if [[ -n "$_upstream" ]]; then
+    _counts=$(git rev-list --left-right --count "$_upstream"...HEAD 2>/dev/null || true)
+    if [[ -n "$_counts" ]]; then
+      read -r _behind _ahead <<<"$_counts"
+    fi
+  fi
+}
+
+_stash_count() {
+  git stash list 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' '
+}
+
+_try_pr_state() {
+  _pr_available=false
+  _pr_number=""
+  _pr_head=""
+  _pr_base=""
+  _pr_url=""
+  _pr_checks=""
+
+  command -v gh >/dev/null 2>&1 || return 0
+  gh auth status >/dev/null 2>&1 || return 0
+
+  _view=$(gt_pr_view_tsv "" 2>/dev/null || true)
+  [[ -n "$_view" ]] || return 0
+  IFS=$'\t' read -r _pr_number _pr_state _pr_draft _pr_merge_state _pr_head _pr_base _pr_url _pr_title <<<"$_view"
+  _pr_available=true
+
+  _checks=$(gt_pr_checks_status "$_pr_number" 2>/dev/null || true)
+  if [[ -n "$_checks" ]]; then
+    _pr_checks=$(gt_checks_ready_state "$_checks")
+  fi
+}
+
+_json_escape() {
+  # Strings are short status fields, paths, branch names, and URLs. Escaping the
+  # JSON metacharacters here keeps --json dependency-free and portable to macOS.
+  printf '%s' "$1" |
+    sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g'
+}
+
+_json_string() {
+  printf '"%s"' "$(_json_escape "$1")"
+}
+
+_print_human() {
+  printf 'repo: %s\n' "$_repo_root"
+  printf 'branch: %s\n' "$_branch"
+  printf 'default: %s\n' "$_default"
+  if [[ -n "$_upstream" ]]; then
+    printf 'upstream: %s ahead=%s behind=%s\n' "$_upstream" "$_ahead" "$_behind"
+  else
+    printf 'upstream: none\n'
+  fi
+  printf 'worktree: %s staged=%s unstaged=%s untracked=%s\n' \
+    "$([[ "$_dirty" == true ]] && printf dirty || printf clean)" \
+    "$_staged" "$_unstaged" "$_untracked"
+  printf 'operation: %s\n' "$_operation"
+  printf 'stashes: %s\n' "$_stashes"
+  if [[ "$_pr_available" == true ]]; then
+    printf 'pr: #%s %s -> %s checks=%s\n' "$_pr_number" "$_pr_base" "$_pr_head" "${_pr_checks:-unknown}"
+    printf 'url: %s\n' "$_pr_url"
+  else
+    printf 'pr: none\n'
+  fi
+}
+
+_print_porcelain() {
+  printf 'repo=%s\n' "$_repo_root"
+  printf 'branch=%s\n' "$_branch"
+  printf 'default=%s\n' "$_default"
+  printf 'upstream=%s\n' "$_upstream"
+  printf 'ahead=%s\n' "$_ahead"
+  printf 'behind=%s\n' "$_behind"
+  printf 'dirty=%s\n' "$_dirty"
+  printf 'staged=%s\n' "$_staged"
+  printf 'unstaged=%s\n' "$_unstaged"
+  printf 'untracked=%s\n' "$_untracked"
+  printf 'operation=%s\n' "$_operation"
+  printf 'stashes=%s\n' "$_stashes"
+  printf 'pr_available=%s\n' "$_pr_available"
+  printf 'pr_number=%s\n' "$_pr_number"
+  printf 'pr_base=%s\n' "$_pr_base"
+  printf 'pr_head=%s\n' "$_pr_head"
+  printf 'pr_checks=%s\n' "$_pr_checks"
+  printf 'pr_url=%s\n' "$_pr_url"
+}
+
+_print_json() {
+  printf '{'
+  printf '"repo":'; _json_string "$_repo_root"
+  printf ',"branch":'; _json_string "$_branch"
+  printf ',"default":'; _json_string "$_default"
+  printf ',"upstream":'; _json_string "$_upstream"
+  printf ',"ahead":%s' "${_ahead:-0}"
+  printf ',"behind":%s' "${_behind:-0}"
+  printf ',"dirty":%s' "$_dirty"
+  printf ',"staged":%s' "$_staged"
+  printf ',"unstaged":%s' "$_unstaged"
+  printf ',"untracked":%s' "$_untracked"
+  printf ',"operation":'; _json_string "$_operation"
+  printf ',"stashes":%s' "$_stashes"
+  printf ',"pr_available":%s' "$_pr_available"
+  printf ',"pr_number":'; _json_string "$_pr_number"
+  printf ',"pr_base":'; _json_string "$_pr_base"
+  printf ',"pr_head":'; _json_string "$_pr_head"
+  printf ',"pr_checks":'; _json_string "$_pr_checks"
+  printf ',"pr_url":'; _json_string "$_pr_url"
+  printf '}\n'
+}
+
+gt_require_repo
+
+_repo_root=$(git rev-parse --show-toplevel)
+_git_dir=$(git rev-parse --git-dir)
+_branch=$(git symbolic-ref -q --short HEAD 2>/dev/null || printf 'DETACHED')
+_default=$(_default_branch)
+_operation=$(_operation "$_git_dir")
+_stashes=$(_stash_count)
+
+_count_status
+_upstream_state
+_try_pr_state
+
+case "$_format" in
+  human) _print_human ;;
+  porcelain) _print_porcelain ;;
+  json) _print_json ;;
+esac

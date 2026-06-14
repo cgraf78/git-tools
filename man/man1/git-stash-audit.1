@@ -1,0 +1,64 @@
+.TH GIT-STASH-AUDIT 1 "2026-06-14" "git-tools" "User Commands"
+.SH NAME
+git-stash-audit \- inspect and clean git stashes
+.SH SYNOPSIS
+.B git stash-audit
+.RI [ options ]
+.SH DESCRIPTION
+.B git stash-audit
+lists stashes, shows one stash, drops one explicit stash, or drops stashes whose
+origin branch can be inferred and no longer exists locally.
+.PP
+Obsolete classification is intentionally conservative. A stash is considered
+obsolete only when its subject identifies an origin branch in Git's normal
+.B "On <branch>:"
+or
+.B "WIP on <branch>:"
+format and that local branch no longer exists.
+.SH OPTIONS
+.TP
+.B \-\-porcelain
+Print stable tab-separated
+.B stash
+records.
+.TP
+.BI "\-\-show " index
+Show one stash by numeric index.
+.TP
+.B \-\-patch
+Show a patch with
+.B \-\-show
+instead of a stat summary.
+.TP
+.BI "\-\-drop " index
+Drop one stash by numeric index.
+.TP
+.B \-\-drop-obsolete
+Drop stashes whose inferred local branch is gone. Requires
+.B \-\-yes
+unless
+.B \-\-dry-run
+is also used.
+.TP
+.B \-\-yes
+Confirm
+.BR \-\-drop-obsolete .
+.TP
+.BR \-n ", " \-\-dry-run
+Print drop actions without changing anything.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH EXIT STATUS
+.TP
+.B 0
+Audit or cleanup completed.
+.TP
+.B 1
+Stash operation failed.
+.TP
+.B 2
+Usage or local environment error.
+.SH SEE ALSO
+.BR git-stash (1),
+.BR git-repo-state (1)

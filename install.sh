@@ -23,6 +23,7 @@ COMMANDS=(
   git-pr-stack
   git-pr-sync-stack
   git-repo-state
+  git-stash-audit
 )
 
 mkdir -p "$BIN_DIR"

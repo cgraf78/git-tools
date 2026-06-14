@@ -192,6 +192,22 @@ git cleanup-repo --remote upstream
 The command refuses to run with a dirty current worktree or an active
 rebase/merge/cherry-pick/revert.
 
+### `git stash-audit`
+
+Lists stashes, shows one stash, drops one explicit stash, or drops stashes whose
+origin branch can be inferred and no longer exists locally.
+
+```sh
+git stash-audit
+git stash-audit --porcelain
+git stash-audit --show 0
+git stash-audit --drop-obsolete --dry-run
+git stash-audit --drop-obsolete --yes
+```
+
+Obsolete classification is conservative: a stash is obsolete only when Git's
+stash subject identifies a local origin branch and that local branch is gone.
+
 ### `git absorb-and-rebase`
 
 Creates `git-absorb` fixup commits for staged changes, then folds those fixups
@@ -244,6 +260,7 @@ git pr-restack
 git pr-stack
 git pr-sync-stack
 git repo-state
+git stash-audit
 ```
 
 For a simple local install:

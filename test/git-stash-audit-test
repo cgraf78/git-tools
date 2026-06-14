@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_assert_eq() {
+  local name="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %s\n' "$expected" >&2
+    printf '  actual:   %s\n' "$actual" >&2
+  fi
+}
+
+_git_init() {
+  local repo="$1"
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+  printf 'base\n' >"$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m base >/dev/null
+}
+
+echo "=== git stash-audit ==="
+
+repo=$(_tmpdir)
+_git_init "$repo"
+
+git -C "$repo" switch -q -c keep-branch
+printf 'keep\n' >>"$repo/README.md"
+git -C "$repo" stash push -m keep >/dev/null
+
+git -C "$repo" switch -q main
+git -C "$repo" switch -q -c old-branch
+printf 'old\n' >>"$repo/README.md"
+git -C "$repo" stash push -m old >/dev/null
+git -C "$repo" switch -q main
+git -C "$repo" branch -D old-branch >/dev/null
+
+git -C "$repo" switch -q -c older-branch
+printf 'older\n' >>"$repo/README.md"
+git -C "$repo" stash push -m older >/dev/null
+git -C "$repo" switch -q main
+git -C "$repo" branch -D older-branch >/dev/null
+
+result=$(git -C "$repo" stash-audit --porcelain 2>&1)
+_assert_contains "porcelain lists newest stash" $'stash\t0\tstash@{0}\tolder-branch\ttrue\tOn older-branch: older' "$result"
+_assert_contains "porcelain lists another obsolete stash" $'stash\t1\tstash@{1}\told-branch\ttrue\tOn old-branch: old' "$result"
+_assert_contains "porcelain lists kept stash" $'stash\t2\tstash@{2}\tkeep-branch\tfalse\tOn keep-branch: keep' "$result"
+
+result=$(git -C "$repo" stash-audit 2>&1)
+_assert_contains "human reports obsolete stash" "old-branch obsolete=true" "$result"
+_assert_contains "human reports live branch stash" "keep-branch obsolete=false" "$result"
+
+result=$(git -C "$repo" stash-audit --show 0 2>&1)
+_assert_contains "show prints stash stat" "README.md" "$result"
+
+result=$(git -C "$repo" stash-audit --drop-obsolete --dry-run 2>&1)
+_assert_contains "dry run reports obsolete drop" "would drop stash@{0}" "$result"
+_assert_contains "dry run reports older obsolete drop first" "would drop stash@{1}" "$result"
+case "$result" in
+  *"would drop stash@{1}"*"would drop stash@{0}"*) _pass "dry run drops highest obsolete index first" ;;
+  *) _fail "dry run drops highest obsolete index first" ;;
+esac
+_assert_eq "dry run keeps stashes" 3 "$(git -C "$repo" stash list | wc -l | tr -d ' ')"
+
+result=$(git -C "$repo" stash-audit --drop-obsolete 2>&1 || true)
+_assert_contains "drop obsolete requires confirmation" "--drop-obsolete requires --yes or --dry-run" "$result"
+
+result=$(git -C "$repo" stash-audit --drop-obsolete --yes 2>&1)
+_assert_contains "drops obsolete stashes" "obsolete stashes processed: 2" "$result"
+_assert_eq "only live branch stash remains" 1 "$(git -C "$repo" stash list | wc -l | tr -d ' ')"
+_assert_contains "live branch stash remains" "keep-branch" "$(git -C "$repo" stash list)"
+
+result=$(git -C "$repo" stash-audit --drop 0 2>&1)
+_assert_contains "drops explicit stash" "Dropped stash@{0}" "$result"
+_assert_eq "all stashes removed" 0 "$(git -C "$repo" stash list | wc -l | tr -d ' ')"
+
+result=$(git -C "$repo" stash-audit --show nope 2>&1 || true)
+_assert_contains "validates stash index" "stash index must be a non-negative integer" "$result"
+
+outside=$(_tmpdir)
+result=$(git -C "$outside" stash-audit 2>&1 || true)
+_assert_contains "requires git repo" "not inside a git repository" "$result"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

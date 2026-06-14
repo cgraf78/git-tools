@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# Inspect and safely clean local git stashes.
+
+set -euo pipefail
+
+# shellcheck disable=SC2034 # consumed by lib/git-tools-pr.sh after dynamic source
+gt_command="git stash-audit"
+
+_script_path="${BASH_SOURCE[0]}"
+while [[ -L "$_script_path" ]]; do
+  _script_dir=$(cd -P -- "$(dirname -- "$_script_path")" && pwd)
+  _link=$(readlink "$_script_path")
+  case "$_link" in
+    /*) _script_path="$_link" ;;
+    *) _script_path="$_script_dir/$_link" ;;
+  esac
+done
+_root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-pr.sh"
+
+_usage() {
+  cat <<'EOF'
+Usage: git stash-audit [options]
+
+List stashes, show one stash, drop one explicit stash, or drop stashes whose
+origin branch can be inferred and no longer exists locally.
+
+Options:
+      --porcelain        Print stable tab-separated list records.
+      --show <index>     Show one stash by numeric index.
+      --patch            Show a patch with --show instead of a stat summary.
+      --drop <index>     Drop one stash by numeric index.
+      --drop-obsolete    Drop stashes whose inferred local branch is gone.
+      --yes              Confirm --drop-obsolete.
+  -n, --dry-run          Print drop actions without changing anything.
+  -h, --help             Show this help.
+
+Exit status:
+  0  Audit or cleanup completed.
+  1  Stash operation failed.
+  2  Usage or local environment error.
+EOF
+}
+
+_porcelain=0
+_show=""
+_patch=0
+_drop=""
+_drop_obsolete=0
+_yes=0
+_dry_run=0
+
+while (($#)); do
+  case "$1" in
+    --porcelain)
+      _porcelain=1
+      shift
+      ;;
+    --show)
+      shift
+      (($#)) || gt_usage_error "--show requires a value"
+      _show="$1"
+      shift
+      ;;
+    --show=*)
+      _show="${1#--show=}"
+      [[ -n "$_show" ]] || gt_usage_error "--show requires a value"
+      shift
+      ;;
+    --patch)
+      _patch=1
+      shift
+      ;;
+    --drop)
+      shift
+      (($#)) || gt_usage_error "--drop requires a value"
+      _drop="$1"
+      shift
+      ;;
+    --drop=*)
+      _drop="${1#--drop=}"
+      [[ -n "$_drop" ]] || gt_usage_error "--drop requires a value"
+      shift
+      ;;
+    --drop-obsolete)
+      _drop_obsolete=1
+      shift
+      ;;
+    --yes)
+      _yes=1
+      shift
+      ;;
+    -n | --dry-run)
+      _dry_run=1
+      shift
+      ;;
+    -h | --help)
+      _usage
+      exit 0
+      ;;
+    -*)
+      gt_usage_error "unexpected option: $1"
+      ;;
+    *)
+      gt_usage_error "unexpected argument: $1"
+      ;;
+  esac
+done
+
+_numeric_index() {
+  case "$1" in
+    '' | *[!0-9]*)
+      gt_usage_error "stash index must be a non-negative integer: $1"
+      ;;
+  esac
+}
+
+_stash_ref() {
+  _numeric_index "$1"
+  printf 'stash@{%s}\n' "$1"
+}
+
+_branch_from_subject() {
+  local subject="$1"
+
+  case "$subject" in
+    "On "*": "*)
+      subject=${subject#On }
+      printf '%s\n' "${subject%%: *}"
+      ;;
+    "WIP on "*": "*)
+      subject=${subject#WIP on }
+      printf '%s\n' "${subject%%: *}"
+      ;;
+    *)
+      printf '\n'
+      ;;
+  esac
+}
+
+_branch_exists() {
+  [[ -n "$1" ]] && git show-ref --verify --quiet "refs/heads/$1"
+}
+
+_is_obsolete() {
+  local branch="$1"
+  [[ -n "$branch" ]] || return 1
+  _branch_exists "$branch" && return 1
+  return 0
+}
+
+_stash_records() {
+  git stash list --format='%gd%x09%gs'
+}
+
+_list() {
+  local ref subject index branch obsolete
+
+  while IFS=$'\t' read -r ref subject; do
+    [[ -n "$ref" ]] || continue
+    index=${ref#stash@\{}
+    index=${index%\}}
+    branch=$(_branch_from_subject "$subject")
+    obsolete=false
+    _is_obsolete "$branch" && obsolete=true
+
+    if [[ "$_porcelain" == 1 ]]; then
+      printf 'stash\t%s\t%s\t%s\t%s\t%s\n' "$index" "$ref" "$branch" "$obsolete" "$subject"
+    else
+      printf '%s. %s' "$index" "$subject"
+      [[ -z "$branch" ]] || printf ' branch=%s' "$branch"
+      printf ' obsolete=%s\n' "$obsolete"
+    fi
+  done < <(_stash_records)
+}
+
+_drop_ref() {
+  local ref="$1"
+
+  if [[ "$_dry_run" == 1 ]]; then
+    printf 'git stash-audit: would drop %s\n' "$ref" >&2
+    return 0
+  fi
+  git stash drop "$ref"
+}
+
+_drop_obsolete_stashes() {
+  local ref subject branch index obsolete_count=0
+  local -a indices=()
+
+  while IFS=$'\t' read -r ref subject; do
+    [[ -n "$ref" ]] || continue
+    branch=$(_branch_from_subject "$subject")
+    _is_obsolete "$branch" || continue
+    index=${ref#stash@\{}
+    index=${index%\}}
+    indices+=("$index")
+  done < <(_stash_records)
+
+  if ((${#indices[@]} == 0)); then
+    gt_say "no obsolete stashes found"
+    return 0
+  fi
+
+  if [[ "$_dry_run" == 0 && "$_yes" == 0 ]]; then
+    gt_usage_error "--drop-obsolete requires --yes or --dry-run"
+  fi
+
+  # Stash refs are index-based and renumber after each drop. Delete from the
+  # highest index down so every saved index still points at the intended stash.
+  while IFS= read -r index; do
+    [[ -n "$index" ]] || continue
+    _drop_ref "$(_stash_ref "$index")"
+    obsolete_count=$((obsolete_count + 1))
+  done < <(printf '%s\n' "${indices[@]}" | sort -rn)
+
+  gt_say "obsolete stashes processed: $obsolete_count"
+}
+
+gt_require_repo
+
+if [[ -n "$_show" ]]; then
+  [[ -z "$_drop" && "$_drop_obsolete" == 0 ]] ||
+    gt_usage_error "--show cannot be combined with drop options"
+  _ref=$(_stash_ref "$_show")
+  if [[ "$_patch" == 1 ]]; then
+    git stash show -p "$_ref"
+  else
+    git stash show --stat "$_ref"
+  fi
+  exit 0
+fi
+
+if [[ -n "$_drop" ]]; then
+  [[ "$_drop_obsolete" == 0 ]] ||
+    gt_usage_error "--drop and --drop-obsolete cannot be used together"
+  _drop_ref "$(_stash_ref "$_drop")"
+  exit 0
+fi
+
+if [[ "$_drop_obsolete" == 1 ]]; then
+  _drop_obsolete_stashes
+  exit 0
+fi
+
+_list

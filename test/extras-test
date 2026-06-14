@@ -121,6 +121,9 @@ _description_for() {
     git-repo-state)
       printf '%s\n' 'report repository workflow state'
       ;;
+    git-stash-audit)
+      printf '%s\n' 'inspect and clean git stashes'
+      ;;
     *)
       return 1
       ;;
@@ -139,6 +142,7 @@ _commands=(
   git-pr-stack
   git-pr-sync-stack
   git-repo-state
+  git-stash-audit
 )
 
 echo "=== extras ==="

@@ -99,7 +99,9 @@ _resolve_default() {
   if [[ -n "$_base" ]]; then
     _default="$_base"
   else
-    _default=$(gt_default_branch) ||
+    # origin is the conventional default remote; naming it also keeps the
+    # shared helper's optional argument explicit for shellcheck (SC2119).
+    _default=$(gt_default_branch origin) ||
       gt_usage_error "could not determine default branch; pass --base <branch>"
   fi
 

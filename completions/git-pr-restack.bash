@@ -12,14 +12,14 @@ _git_pr_restack() {
   prev="${COMP_WORDS[COMP_CWORD - 1]}"
 
   case "$prev" in
-    -b | --base)
+    -b | --base | --fork)
       COMPREPLY=($(compgen -W "$(_git_pr_restack_refs)" -- "$cur"))
       return
       ;;
   esac
 
   if [[ "$cur" == -* ]]; then
-    COMPREPLY=($(compgen -W "-b --base --no-push -n --dry-run -h --help" -- "$cur"))
+    COMPREPLY=($(compgen -W "-b --base --fork --no-push -n --dry-run -h --help" -- "$cur"))
     return
   fi
 

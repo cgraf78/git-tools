@@ -18,6 +18,14 @@ pull request base.
 .BR \-b ", " \-\-base " " \fIbranch\fR
 Rebase onto this branch and update the pull request base.
 .TP
+.BI \-\-fork " ref"
+Replay only commits after
+.I ref
+using
+.BR "git rebase \-\-onto" .
+Use this when the previous base was squash-merged, so its commits are dropped
+instead of re-applied and conflicting.
+.TP
 .B \-\-no\-push
 Rebase locally without pushing or editing the pull request base.
 .TP

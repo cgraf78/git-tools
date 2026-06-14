@@ -325,7 +325,11 @@ for _i in "${!_numbers[@]}"; do
 
   if ((_next_index < ${#_numbers[@]})); then
     _child="${_numbers[$_next_index]}"
-    _restack_args=("$_tool_dir/git-pr-restack" "$_child" --base "$_land_base")
+    # The just-landed parent's head is the child's old base. Pass it as the fork
+    # point so the parent's commits drop out of the child instead of being
+    # re-applied onto the root base (which conflicts after a squash merge). The
+    # parent branch still exists here; _delete_landed_head removes it below.
+    _restack_args=("$_tool_dir/git-pr-restack" "$_child" --base "$_land_base" --fork "${_heads[$_i]}")
     if [[ "$_dry_run" == 1 ]]; then
       _restack_args+=(--dry-run)
     fi

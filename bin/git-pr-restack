@@ -28,6 +28,9 @@ Rebase one open PR's head branch onto a base branch and push it with
 
 Options:
   -b, --base <branch>   Rebase onto this branch and update the PR base.
+      --fork <ref>      Replay only commits after <ref> (git rebase --onto). Use
+                        this when the previous base was squash-merged, so its
+                        commits are dropped instead of re-applied.
       --no-push         Rebase locally without pushing or editing the PR base.
   -n, --dry-run         Print actions without changing anything.
   -h, --help            Show this help.
@@ -41,6 +44,7 @@ EOF
 
 _target=""
 _base_override=""
+_fork=""
 _push=1
 _dry_run=0
 
@@ -66,6 +70,18 @@ while (($#)); do
     --base=*)
       _base_override="${1#--base=}"
       [[ -n "$_base_override" ]] || gt_usage_error "--base requires a value"
+      shift
+      ;;
+    --fork)
+      _opt="$1"
+      shift
+      (($#)) || gt_usage_error "$_opt requires a value"
+      _fork="$1"
+      shift
+      ;;
+    --fork=*)
+      _fork="${1#--fork=}"
+      [[ -n "$_fork" ]] || gt_usage_error "--fork requires a value"
       shift
       ;;
     --no-push)
@@ -138,17 +154,20 @@ _checkout_head() {
   gt_die "PR head branch does not exist locally or on $remote: $branch"
 }
 
-_base_ref() {
+# Resolve a branch name or commit-ish to a rebase target, preferring the
+# remote-tracking branch so a stale local copy never shadows the remote.
+_resolve_ref() {
   local remote="$1"
-  local base="$2"
+  local ref="$2"
+  local label="$3"
 
-  if _remote_branch_exists "$remote" "$base"; then
-    printf '%s/%s\n' "$remote" "$base"
+  if _remote_branch_exists "$remote" "$ref"; then
+    printf '%s/%s\n' "$remote" "$ref"
     return 0
   fi
-  git rev-parse --verify --quiet "$base^{commit}" >/dev/null ||
-    gt_die "base is not a local or $remote branch: $base"
-  printf '%s\n' "$base"
+  git rev-parse --verify --quiet "$ref^{commit}" >/dev/null ||
+    gt_die "$label is not a local or $remote branch: $ref"
+  printf '%s\n' "$ref"
 }
 
 gt_require_repo
@@ -168,10 +187,19 @@ _remote=$(_remote_for_branch "$_head")
 
 _run git fetch --quiet --prune --tags "$_remote"
 _checkout_head "$_remote" "$_head"
-_onto=$(_base_ref "$_remote" "$_new_base")
+_onto=$(_resolve_ref "$_remote" "$_new_base" "base")
 
-gt_say "rebasing $_head onto $_onto"
-_run git rebase "$_onto"
+# Without --fork, a plain rebase replays everything since the merge base, which
+# re-applies a squash-merged parent's commits and conflicts. --fork names the
+# old base so its commits are dropped via git rebase --onto.
+if [[ -n "$_fork" ]]; then
+  _fork_ref=$(_resolve_ref "$_remote" "$_fork" "fork")
+  gt_say "rebasing $_head onto $_onto, dropping commits up to $_fork_ref"
+  _run git rebase --onto "$_onto" "$_fork_ref"
+else
+  gt_say "rebasing $_head onto $_onto"
+  _run git rebase "$_onto"
+fi
 
 if [[ "$_push" == 1 ]]; then
   gt_say "pushing $_head to $_remote with --force-with-lease"

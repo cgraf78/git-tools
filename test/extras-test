@@ -112,6 +112,9 @@ _description_for() {
     git-pr-stack)
       printf '%s\n' 'discover a linear GitHub pull request stack'
       ;;
+    git-pr-sync-stack)
+      printf '%s\n' 'restack a GitHub pull request stack'
+      ;;
     git-repo-state)
       printf '%s\n' 'report repository workflow state'
       ;;
@@ -130,6 +133,7 @@ _commands=(
   git-pr-ready
   git-pr-restack
   git-pr-stack
+  git-pr-sync-stack
   git-repo-state
 )
 

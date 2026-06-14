@@ -1,0 +1,52 @@
+.TH GIT-PR-CHECKS 1 "2026-06-14" "git-tools" "User Commands"
+.SH NAME
+git-pr-checks \- summarize GitHub pull request checks
+.SH SYNOPSIS
+.B git pr-checks
+.RI [ options ]
+.RI [ number|url|branch ]
+.SH DESCRIPTION
+.B git pr-checks
+summarizes GitHub pull request checks. Without a target, it uses the pull
+request for the current branch.
+.PP
+The command preserves useful GitHub CLI status semantics: passing checks return
+0, pending checks return 8, and failing, cancelled, or missing checks return 1.
+.SH OPTIONS
+.TP
+.B \-\-porcelain
+Print stable
+.B key=value
+summary fields followed by tab-separated
+.B check
+records.
+.TP
+.BR \-\-required-only ", " \-\-required
+Only include checks required by branch protection.
+.TP
+.BR \-w ", " \-\-watch
+Wait for checks to finish before summarizing.
+.TP
+.BI "\-i, \-\-interval " seconds
+Refresh interval in seconds for
+.BR \-\-watch .
+The default is 10.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH EXIT STATUS
+.TP
+.B 0
+Checks passed.
+.TP
+.B 1
+Checks failed, were cancelled, are missing, or could not be read.
+.TP
+.B 2
+Usage or local environment error.
+.TP
+.B 8
+Checks are still pending.
+.SH SEE ALSO
+.BR git-pr-ready (1),
+.BR git-pr-stack (1)

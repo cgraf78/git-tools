@@ -94,6 +94,9 @@ _description_for() {
     git-cleanup-repo)
       printf '%s\n' 'clean stale local branches and worktrees'
       ;;
+    git-pr-checks)
+      printf '%s\n' 'summarize GitHub pull request checks'
+      ;;
     git-pr-land)
       printf '%s\n' 'land one ready GitHub pull request'
       ;;
@@ -118,6 +121,7 @@ _description_for() {
 _commands=(
   git-absorb-and-rebase
   git-cleanup-repo
+  git-pr-checks
   git-pr-land
   git-pr-land-stack
   git-pr-ready

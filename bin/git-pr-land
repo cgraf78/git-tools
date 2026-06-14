@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# Merge one ready GitHub pull request and clean up its local branch.
+
+set -euo pipefail
+
+# shellcheck disable=SC2034 # consumed by lib/git-tools-pr.sh after dynamic source
+gt_command="git pr-land"
+
+_script_path="${BASH_SOURCE[0]}"
+while [[ -L "$_script_path" ]]; do
+  _script_dir=$(cd -P -- "$(dirname -- "$_script_path")" && pwd)
+  _link=$(readlink "$_script_path")
+  case "$_link" in
+    /*) _script_path="$_link" ;;
+    *) _script_path="$_script_dir/$_link" ;;
+  esac
+done
+_root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-pr.sh"
+
+_usage() {
+  cat <<'EOF'
+Usage: git pr-land [options] <number|url|branch>
+
+Verify that one GitHub pull request is ready, merge it, sync the base branch,
+and delete the local PR branch. This command does not discover or land stacks.
+
+Options:
+  -m, --method <method>   Merge method: squash, merge, or rebase (default: squash).
+      --keep-branch       Do not ask GitHub to delete the remote branch and do
+                          not delete the local branch.
+  -n, --dry-run           Print actions without changing anything.
+  -h, --help              Show this help.
+
+Exit status:
+  0  PR was landed.
+  1  PR is not ready or merge failed.
+  2  Usage or local environment error.
+EOF
+}
+
+_target=""
+_method="squash"
+_keep_branch=0
+_dry_run=0
+
+_run() {
+  if [[ "$_dry_run" == 1 ]]; then
+    printf 'git pr-land: would run:' >&2
+    printf ' %q' "$@" >&2
+    printf '\n' >&2
+    return 0
+  fi
+  "$@"
+}
+
+while (($#)); do
+  case "$1" in
+    -m | --method)
+      _opt="$1"
+      shift
+      (($#)) || gt_usage_error "$_opt requires a value"
+      _method="$1"
+      shift
+      ;;
+    --method=*)
+      _method="${1#--method=}"
+      [[ -n "$_method" ]] || gt_usage_error "--method requires a value"
+      shift
+      ;;
+    --keep-branch)
+      _keep_branch=1
+      shift
+      ;;
+    -n | --dry-run)
+      _dry_run=1
+      shift
+      ;;
+    -h | --help)
+      _usage
+      exit 0
+      ;;
+    --)
+      shift
+      (($# == 1)) || gt_usage_error "expected exactly one target"
+      _target="$1"
+      break
+      ;;
+    -*)
+      gt_usage_error "unexpected option: $1"
+      ;;
+    *)
+      [[ -z "$_target" ]] || gt_usage_error "expected exactly one target"
+      _target="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$_target" ]] || gt_usage_error "expected exactly one target"
+
+case "$_method" in
+  squash | merge | rebase) ;;
+  *) gt_usage_error "merge method must be squash, merge, or rebase" ;;
+esac
+
+_remote_for_branch() {
+  local branch="$1"
+  local remote
+
+  remote=$(git config "branch.$branch.remote" 2>/dev/null || true)
+  if [[ -n "$remote" ]]; then
+    printf '%s\n' "$remote"
+    return 0
+  fi
+  printf 'origin\n'
+}
+
+_local_branch_exists() {
+  git show-ref --verify --quiet "refs/heads/$1"
+}
+
+_remote_branch_exists() {
+  local remote="$1"
+  local branch="$2"
+  git show-ref --verify --quiet "refs/remotes/$remote/$branch"
+}
+
+_sync_base() {
+  local remote="$1"
+  local base="$2"
+
+  _run git fetch --quiet --prune --tags "$remote"
+  if _local_branch_exists "$base"; then
+    _run git switch --quiet "$base"
+  elif _remote_branch_exists "$remote" "$base"; then
+    _run git switch --quiet -c "$base" --track "$remote/$base"
+  else
+    gt_die "base branch does not exist locally or on $remote: $base"
+  fi
+
+  if _remote_branch_exists "$remote" "$base"; then
+    _run git pull --quiet --ff-only "$remote" "$base"
+  fi
+}
+
+_delete_local_head() {
+  local head="$1"
+  local current
+
+  [[ "$_keep_branch" == 0 ]] || return 0
+  _local_branch_exists "$head" || return 0
+  current=$(git symbolic-ref -q --short HEAD 2>/dev/null || true)
+  [[ "$current" != "$head" ]] || gt_die "refusing to delete currently checked-out branch: $head"
+  _run git branch -D "$head"
+}
+
+gt_require_repo
+gt_require_gh
+if [[ "$_dry_run" != 1 ]]; then
+  gt_require_clean_worktree
+fi
+
+_view=$(gt_pr_view_tsv "$_target") || gt_die "could not read pull request"
+IFS=$'\t' read -r _number _state _draft _merge_state _head _base _url _title <<<"$_view"
+
+_checks=$(gt_pr_checks_status "$_target") || gt_die "could not read pull request checks"
+_checks_state=$(gt_checks_ready_state "$_checks")
+
+if [[ "$_state" != "OPEN" ]]; then
+  gt_die "PR #$_number is not open"
+elif gt_bool "$_draft"; then
+  gt_die "PR #$_number is a draft"
+elif [[ "$_merge_state" != "CLEAN" ]]; then
+  gt_die "PR #$_number merge state is $_merge_state"
+elif [[ "$_checks_state" != "pass" ]]; then
+  gt_die "PR #$_number checks are $_checks_state"
+fi
+
+_remote=$(_remote_for_branch "$_base")
+_merge_args=(pr merge "$_number" "--$_method")
+if [[ "$_keep_branch" == 0 ]]; then
+  _merge_args+=(--delete-branch)
+fi
+
+gt_say "merging PR #$_number with $_method"
+_run gh "${_merge_args[@]}"
+
+gt_say "syncing $_base from $_remote"
+_sync_base "$_remote" "$_base"
+_delete_local_head "$_head"
+
+gt_say "landed PR #$_number ($_head -> $_base)"

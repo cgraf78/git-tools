@@ -1,0 +1,60 @@
+.TH GIT-PR-OPEN 1 "2026-06-14" "git-tools" "User Commands"
+.SH NAME
+git-pr-open \- push a branch and create a pull request
+.SH SYNOPSIS
+.B git pr-open
+.RI [ options ]
+.SH DESCRIPTION
+.B git pr-open
+pushes the current branch with upstream tracking and creates a GitHub pull
+request without interactive prompts.
+.PP
+The command refuses dirty worktrees, refuses to open a pull request from the
+base branch itself, fetches the base remote, and rejects a stale local base
+branch when the local base branch differs from its remote-tracking branch.
+.SH OPTIONS
+.TP
+.BI "\-t, \-\-title " title
+Pull request title. Required unless a
+.B \-\-fill
+mode is used.
+.TP
+.BI "\-b, \-\-body " body
+Pull request body.
+.TP
+.BI "\-F, \-\-body-file " file
+Read pull request body from file.
+.TP
+.BI "\-B, \-\-base " branch
+Base branch. Defaults to the repository default branch.
+.TP
+.BI "\-H, \-\-head " branch
+Head branch name for GitHub. Defaults to the current branch.
+.TP
+.BR \-d ", " \-\-draft
+Create a draft pull request.
+.TP
+.BR \-\-fill ", " \-\-fill-first ", " \-\-fill-verbose
+Use GitHub CLI commit-derived title and body modes.
+.TP
+.B \-\-no-maintainer-edit
+Disable maintainer edits.
+.TP
+.BR \-n ", " \-\-dry-run
+Print actions without changing anything.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH EXIT STATUS
+.TP
+.B 0
+Pull request was created, or dry-run completed.
+.TP
+.B 1
+Pull request creation failed.
+.TP
+.B 2
+Usage or local environment error.
+.SH SEE ALSO
+.BR git-pr-checks (1),
+.BR git-pr-ready (1)

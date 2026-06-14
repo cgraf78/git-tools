@@ -45,6 +45,21 @@ git pr-checks --porcelain
 The command returns `0` when checks pass, `8` while checks are pending, and `1`
 when checks fail, are cancelled, or are missing.
 
+### `git pr-open`
+
+Pushes the current branch with upstream tracking and creates a GitHub pull
+request without interactive prompts.
+
+```sh
+git pr-open --title "Add thing" --body-file /tmp/pr-body.md
+git pr-open --title "Add thing" --draft
+git pr-open --fill --dry-run
+```
+
+The command refuses dirty worktrees, refuses to open from the base branch, fetches
+the base remote, and rejects a stale local base branch when it differs from its
+remote-tracking branch.
+
 ### `git repo-state`
 
 Prints a read-only repository workflow report: current branch, default branch,
@@ -223,6 +238,7 @@ git absorb-and-rebase
 git pr-checks
 git pr-land
 git pr-land-stack
+git pr-open
 git pr-ready
 git pr-restack
 git pr-stack

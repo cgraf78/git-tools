@@ -17,6 +17,7 @@ COMMANDS=(
   git-pr-checks
   git-pr-land
   git-pr-land-stack
+  git-pr-open
   git-pr-ready
   git-pr-restack
   git-pr-stack

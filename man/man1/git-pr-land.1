@@ -1,0 +1,49 @@
+.TH GIT-PR-LAND 1 "2026-06-13" "git-tools" "User Commands"
+.SH NAME
+git-pr-land \- land one ready GitHub pull request
+.SH SYNOPSIS
+.B git pr-land
+.RI [ options ]
+.I number|url|branch
+.SH DESCRIPTION
+.B git pr-land
+verifies that one GitHub pull request is ready, merges it, syncs the base
+branch locally, and deletes the local pull request branch.
+.PP
+This command intentionally does not discover or land stacks. Use
+.BR git-pr-land-stack (1)
+for stack orchestration.
+.SH OPTIONS
+.TP
+.BR \-m ", " \-\-method " " \fImethod\fR
+Merge method:
+.BR squash ,
+.BR merge ,
+or
+.BR rebase .
+Defaults to
+.BR squash .
+.TP
+.B \-\-keep\-branch
+Do not ask GitHub to delete the remote branch and do not delete the local
+branch.
+.TP
+.BR \-n ", " \-\-dry\-run
+Print actions without changing anything.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH EXIT STATUS
+.TP
+.B 0
+Pull request was landed.
+.TP
+.B 1
+Pull request is not ready or merge failed.
+.TP
+.B 2
+Usage or local environment error.
+.SH SEE ALSO
+.BR git-pr-ready (1),
+.BR git-pr-stack (1),
+.BR git-pr-land-stack (1)

@@ -1,0 +1,37 @@
+.TH GIT-ABSORB-AND-REBASE 1 "2026-06-13" "git-tools" "User Commands"
+.SH NAME
+git-absorb-and-rebase \- absorb staged changes into earlier commits
+.SH SYNOPSIS
+.B git absorb-and-rebase
+.RB [ \-b | \-\-base
+.IR rev ]
+.SH DESCRIPTION
+.B git absorb-and-rebase
+creates git-absorb fixup commits for staged changes on the current branch, then
+folds those fixups with a non-interactive autosquash rebase.
+.PP
+The command operates only on staged changes. It refuses active
+rebase, merge, cherry-pick, or revert states, and rolls back partial fixup
+generation if git-absorb leaves staged changes behind.
+.SH OPTIONS
+.TP
+.BR \-b ", " \-\-base " " \fIrev\fR
+Rebase from this base revision instead of deriving one.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH BASE SELECTION
+When no base is given, the command derives one from the branch upstream,
+remote default branches such as
+.BR origin/HEAD ,
+.BR origin/main ,
+or
+.BR origin/master ,
+then local default branches such as
+.BR main ,
+.BR master ,
+or
+.BR trunk .
+.SH REQUIREMENTS
+.B git-absorb
+must be installed.

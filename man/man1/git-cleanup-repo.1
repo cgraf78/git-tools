@@ -1,0 +1,43 @@
+.TH GIT-CLEANUP-REPO 1 "2026-06-13" "git-tools" "User Commands"
+.SH NAME
+git-cleanup-repo \- clean stale local branches and worktrees
+.SH SYNOPSIS
+.B git cleanup-repo
+.RI [ options ]
+.SH DESCRIPTION
+.B git cleanup-repo
+fetches and prunes the remote, updates the repository default branch, then
+deletes stale local branches.
+.PP
+By default it deletes local branches that are already merged into the base
+branch. It can also delete branches whose upstream is gone or every local
+branch except the base branch.
+.SH OPTIONS
+.TP
+.BR \-b ", " \-\-base " " \fIbranch\fR
+Base branch to keep and update.
+.TP
+.BR \-r ", " \-\-remote " " \fIname\fR
+Remote to fetch and pull from. Defaults to
+.BR origin .
+.TP
+.B \-\-gone
+Also delete branches whose upstream is gone.
+.TP
+.BR \-a ", " \-\-all
+Delete all local branches except the base branch.
+.TP
+.B \-\-remove\-worktrees
+Remove clean linked worktrees for deleted branches.
+.TP
+.BR \-n ", " \-\-dry\-run
+Print actions without changing anything.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH SAFETY
+The command refuses to run with a dirty current worktree or active
+rebase, merge, cherry-pick, or revert state. Linked worktrees are skipped by
+default unless
+.B \-\-remove\-worktrees
+is given and the worktree is clean.

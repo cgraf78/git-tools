@@ -1,0 +1,41 @@
+.TH GIT-PR-RESTACK 1 "2026-06-13" "git-tools" "User Commands"
+.SH NAME
+git-pr-restack \- rebase one GitHub pull request branch onto a base
+.SH SYNOPSIS
+.B git pr-restack
+.RI [ options ]
+.I number|url|branch
+.SH DESCRIPTION
+.B git pr-restack
+rebases one open pull request head branch onto a base branch and pushes with
+.BR \-\-force\-with\-lease .
+By default, the base is the pull request's current base branch.
+.PP
+When a new base is given and the push succeeds, the command updates the GitHub
+pull request base.
+.SH OPTIONS
+.TP
+.BR \-b ", " \-\-base " " \fIbranch\fR
+Rebase onto this branch and update the pull request base.
+.TP
+.B \-\-no\-push
+Rebase locally without pushing or editing the pull request base.
+.TP
+.BR \-n ", " \-\-dry\-run
+Print actions without changing anything.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH EXIT STATUS
+.TP
+.B 0
+Pull request branch was restacked.
+.TP
+.B 1
+Restack failed.
+.TP
+.B 2
+Usage or local environment error.
+.SH SEE ALSO
+.BR git-pr-stack (1),
+.BR git-pr-land-stack (1)

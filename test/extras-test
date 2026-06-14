@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_file() {
+  local name="$1"
+  local path="$2"
+
+  if [[ -f "$path" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  missing file: %s\n' "$path" >&2
+  fi
+}
+
+_assert_symlink() {
+  local name="$1"
+  local path="$2"
+
+  if [[ -L "$path" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  missing symlink: %s\n' "$path" >&2
+  fi
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local path="$3"
+
+  if grep -F -q -- "$needle" "$path"; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected %s to contain: %s\n' "$path" "$needle" >&2
+  fi
+}
+
+_commands=(
+  git-absorb-and-rebase
+  git-cleanup-repo
+  git-pr-land
+  git-pr-land-stack
+  git-pr-ready
+  git-pr-restack
+  git-pr-stack
+)
+
+echo "=== extras ==="
+
+for command in "${_commands[@]}"; do
+  _assert_file "man page exists for $command" "$ROOT/man/man1/$command.1"
+  _assert_contains "man page names $command" "$command" "$ROOT/man/man1/$command.1"
+
+  _assert_file "bash completion exists for $command" "$ROOT/completions/$command.bash"
+  _assert_contains "bash completion registers $command" "complete -F" "$ROOT/completions/$command.bash"
+  if bash -n "$ROOT/completions/$command.bash"; then
+    _pass "bash completion parses for $command"
+  else
+    _fail "bash completion parses for $command"
+  fi
+
+  _assert_file "zsh completion exists for $command" "$ROOT/completions/$command.zsh"
+  _assert_contains "zsh completion declares $command" "#compdef $command" "$ROOT/completions/$command.zsh"
+  if command -v zsh >/dev/null 2>&1; then
+    if zsh -n "$ROOT/completions/$command.zsh"; then
+      _pass "zsh completion parses for $command"
+    else
+      _fail "zsh completion parses for $command"
+    fi
+  fi
+
+  _assert_file "fish completion exists for $command" "$ROOT/completions/$command.fish"
+  _assert_contains "fish completion registers $command" "complete -c $command" "$ROOT/completions/$command.fish"
+  if command -v fish >/dev/null 2>&1; then
+    if fish --no-execute "$ROOT/completions/$command.fish"; then
+      _pass "fish completion parses for $command"
+    else
+      _fail "fish completion parses for $command"
+    fi
+  fi
+done
+
+prefix=$(_tmpdir)
+install_out=$(_tmpdir)/install.out
+PREFIX="$prefix" "$ROOT/install.sh" >"$install_out" 2>&1
+
+for command in "${_commands[@]}"; do
+  _assert_symlink "installs $command binary" "$prefix/bin/$command"
+  _assert_symlink "installs $command man page" "$prefix/share/man/man1/$command.1"
+  _assert_symlink "installs $command bash completion" "$prefix/share/bash-completion/completions/$command"
+  _assert_symlink "installs $command zsh completion" "$prefix/share/zsh/site-functions/_$command"
+  _assert_symlink "installs $command fish completion" "$prefix/share/fish/vendor_completions.d/$command.fish"
+done
+
+_assert_contains "install reports man destination" "installed man pages to" "$install_out"
+_assert_contains "install reports bash destination" "installed bash completions to" "$install_out"
+_assert_contains "install reports zsh destination" "installed zsh completions to" "$install_out"
+_assert_contains "install reports fish destination" "installed fish completions to" "$install_out"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

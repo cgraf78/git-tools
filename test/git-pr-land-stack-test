@@ -122,18 +122,36 @@ repo=$(_tmpdir)
 bin_dir=$(_tmpdir)
 log=$(_tmpdir)/stack.log
 _git_init "$repo"
+git -C "$repo" branch feature/a
+git -C "$repo" branch feature/b
+git -C "$repo" branch feature/c
 _write_tool_stubs "$bin_dir"
 
 PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" git -C "$repo" pr-land-stack 1 >/tmp/pr-land-stack.out 2>&1
 expected="$(cat <<'EOF'
-land 1 --method squash
+land 1 --method squash --keep-branch
 restack 2 --base main
-land 2 --method squash
+land 2 --method squash --keep-branch
 restack 3 --base main
 land 3 --method squash
 EOF
 )"
 _assert_eq "lands and restacks in stack order" "$expected" "$(cat "$log")"
+if git -C "$repo" show-ref --verify --quiet refs/heads/feature/a; then
+  _fail "deletes first intermediate branch after child restack"
+else
+  _pass "deletes first intermediate branch after child restack"
+fi
+if git -C "$repo" show-ref --verify --quiet refs/heads/feature/b; then
+  _fail "deletes second intermediate branch after child restack"
+else
+  _pass "deletes second intermediate branch after child restack"
+fi
+if git -C "$repo" show-ref --verify --quiet refs/heads/feature/c; then
+  _pass "leaves final branch cleanup to git pr-land"
+else
+  _fail "leaves final branch cleanup to git pr-land"
+fi
 _assert_contains "reports stack completion" "landed stack rooted at PR #1" "$(< /tmp/pr-land-stack.out)"
 
 log_keep=$(_tmpdir)/stack.log
@@ -142,7 +160,7 @@ _assert_contains "passes keep-branch to land" "land 1 --method merge --keep-bran
 
 log_dry=$(_tmpdir)/stack.log
 PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log_dry" git -C "$repo" pr-land-stack 1 --dry-run >/tmp/pr-land-stack-dry.out 2>&1
-_assert_contains "dry run passes through to land" "land 1 --method squash --dry-run" "$(cat "$log_dry")"
+_assert_contains "dry run passes through to land" "land 1 --method squash --keep-branch --dry-run" "$(cat "$log_dry")"
 _assert_contains "dry run passes through to restack" "restack 2 --base main --dry-run" "$(cat "$log_dry")"
 
 result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_CASE=blocked STACK_LOG="$log" git -C "$repo" pr-land-stack 1 2>&1 || true)

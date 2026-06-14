@@ -161,8 +161,6 @@ _wait_for_ready_pr() {
       gt_die "PR #$target is a draft after restack"
     elif [[ "$checks_state" == "fail" ]]; then
       gt_die "PR #$target checks failed after restack"
-    elif [[ "$merge_state" == "DIRTY" ]]; then
-      gt_die "PR #$target has merge conflicts after restack"
     elif [[ "$merge_state" == "CLEAN" && "$checks_state" == "pass" ]]; then
       gt_say "PR #$target is ready after restack"
       return 0
@@ -177,7 +175,7 @@ _wait_for_ready_pr() {
     esac
 
     case "$merge_state" in
-      BLOCKED | CLEAN | HAS_HOOKS | UNKNOWN | UNSTABLE)
+      BLOCKED | CLEAN | DIRTY | HAS_HOOKS | UNKNOWN | UNSTABLE)
         ;;
       *)
         gt_die "unexpected merge state for PR #$target after restack: $merge_state"

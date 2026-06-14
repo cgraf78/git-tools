@@ -106,16 +106,47 @@ EOF
   cat >"$dir/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+_merge_state() {
+  local target="$1"
+  local count count_file
+
+  case "${GH_MERGE_CASE:-clean}" in
+    clean)
+      printf 'CLEAN\n'
+      ;;
+    dirty)
+      printf 'DIRTY\n'
+      ;;
+    dirty-then-clean)
+      count_file="${GH_VIEW_COUNT:?}.$target"
+      count=0
+      [[ ! -f "$count_file" ]] || count=$(< "$count_file")
+      count=$((count + 1))
+      printf '%s\n' "$count" >"$count_file"
+      if ((count == 1)); then
+        printf 'DIRTY\n'
+      else
+        printf 'CLEAN\n'
+      fi
+      ;;
+    *)
+      printf 'unexpected merge case: %s\n' "$GH_MERGE_CASE" >&2
+      exit 99
+      ;;
+  esac
+}
+
 if [[ "$1 $2" == "auth status" ]]; then
   exit 0
 fi
 if [[ "$1 $2" == "pr view" ]]; then
+  merge_state=$(_merge_state "${3:-}")
   case "${3:-}" in
     2)
-      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\tmain\thttps://example/pr/2\tChild PR\n'
+      printf '2\tOPEN\tfalse\t%s\tfeature/b\tmain\thttps://example/pr/2\tChild PR\n' "$merge_state"
       ;;
     3)
-      printf '3\tOPEN\tfalse\tCLEAN\tfeature/c\tmain\thttps://example/pr/3\tGrandchild PR\n'
+      printf '3\tOPEN\tfalse\t%s\tfeature/c\tmain\thttps://example/pr/3\tGrandchild PR\n' "$merge_state"
       ;;
     *)
       printf 'unexpected pr view target: %s\n' "${3:-}" >&2
@@ -185,6 +216,15 @@ else
   _fail "leaves final branch cleanup to git pr-land"
 fi
 _assert_contains "reports stack completion" "landed stack rooted at PR #1" "$(< /tmp/pr-land-stack.out)"
+
+log_dirty=$(_tmpdir)/stack.log
+view_count=$(_tmpdir)/view-count
+PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" GH_MERGE_CASE=dirty-then-clean GH_VIEW_COUNT="$view_count" STACK_LOG="$log_dirty" git -C "$repo" pr-land-stack 1 --check-timeout 3 --check-interval 1 >/tmp/pr-land-stack-dirty.out 2>&1
+_assert_contains "waits through transient dirty merge state" "waiting for PR #2 after restack: merge DIRTY, checks pass" "$(< /tmp/pr-land-stack-dirty.out)"
+_assert_contains "lands after transient dirty merge state" "land 3 --method squash" "$(cat "$log_dirty")"
+
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" GH_MERGE_CASE=dirty STACK_LOG="$log" git -C "$repo" pr-land-stack 1 --check-timeout 1 --check-interval 1 2>&1 || true)
+_assert_contains "times out persistent dirty merge state" "timed out waiting for PR #2 after restack: merge DIRTY, checks pass" "$result"
 
 log_keep=$(_tmpdir)/stack.log
 PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log_keep" git -C "$repo" pr-land-stack 1 --method merge --keep-branch >/tmp/pr-land-stack-keep.out 2>&1

@@ -54,6 +54,46 @@ _run_tool() {
   "$@"
 }
 
+_remote_for_branch() {
+  local branch="$1"
+  local remote
+
+  remote=$(git config "branch.$branch.remote" 2>/dev/null || true)
+  if [[ -n "$remote" ]]; then
+    printf '%s\n' "$remote"
+    return 0
+  fi
+  printf 'origin\n'
+}
+
+_local_branch_exists() {
+  git show-ref --verify --quiet "refs/heads/$1"
+}
+
+_remote_branch_exists() {
+  local remote="$1"
+  local branch="$2"
+  git show-ref --verify --quiet "refs/remotes/$remote/$branch"
+}
+
+_delete_landed_head() {
+  local head="$1"
+  local remote
+
+  [[ "$_keep_branch" == 0 ]] || return 0
+
+  # In a stack, a parent PR branch is still the next PR's base until after that
+  # child has been restacked. Deleting it as part of the merge makes GitHub close
+  # the child PR. Clean it up only once the child no longer points at it.
+  remote=$(_remote_for_branch "$head")
+  if _remote_branch_exists "$remote" "$head"; then
+    _run_tool git push "$remote" --delete "$head"
+  fi
+  if _local_branch_exists "$head"; then
+    _run_tool git branch -D "$head"
+  fi
+}
+
 while (($#)); do
   case "$1" in
     -m | --method)
@@ -148,9 +188,10 @@ _land_base="${_bases[0]}"
 
 for _i in "${!_numbers[@]}"; do
   _number="${_numbers[$_i]}"
+  _next_index=$((_i + 1))
 
   _land_args=("$_tool_dir/git-pr-land" "$_number" --method "$_method")
-  if [[ "$_keep_branch" == 1 ]]; then
+  if [[ "$_keep_branch" == 1 || $_next_index -lt ${#_numbers[@]} ]]; then
     _land_args+=(--keep-branch)
   fi
   if [[ "$_dry_run" == 1 ]]; then
@@ -159,7 +200,6 @@ for _i in "${!_numbers[@]}"; do
 
   _run_tool "${_land_args[@]}"
 
-  _next_index=$((_i + 1))
   if ((_next_index < ${#_numbers[@]})); then
     _child="${_numbers[$_next_index]}"
     _restack_args=("$_tool_dir/git-pr-restack" "$_child" --base "$_land_base")
@@ -167,6 +207,7 @@ for _i in "${!_numbers[@]}"; do
       _restack_args+=(--dry-run)
     fi
     _run_tool "${_restack_args[@]}"
+    _delete_landed_head "${_heads[$_i]}"
   fi
 done
 

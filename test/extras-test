@@ -121,6 +121,9 @@ _description_for() {
     git-repo-state)
       printf '%s\n' 'report repository workflow state'
       ;;
+    git-resolve-base)
+      printf '%s\n' 'print the inferred branch point of the current branch'
+      ;;
     git-stash-audit)
       printf '%s\n' 'inspect and clean git stashes'
       ;;
@@ -142,6 +145,7 @@ _commands=(
   git-pr-stack
   git-pr-sync-stack
   git-repo-state
+  git-resolve-base
   git-stash-audit
 )
 

@@ -3,6 +3,19 @@
 
 set -euo pipefail
 
+_script_path="${BASH_SOURCE[0]}"
+while [[ -L "$_script_path" ]]; do
+  _script_dir=$(cd -P -- "$(dirname -- "$_script_path")" && pwd)
+  _link=$(readlink "$_script_path")
+  case "$_link" in
+    /*) _script_path="$_link" ;;
+    *) _script_path="$_script_dir/$_link" ;;
+  esac
+done
+_root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-base.sh"
+
 _usage() {
   cat <<'EOF'
 Usage: git absorb-and-rebase [--base <rev>]
@@ -63,85 +76,19 @@ _ensure_ready() {
   _die "no staged changes to absorb"
 }
 
-_commit() {
-  git rev-parse --verify -q "$1^{commit}" 2>/dev/null
-}
-
-_merge_base() {
-  local base
-  base=$(git merge-base HEAD "$1" 2>/dev/null) || return 1
-  [[ -n "$base" ]] || return 1
-  printf '%s\n' "$base"
-}
-
-_branch_base() {
-  # fork-point handles the common case where an upstream branch was rebased and
-  # Git's reflog can identify the original branch point more accurately than a
-  # plain graph merge-base. Fall back to merge-base for repos without reflogs.
-  git merge-base --fork-point "$1" HEAD 2>/dev/null ||
-    _merge_base "$1"
-}
-
-_base_from_upstream() {
-  local upstream
-  upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) ||
-    return 1
-  [[ -n "$upstream" ]] || return 1
-  _branch_base "$upstream"
-}
-
-_remote_default_candidates() {
-  local remote ref
-
-  printf '%s\n' origin/HEAD
-  while IFS= read -r ref; do
-    case "$ref" in
-      */HEAD) printf '%s\n' "$ref" ;;
-    esac
-  done < <(git for-each-ref --format='%(refname:short)' refs/remotes 2>/dev/null)
-
-  printf '%s\n' origin/main origin/master
-  while IFS= read -r remote; do
-    [[ -n "$remote" ]] || continue
-    printf '%s\n' "$remote/main" "$remote/master"
-  done < <(git remote 2>/dev/null)
-}
-
-_base_from_remote_default() {
-  local candidate seen=$'\n'
-  while IFS= read -r candidate; do
-    [[ -n "$candidate" ]] || continue
-    case "$seen" in
-      *$'\n'"$candidate"$'\n'*) continue ;;
-    esac
-    seen="${seen}${candidate}"$'\n'
-    _commit "$candidate" >/dev/null || continue
-    _branch_base "$candidate" && return 0
-  done < <(_remote_default_candidates)
-  return 1
-}
-
-_base_from_local_default() {
-  local candidate
-  for candidate in main master trunk; do
-    _commit "$candidate" >/dev/null || continue
-    _branch_base "$candidate" && return 0
-  done
-  return 1
-}
-
 _derive_base() {
   if [[ -n "${_explicit_base:-}" ]]; then
-    _commit "$_explicit_base" ||
+    gt_commit "$_explicit_base" ||
       _die "base is not a commit: $_explicit_base"
     return 0
   fi
 
-  _base_from_upstream && return 0
-  _base_from_remote_default && return 0
-  _base_from_local_default && return 0
-
-  _die "could not determine branch base; pass --base <rev>"
+  # gt_resolve_base prints "<ref>\t<merge-base>"; the rebase only needs the
+  # branch point commit, so keep the trailing field.
+  local resolved
+  resolved=$(gt_resolve_base) ||
+    _die "could not determine branch base; pass --base <rev>"
+  printf '%s\n' "${resolved#*$'\t'}"
 }
 
 _validate_base() {

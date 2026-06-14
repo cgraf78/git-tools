@@ -153,6 +153,35 @@ refuses the whole stack before merging anything if any PR is not ready. As each
 parent lands, the next child is restacked onto the root base branch before it is
 landed.
 
+### `git branch-audit`
+
+Lists local branches with their state relative to the default branch: last
+commit age, ahead/behind counts, merged-into-default status, and the open PR
+number when GitHub data is available. The default branch is the reference point
+and is omitted from the listing.
+
+```sh
+git branch-audit
+git branch-audit --porcelain
+git branch-audit --base main
+```
+
+Use `--porcelain` for stable tab-separated `branch` records (name, merged,
+ahead, behind, PR number, commit timestamp, and a `gone` flag for deleted
+upstreams) that other scripts can filter.
+
+PR lookup is best-effort: when `gh` is missing or unauthenticated, the audit
+still reports local branch state and omits PR numbers.
+
+Use `--drop-merged` to delete branches already merged into the default branch.
+The current branch and branches checked out in a worktree are skipped. The
+deletion requires `--yes` unless `--dry-run` is also given:
+
+```sh
+git branch-audit --drop-merged --dry-run
+git branch-audit --drop-merged --yes
+```
+
 ### `git cleanup-repo`
 
 Fetches and prunes the remote, updates the repository's default branch, then
@@ -269,6 +298,7 @@ commands are invoked as:
 ```sh
 git cleanup-repo
 git absorb-and-rebase
+git branch-audit
 git pr-checks
 git pr-land
 git pr-land-stack

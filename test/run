@@ -6,6 +6,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck "$ROOT/bin/git-absorb-and-rebase" \
+    "$ROOT/bin/git-branch-audit" \
     "$ROOT/bin/git-cleanup-repo" \
     "$ROOT/bin/git-pr-checks" \
     "$ROOT/bin/git-pr-land" \
@@ -24,6 +25,7 @@ if command -v shellcheck >/dev/null 2>&1; then
     "$ROOT/install.sh" \
     "$ROOT/test/extras-test" \
     "$ROOT/test/git-absorb-and-rebase-test" \
+    "$ROOT/test/git-branch-audit-test" \
     "$ROOT/test/git-cleanup-repo-test" \
     "$ROOT/test/git-pr-checks-test" \
     "$ROOT/test/git-pr-land-test" \
@@ -41,6 +43,7 @@ fi
 
 "$ROOT/test/extras-test"
 "$ROOT/test/git-absorb-and-rebase-test"
+"$ROOT/test/git-branch-audit-test"
 "$ROOT/test/git-cleanup-repo-test"
 "$ROOT/test/git-pr-checks-test"
 "$ROOT/test/git-pr-land-test"

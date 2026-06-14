@@ -1,0 +1,69 @@
+.TH GIT-BRANCH-AUDIT 1 "2026-06-13" "git-tools" "User Commands"
+.SH NAME
+git-branch-audit \- audit local branches against the default branch
+.SH SYNOPSIS
+.B git branch-audit
+.RI [ options ]
+.SH DESCRIPTION
+.B git branch-audit
+lists local branches with their state relative to the default branch: last
+commit age, ahead/behind counts, whether they are merged into the default
+branch, and the open pull request number when GitHub data is available.
+.PP
+The default branch is the reference point and is omitted from the listing. PR
+lookup is best-effort: when
+.B gh
+is missing or unauthenticated the audit still reports local branch state and
+omits PR numbers.
+.SH OPTIONS
+.TP
+.B \-\-porcelain
+Print stable tab-separated
+.B branch
+records:
+.BR name ,
+.B merged
+(true/false),
+.BR ahead ,
+.BR behind ,
+.B pr
+number (may be empty),
+.B committerdate
+as a Unix timestamp, and
+.B gone
+(true/false for a deleted upstream).
+.TP
+.B \-\-drop-merged
+Delete local branches already merged into the default branch. The current
+branch and branches checked out in a worktree are skipped. Requires
+.B \-\-yes
+unless
+.B \-\-dry-run
+is also used.
+.TP
+.B \-\-yes
+Confirm
+.BR \-\-drop-merged .
+.TP
+.BI "\-b, \-\-base " branch
+Use this branch as the default instead of inferring one.
+.TP
+.BR \-n ", " \-\-dry-run
+Print drop actions without changing anything.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH EXIT STATUS
+.TP
+.B 0
+Audit or cleanup completed.
+.TP
+.B 1
+Branch deletion failed.
+.TP
+.B 2
+Usage or local environment error.
+.SH SEE ALSO
+.BR git-cleanup-repo (1),
+.BR git-repo-state (1),
+.BR git-stash-audit (1)

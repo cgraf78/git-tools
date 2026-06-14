@@ -1,4 +1,5 @@
 #compdef git-pr-land
+#description land one ready GitHub pull request
 
 _git_pr_land_refs() {
   local -a refs

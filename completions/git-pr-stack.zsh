@@ -1,4 +1,5 @@
 #compdef git-pr-stack
+#description discover a linear GitHub pull request stack
 
 _git_pr_stack_refs() {
   local -a refs

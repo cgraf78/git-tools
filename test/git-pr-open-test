@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_git_remote_repo() {
+  local remote="$1"
+  local seed="$2"
+
+  git init -q --bare --initial-branch=main "$remote"
+  git init -q --initial-branch=main "$seed"
+  git -C "$seed" config user.email "test@test.com"
+  git -C "$seed" config user.name "Test"
+  git -C "$seed" config core.hooksPath /dev/null
+  printf 'base\n' >"$seed/README.md"
+  git -C "$seed" add README.md
+  git -C "$seed" commit -m base >/dev/null
+  git -C "$seed" remote add origin "$remote"
+  git -C "$seed" push -u origin main >/dev/null 2>&1
+}
+
+_clone_feature_repo() {
+  local remote="$1"
+  local repo="$2"
+
+  git clone -q "$remote" "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+  git -C "$repo" switch -q -c feature/open
+  printf 'feature\n' >"$repo/feature.txt"
+  git -C "$repo" add feature.txt
+  git -C "$repo" commit -m feature >/dev/null
+}
+
+_write_gh_stub() {
+  local bin="$1/gh"
+  cat >"$bin" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\n' "$*" >>"${GH_LOG:?}"
+
+if [[ "$1 $2" == "auth status" ]]; then
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr create" ]]; then
+  printf 'https://example/pr/11\n'
+  exit 0
+fi
+
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 99
+EOF
+  chmod +x "$bin"
+}
+
+echo "=== git pr-open ==="
+
+remote=$(_tmpdir)/remote.git
+seed=$(_tmpdir)/seed
+repo=$(_tmpdir)/repo
+bin_dir=$(_tmpdir)
+log=$(_tmpdir)/gh.log
+export GH_LOG="$log"
+_git_remote_repo "$remote" "$seed"
+_clone_feature_repo "$remote" "$repo"
+_write_gh_stub "$bin_dir"
+
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-open --title "Open PR" --body "Body" 2>&1)
+_assert_contains "creates PR" "https://example/pr/11" "$result"
+_assert_contains "passes base and head" "pr create --base main --head feature/open" "$(<"$log")"
+_assert_contains "passes title and body" "--title Open PR --body Body" "$(<"$log")"
+_assert_contains "pushes current branch" "feature/open" "$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')"
+
+: >"$log"
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-open --fill --draft --no-maintainer-edit --dry-run 2>&1)
+_assert_contains "dry run prints push" "would run: git push -u origin feature/open" "$result"
+_assert_contains "dry run passes gh dry-run" "--dry-run --fill" "$result"
+_assert_contains "fill mode skips title requirement" "would run: gh pr create" "$result"
+
+body_file=$(_tmpdir)/body.md
+printf 'from file\n' >"$body_file"
+: >"$log"
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-open --title "Body File" --body-file "$body_file" 2>&1)
+_assert_contains "passes body file" "--body-file $body_file" "$(<"$log")"
+
+dirty_repo=$(_tmpdir)/dirty
+_clone_feature_repo "$remote" "$dirty_repo"
+printf 'dirty\n' >>"$dirty_repo/feature.txt"
+result=$(PATH="$bin_dir:$PATH" git -C "$dirty_repo" pr-open --title Dirty 2>&1 || true)
+_assert_contains "refuses dirty worktree" "worktree must be clean" "$result"
+
+stale_repo=$(_tmpdir)/stale
+_clone_feature_repo "$remote" "$stale_repo"
+printf 'new base\n' >>"$seed/README.md"
+git -C "$seed" add README.md
+git -C "$seed" commit -m update-base >/dev/null
+git -C "$seed" push origin main >/dev/null 2>&1
+result=$(PATH="$bin_dir:$PATH" git -C "$stale_repo" pr-open --title Stale 2>&1 || true)
+_assert_contains "refuses stale local base" "local base branch is stale" "$result"
+
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-open 2>&1 || true)
+_assert_contains "requires title without fill" "--title is required" "$result"
+
+outside=$(_tmpdir)
+result=$(PATH="$bin_dir:$PATH" git -C "$outside" pr-open --title Outside 2>&1 || true)
+_assert_contains "requires git repo" "not inside a git repository" "$result"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

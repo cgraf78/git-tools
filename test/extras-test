@@ -103,6 +103,9 @@ _description_for() {
     git-pr-land-stack)
       printf '%s\n' 'land a ready linear GitHub pull request stack'
       ;;
+    git-pr-open)
+      printf '%s\n' 'push a branch and create a pull request'
+      ;;
     git-pr-ready)
       printf '%s\n' 'check whether a GitHub pull request is landable'
       ;;
@@ -130,6 +133,7 @@ _commands=(
   git-pr-checks
   git-pr-land
   git-pr-land-stack
+  git-pr-open
   git-pr-ready
   git-pr-restack
   git-pr-stack

@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# Rebase one pull-request branch onto a target base and push with lease.
+
+set -euo pipefail
+
+# shellcheck disable=SC2034 # consumed by lib/git-tools-pr.sh after dynamic source
+gt_command="git pr-restack"
+
+_script_path="${BASH_SOURCE[0]}"
+while [[ -L "$_script_path" ]]; do
+  _script_dir=$(cd -P -- "$(dirname -- "$_script_path")" && pwd)
+  _link=$(readlink "$_script_path")
+  case "$_link" in
+    /*) _script_path="$_link" ;;
+    *) _script_path="$_script_dir/$_link" ;;
+  esac
+done
+_root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-pr.sh"
+
+_usage() {
+  cat <<'EOF'
+Usage: git pr-restack [options] <number|url|branch>
+
+Rebase one open PR's head branch onto a base branch and push it with
+--force-with-lease. By default, the base is the PR's current base branch.
+
+Options:
+  -b, --base <branch>   Rebase onto this branch and update the PR base.
+      --no-push         Rebase locally without pushing or editing the PR base.
+  -n, --dry-run         Print actions without changing anything.
+  -h, --help            Show this help.
+
+Exit status:
+  0  PR branch was restacked.
+  1  Restack failed.
+  2  Usage or local environment error.
+EOF
+}
+
+_target=""
+_base_override=""
+_push=1
+_dry_run=0
+
+_run() {
+  if [[ "$_dry_run" == 1 ]]; then
+    printf 'git pr-restack: would run:' >&2
+    printf ' %q' "$@" >&2
+    printf '\n' >&2
+    return 0
+  fi
+  "$@"
+}
+
+while (($#)); do
+  case "$1" in
+    -b | --base)
+      _opt="$1"
+      shift
+      (($#)) || gt_usage_error "$_opt requires a value"
+      _base_override="$1"
+      shift
+      ;;
+    --base=*)
+      _base_override="${1#--base=}"
+      [[ -n "$_base_override" ]] || gt_usage_error "--base requires a value"
+      shift
+      ;;
+    --no-push)
+      _push=0
+      shift
+      ;;
+    -n | --dry-run)
+      _dry_run=1
+      shift
+      ;;
+    -h | --help)
+      _usage
+      exit 0
+      ;;
+    --)
+      shift
+      (($# == 1)) || gt_usage_error "expected exactly one target"
+      _target="$1"
+      break
+      ;;
+    -*)
+      gt_usage_error "unexpected option: $1"
+      ;;
+    *)
+      [[ -z "$_target" ]] || gt_usage_error "expected exactly one target"
+      _target="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$_target" ]] || gt_usage_error "expected exactly one target"
+
+_remote_for_branch() {
+  local branch="$1"
+  local remote
+
+  remote=$(git config "branch.$branch.remote" 2>/dev/null || true)
+  if [[ -n "$remote" ]]; then
+    printf '%s\n' "$remote"
+    return 0
+  fi
+  printf 'origin\n'
+}
+
+_remote_branch_exists() {
+  local remote="$1"
+  local branch="$2"
+  git show-ref --verify --quiet "refs/remotes/$remote/$branch"
+}
+
+_local_branch_exists() {
+  git show-ref --verify --quiet "refs/heads/$1"
+}
+
+_checkout_head() {
+  local remote="$1"
+  local branch="$2"
+
+  if _local_branch_exists "$branch"; then
+    _run git switch --quiet "$branch"
+    return 0
+  fi
+
+  if _remote_branch_exists "$remote" "$branch"; then
+    _run git switch --quiet -c "$branch" --track "$remote/$branch"
+    return 0
+  fi
+
+  gt_die "PR head branch does not exist locally or on $remote: $branch"
+}
+
+_base_ref() {
+  local remote="$1"
+  local base="$2"
+
+  if _remote_branch_exists "$remote" "$base"; then
+    printf '%s/%s\n' "$remote" "$base"
+    return 0
+  fi
+  git rev-parse --verify --quiet "$base^{commit}" >/dev/null ||
+    gt_die "base is not a local or $remote branch: $base"
+  printf '%s\n' "$base"
+}
+
+gt_require_repo
+gt_require_gh
+if [[ "$_dry_run" != 1 ]]; then
+  gt_require_clean_worktree
+fi
+
+_view=$(gt_pr_view_tsv "$_target") || gt_die "could not read pull request"
+IFS=$'\t' read -r _number _state _draft _merge_state _head _current_base _url _title <<<"$_view"
+
+[[ "$_state" == "OPEN" ]] || gt_die "PR #$_number is not open"
+gt_bool "$_draft" && gt_die "PR #$_number is a draft"
+
+_new_base="${_base_override:-$_current_base}"
+_remote=$(_remote_for_branch "$_head")
+
+_run git fetch --quiet --prune --tags "$_remote"
+_checkout_head "$_remote" "$_head"
+_onto=$(_base_ref "$_remote" "$_new_base")
+
+gt_say "rebasing $_head onto $_onto"
+_run git rebase "$_onto"
+
+if [[ "$_push" == 1 ]]; then
+  gt_say "pushing $_head to $_remote with --force-with-lease"
+  _run git push --force-with-lease "$_remote" "$_head"
+  if [[ -n "$_base_override" && "$_base_override" != "$_current_base" ]]; then
+    gt_say "updating PR #$_number base to $_base_override"
+    _run gh pr edit "$_number" --base "$_base_override"
+  fi
+else
+  gt_say "push skipped"
+  if [[ -n "$_base_override" && "$_base_override" != "$_current_base" ]]; then
+    gt_say "PR base update skipped"
+  fi
+fi
+
+gt_say "restacked PR #$_number ($_head -> $_new_base)"

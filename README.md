@@ -46,6 +46,21 @@ git pr-stack --porcelain
 If a stack branches into multiple child PRs, the command stops instead of
 guessing a landing order.
 
+### `git pr-restack`
+
+Rebases one open PR's head branch onto a target base and pushes with
+`--force-with-lease`.
+
+```sh
+git pr-restack 123
+git pr-restack 123 --base main
+git pr-restack 123 --base main --no-push
+```
+
+Use `--base` when a parent PR landed and the child should now target the landed
+base branch. The command updates the PR base after the local rebase succeeds.
+With `--no-push`, it rebases locally and skips remote PR base edits.
+
 ### `git cleanup-repo`
 
 Fetches and prunes the remote, updates the repository's default branch, then
@@ -129,6 +144,7 @@ commands are invoked as:
 git cleanup-repo
 git absorb-and-rebase
 git pr-ready
+git pr-restack
 git pr-stack
 ```
 
@@ -154,6 +170,7 @@ Or run the focused command test directly:
 test/git-absorb-and-rebase-test
 test/git-cleanup-repo-test
 test/git-pr-ready-test
+test/git-pr-restack-test
 test/git-pr-stack-test
 ```
 

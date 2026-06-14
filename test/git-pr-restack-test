@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_eq() {
+  local name="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %q\n' "$expected" >&2
+    printf '  actual:   %q\n' "$actual" >&2
+  fi
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_commit_file() {
+  local repo="$1"
+  local path="$2"
+  local content="$3"
+  local message="$4"
+
+  mkdir -p "$(dirname "$repo/$path")"
+  printf '%s\n' "$content" >"$repo/$path"
+  git -C "$repo" add "$path"
+  git -C "$repo" commit -m "$message" >/dev/null
+}
+
+_init_stack_repo() {
+  local repo="$1"
+  local remote="$2"
+
+  git init --bare --initial-branch=main "$remote" >/dev/null
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+  _commit_file "$repo" README.md base base
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -u origin main >/dev/null 2>&1
+
+  git -C "$repo" switch --quiet -c parent
+  _commit_file "$repo" parent.txt parent parent
+  git -C "$repo" push -u origin parent >/dev/null 2>&1
+
+  git -C "$repo" switch --quiet -c child
+  _commit_file "$repo" child.txt child child
+  git -C "$repo" push -u origin child >/dev/null 2>&1
+
+  git -C "$repo" switch --quiet main
+  git -C "$repo" merge --ff-only parent >/dev/null
+  git -C "$repo" push origin main >/dev/null 2>&1
+}
+
+_write_gh_stub() {
+  local dir="$1"
+  local bin="$dir/gh"
+  cat >"$bin" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+log="${GH_LOG:?}"
+
+if [[ "$1 $2" == "auth status" ]]; then
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr view" ]]; then
+  case "${GH_PR_CASE:-open}" in
+    open)
+      printf '2\tOPEN\tfalse\tCLEAN\tchild\tparent\thttps://example/pr/2\tChild PR\n'
+      ;;
+    draft)
+      printf '2\tOPEN\ttrue\tCLEAN\tchild\tparent\thttps://example/pr/2\tChild PR\n'
+      ;;
+  esac
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr edit" ]]; then
+  printf '%s\n' "$*" >>"$log"
+  exit 0
+fi
+
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 99
+EOF
+  chmod +x "$bin"
+}
+
+echo "=== git pr-restack ==="
+
+repo=$(_tmpdir)
+remote=$(_tmpdir)
+bin_dir=$(_tmpdir)
+log=$(_tmpdir)/gh.log
+_init_stack_repo "$repo" "$remote"
+_write_gh_stub "$bin_dir"
+
+result=$(GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-restack 2 --base main 2>&1)
+_assert_contains "rebases onto requested base" "rebasing child onto origin/main" "$result"
+_assert_contains "pushes with lease" "pushing child to origin with --force-with-lease" "$result"
+_assert_eq "leaves child checked out" "child" "$(git -C "$repo" branch --show-current)"
+_assert_eq "updates PR base" "pr edit 2 --base main" "$(cat "$log")"
+
+repo_no_push=$(_tmpdir)
+remote_no_push=$(_tmpdir)
+log_no_push=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_no_push" "$remote_no_push"
+result=$(GH_LOG="$log_no_push" PATH="$bin_dir:$PATH" git -C "$repo_no_push" pr-restack 2 --base main --no-push 2>&1)
+_assert_contains "supports no-push mode" "push skipped" "$result"
+_assert_contains "no-push skips remote PR edits" "PR base update skipped" "$result"
+if [[ -f "$log_no_push" ]]; then
+  _assert_eq "no-push does not edit PR base" "" "$(cat "$log_no_push")"
+else
+  _pass "no-push does not edit PR base"
+fi
+
+repo_dry=$(_tmpdir)
+remote_dry=$(_tmpdir)
+log_dry=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_dry" "$remote_dry"
+result=$(GH_LOG="$log_dry" PATH="$bin_dir:$PATH" git -C "$repo_dry" pr-restack 2 --base main --dry-run 2>&1)
+_assert_contains "dry run prints fetch" "would run: git fetch" "$result"
+_assert_eq "dry run does not switch branches" "main" "$(git -C "$repo_dry" branch --show-current)"
+
+repo_dirty=$(_tmpdir)
+remote_dirty=$(_tmpdir)
+log_dirty=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_dirty" "$remote_dirty"
+printf 'dirty\n' >"$repo_dirty/dirty.txt"
+result=$(GH_LOG="$log_dirty" PATH="$bin_dir:$PATH" git -C "$repo_dirty" pr-restack 2 --base main 2>&1 || true)
+_assert_contains "refuses dirty worktrees" "worktree must be clean" "$result"
+
+result=$(GH_PR_CASE=draft GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-restack 2 --base main 2>&1 || true)
+_assert_contains "refuses draft PRs" "PR #2 is a draft" "$result"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

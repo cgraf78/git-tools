@@ -109,6 +109,36 @@ set -euo pipefail
 if [[ "$1 $2" == "auth status" ]]; then
   exit 0
 fi
+if [[ "$1 $2" == "pr view" ]]; then
+  case "${3:-}" in
+    2)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\tmain\thttps://example/pr/2\tChild PR\n'
+      ;;
+    3)
+      printf '3\tOPEN\tfalse\tCLEAN\tfeature/c\tmain\thttps://example/pr/3\tGrandchild PR\n'
+      ;;
+    *)
+      printf 'unexpected pr view target: %s\n' "${3:-}" >&2
+      exit 99
+      ;;
+  esac
+  exit 0
+fi
+if [[ "$1 $2" == "pr checks" ]]; then
+  printf 'checks %s\n' "$*" >>"${STACK_LOG:?}"
+  case "${GH_CHECK_CASE:-pass}" in
+    pass)
+      printf '{"pass":2}\n'
+      ;;
+    fail)
+      printf '{"fail":1}\n'
+      ;;
+    none)
+      printf '{"none":1}\n'
+      ;;
+  esac
+  exit 0
+fi
 printf 'unexpected gh call: %s\n' "$*" >&2
 exit 99
 EOF
@@ -131,8 +161,10 @@ PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" git -C "$re
 expected="$(cat <<'EOF'
 land 1 --method squash --keep-branch
 restack 2 --base main
+checks pr checks 2 --json bucket --jq [.[].bucket] | group_by(.) | map({key: .[0], value: length}) | from_entries
 land 2 --method squash --keep-branch
 restack 3 --base main
+checks pr checks 3 --json bucket --jq [.[].bucket] | group_by(.) | map({key: .[0], value: length}) | from_entries
 land 3 --method squash
 EOF
 )"
@@ -166,8 +198,14 @@ _assert_contains "dry run passes through to restack" "restack 2 --base main --dr
 result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_CASE=blocked STACK_LOG="$log" git -C "$repo" pr-land-stack 1 2>&1 || true)
 _assert_contains "refuses unready stacks before landing" "PR #2 is not ready: checks pending" "$result"
 
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" GH_CHECK_CASE=fail STACK_LOG="$log" git -C "$repo" pr-land-stack 1 2>&1 || true)
+_assert_contains "refuses failed post-restack checks" "PR #2 checks failed after restack" "$result"
+
 result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" git -C "$repo" pr-land-stack 1 --method bad 2>&1 || true)
 _assert_contains "validates merge method" "merge method must be squash, merge, or rebase" "$result"
+
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" git -C "$repo" pr-land-stack 1 --check-timeout 0 2>&1 || true)
+_assert_contains "validates check timeout" "--check-timeout must be greater than zero" "$result"
 
 outside=$(_tmpdir)
 result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" git -C "$outside" pr-land-stack 1 2>&1 || true)

@@ -235,8 +235,9 @@ gt_require_repo
 _repo_root=$(git rev-parse --show-toplevel)
 _git_dir=$(git rev-parse --git-dir)
 _branch=$(git symbolic-ref -q --short HEAD 2>/dev/null || printf 'DETACHED')
-# An unresolvable default branch is informational here, not fatal.
-_default=$(gt_default_branch || printf 'unknown')
+# An unresolvable default branch is informational here, not fatal. repo-state
+# has always reported origin's default, so name the remote explicitly.
+_default=$(gt_default_branch origin || printf 'unknown')
 _operation=$(_operation "$_git_dir")
 _stashes=$(_stash_count)
 

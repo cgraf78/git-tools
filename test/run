@@ -12,8 +12,10 @@ if command -v shellcheck >/dev/null 2>&1; then
     "$ROOT/bin/git-pr-ready" \
     "$ROOT/bin/git-pr-restack" \
     "$ROOT/bin/git-pr-stack" \
+    "$ROOT"/completions/*.bash \
     "$ROOT/lib/git-tools-pr.sh" \
     "$ROOT/install.sh" \
+    "$ROOT/test/extras-test" \
     "$ROOT/test/git-absorb-and-rebase-test" \
     "$ROOT/test/git-cleanup-repo-test" \
     "$ROOT/test/git-pr-land-test" \
@@ -24,6 +26,7 @@ if command -v shellcheck >/dev/null 2>&1; then
     "$ROOT/test/run"
 fi
 
+"$ROOT/test/extras-test"
 "$ROOT/test/git-absorb-and-rebase-test"
 "$ROOT/test/git-cleanup-repo-test"
 "$ROOT/test/git-pr-land-test"

@@ -3,22 +3,52 @@
 set -euo pipefail
 
 PREFIX="${PREFIX:-$HOME/.local}"
+SHARE_DIR="${SHARE_DIR:-$PREFIX/share}"
 BIN_DIR="${BIN_DIR:-$PREFIX/bin}"
+MAN_DIR="${MAN_DIR:-$SHARE_DIR/man/man1}"
+BASH_COMPLETION_DIR="${BASH_COMPLETION_DIR:-$SHARE_DIR/bash-completion/completions}"
+ZSH_COMPLETION_DIR="${ZSH_COMPLETION_DIR:-$SHARE_DIR/zsh/site-functions}"
+FISH_COMPLETION_DIR="${FISH_COMPLETION_DIR:-$SHARE_DIR/fish/vendor_completions.d}"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-mkdir -p "$BIN_DIR"
-ln -sf "$ROOT/bin/git-absorb-and-rebase" "$BIN_DIR/git-absorb-and-rebase"
-ln -sf "$ROOT/bin/git-cleanup-repo" "$BIN_DIR/git-cleanup-repo"
-ln -sf "$ROOT/bin/git-pr-land" "$BIN_DIR/git-pr-land"
-ln -sf "$ROOT/bin/git-pr-land-stack" "$BIN_DIR/git-pr-land-stack"
-ln -sf "$ROOT/bin/git-pr-ready" "$BIN_DIR/git-pr-ready"
-ln -sf "$ROOT/bin/git-pr-restack" "$BIN_DIR/git-pr-restack"
-ln -sf "$ROOT/bin/git-pr-stack" "$BIN_DIR/git-pr-stack"
+COMMANDS=(
+  git-absorb-and-rebase
+  git-cleanup-repo
+  git-pr-land
+  git-pr-land-stack
+  git-pr-ready
+  git-pr-restack
+  git-pr-stack
+)
 
-printf 'installed git-absorb-and-rebase to %s\n' "$BIN_DIR"
-printf 'installed git-cleanup-repo to %s\n' "$BIN_DIR"
-printf 'installed git-pr-land to %s\n' "$BIN_DIR"
-printf 'installed git-pr-land-stack to %s\n' "$BIN_DIR"
-printf 'installed git-pr-ready to %s\n' "$BIN_DIR"
-printf 'installed git-pr-restack to %s\n' "$BIN_DIR"
-printf 'installed git-pr-stack to %s\n' "$BIN_DIR"
+mkdir -p "$BIN_DIR"
+for command in "${COMMANDS[@]}"; do
+  ln -sf "$ROOT/bin/$command" "$BIN_DIR/$command"
+  printf 'installed %s to %s\n' "$command" "$BIN_DIR"
+done
+
+mkdir -p "$MAN_DIR"
+for page in "$ROOT"/man/man1/*.1; do
+  ln -sf "$page" "$MAN_DIR/$(basename "$page")"
+done
+printf 'installed man pages to %s\n' "$MAN_DIR"
+
+mkdir -p "$BASH_COMPLETION_DIR"
+for completion in "$ROOT"/completions/*.bash; do
+  name=$(basename "$completion" .bash)
+  ln -sf "$completion" "$BASH_COMPLETION_DIR/$name"
+done
+printf 'installed bash completions to %s\n' "$BASH_COMPLETION_DIR"
+
+mkdir -p "$ZSH_COMPLETION_DIR"
+for completion in "$ROOT"/completions/*.zsh; do
+  name=$(basename "$completion" .zsh)
+  ln -sf "$completion" "$ZSH_COMPLETION_DIR/_$name"
+done
+printf 'installed zsh completions to %s\n' "$ZSH_COMPLETION_DIR"
+
+mkdir -p "$FISH_COMPLETION_DIR"
+for completion in "$ROOT"/completions/*.fish; do
+  ln -sf "$completion" "$FISH_COMPLETION_DIR/$(basename "$completion")"
+done
+printf 'installed fish completions to %s\n' "$FISH_COMPLETION_DIR"

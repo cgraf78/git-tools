@@ -1,0 +1,34 @@
+.TH GIT-PR-READY 1 "2026-06-13" "git-tools" "User Commands"
+.SH NAME
+git-pr-ready \- check whether a GitHub pull request is landable
+.SH SYNOPSIS
+.B git pr-ready
+.RI [ options ]
+.RI [ number|url|branch ]
+.SH DESCRIPTION
+.B git pr-ready
+checks whether a GitHub pull request is open, non-draft, conflict-free, and has
+passing checks. Without a target, it uses the pull request for the current
+branch.
+.SH OPTIONS
+.TP
+.B \-\-porcelain
+Print stable
+.B key=value
+output for scripts.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH EXIT STATUS
+.TP
+.B 0
+Pull request is ready.
+.TP
+.B 1
+Pull request is not ready, or GitHub status could not be read.
+.TP
+.B 2
+Usage or local environment error.
+.SH SEE ALSO
+.BR git-pr-stack (1),
+.BR git-pr-land (1)

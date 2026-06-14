@@ -1,0 +1,56 @@
+.TH GIT-PR-LAND-STACK 1 "2026-06-13" "git-tools" "User Commands"
+.SH NAME
+git-pr-land-stack \- land a ready linear GitHub pull request stack
+.SH SYNOPSIS
+.B git pr-land-stack
+.RI [ options ]
+.I number|url|branch
+.SH DESCRIPTION
+.B git pr-land-stack
+lands a linear stack of ready GitHub pull requests from parent to child.
+It composes
+.BR git-pr-stack (1),
+.BR git-pr-land (1),
+and
+.BR git-pr-restack (1).
+.PP
+The command refuses the whole stack before merging anything if any pull request
+is not ready. As each parent lands, the next child is restacked onto the root
+base branch before it is landed.
+.SH OPTIONS
+.TP
+.BR \-m ", " \-\-method " " \fImethod\fR
+Merge method:
+.BR squash ,
+.BR merge ,
+or
+.BR rebase .
+Defaults to
+.BR squash .
+.TP
+.B \-\-keep\-branch
+Pass
+.B \-\-keep\-branch
+to
+.BR git-pr-land (1).
+.TP
+.BR \-n ", " \-\-dry\-run
+Print actions without changing anything.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH EXIT STATUS
+.TP
+.B 0
+Stack was landed.
+.TP
+.B 1
+Stack is not ready or a child restack or merge failed.
+.TP
+.B 2
+Usage or local environment error.
+.SH SEE ALSO
+.BR git-pr-ready (1),
+.BR git-pr-stack (1),
+.BR git-pr-restack (1),
+.BR git-pr-land (1)

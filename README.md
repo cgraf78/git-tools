@@ -185,7 +185,21 @@ For a simple local install:
 ./install.sh
 ```
 
-Set `PREFIX` or `BIN_DIR` to choose another destination.
+Set `PREFIX` or `BIN_DIR` to choose another command destination. The installer
+also links bundled man pages and completions using standard XDG-style
+subdirectories under `PREFIX/share`:
+
+```text
+share/man/man1/
+share/bash-completion/completions/
+share/zsh/site-functions/
+share/fish/vendor_completions.d/
+```
+
+Override `MAN_DIR`, `BASH_COMPLETION_DIR`, `ZSH_COMPLETION_DIR`, or
+`FISH_COMPLETION_DIR` when a shell expects a different local directory. The
+repo also keeps the source files in the shdeps-discoverable layout:
+`man/man1/*.1` and `completions/*.{bash,zsh,fish}`.
 
 ## Test
 
@@ -198,6 +212,7 @@ test/run
 Or run the focused command test directly:
 
 ```sh
+test/extras-test
 test/git-absorb-and-rebase-test
 test/git-cleanup-repo-test
 test/git-pr-land-test

@@ -1,0 +1,37 @@
+.TH GIT-PR-STACK 1 "2026-06-13" "git-tools" "User Commands"
+.SH NAME
+git-pr-stack \- discover a linear GitHub pull request stack
+.SH SYNOPSIS
+.B git pr-stack
+.RI [ options ]
+.RI [ number|url|branch ]
+.SH DESCRIPTION
+.B git pr-stack
+discovers the linear GitHub pull request stack connected to a target pull
+request and prints it in parent-to-child order. Without a target, it uses the
+pull request for the current branch.
+.PP
+A stack is connected when one pull request's base branch is another pull
+request's head branch. If a stack branches into multiple child pull requests,
+the command stops instead of guessing a landing order.
+.SH OPTIONS
+.TP
+.B \-\-porcelain
+Print one stable tab-separated record per pull request for scripts.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH EXIT STATUS
+.TP
+.B 0
+Stack printed.
+.TP
+.B 1
+Stack could not be read or is branched.
+.TP
+.B 2
+Usage or local environment error.
+.SH SEE ALSO
+.BR git-pr-ready (1),
+.BR git-pr-restack (1),
+.BR git-pr-land-stack (1)

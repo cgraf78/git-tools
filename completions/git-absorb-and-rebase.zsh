@@ -1,4 +1,5 @@
 #compdef git-absorb-and-rebase
+#description absorb staged changes into earlier commits
 
 _git_absorb_and_rebase_refs() {
   local -a refs

@@ -1,4 +1,5 @@
 #compdef git-pr-ready
+#description check whether a GitHub pull request is landable
 
 _git_pr_ready_refs() {
   local -a refs

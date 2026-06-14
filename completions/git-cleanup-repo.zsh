@@ -1,4 +1,5 @@
 #compdef git-cleanup-repo
+#description clean stale local branches and worktrees
 
 _git_cleanup_repo_refs() {
   local -a refs

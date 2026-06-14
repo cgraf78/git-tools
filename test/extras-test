@@ -68,6 +68,53 @@ _assert_contains() {
   fi
 }
 
+_assert_line() {
+  local name="$1"
+  local expected="$2"
+  local path="$3"
+  local line_number="$4"
+  local actual
+
+  actual=$(sed -n "${line_number}p" "$path")
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected %s line %s: %s\n' "$path" "$line_number" "$expected" >&2
+    printf '  actual: %s\n' "$actual" >&2
+  fi
+}
+
+_description_for() {
+  case "$1" in
+    git-absorb-and-rebase)
+      printf '%s\n' 'absorb staged changes into earlier commits'
+      ;;
+    git-cleanup-repo)
+      printf '%s\n' 'clean stale local branches and worktrees'
+      ;;
+    git-pr-land)
+      printf '%s\n' 'land one ready GitHub pull request'
+      ;;
+    git-pr-land-stack)
+      printf '%s\n' 'land a ready linear GitHub pull request stack'
+      ;;
+    git-pr-ready)
+      printf '%s\n' 'check whether a GitHub pull request is landable'
+      ;;
+    git-pr-restack)
+      printf '%s\n' 'rebase one GitHub pull request branch onto a base'
+      ;;
+    git-pr-stack)
+      printf '%s\n' 'discover a linear GitHub pull request stack'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 _commands=(
   git-absorb-and-rebase
   git-cleanup-repo
@@ -81,8 +128,11 @@ _commands=(
 echo "=== extras ==="
 
 for command in "${_commands[@]}"; do
+  description=$(_description_for "$command")
+
   _assert_file "man page exists for $command" "$ROOT/man/man1/$command.1"
   _assert_contains "man page names $command" "$command" "$ROOT/man/man1/$command.1"
+  _assert_contains "man page summarizes $command" "$description" "$ROOT/man/man1/$command.1"
 
   _assert_file "bash completion exists for $command" "$ROOT/completions/$command.bash"
   _assert_contains "bash completion registers $command" "complete -F" "$ROOT/completions/$command.bash"
@@ -94,6 +144,7 @@ for command in "${_commands[@]}"; do
 
   _assert_file "zsh completion exists for $command" "$ROOT/completions/$command.zsh"
   _assert_contains "zsh completion declares $command" "#compdef $command" "$ROOT/completions/$command.zsh"
+  _assert_line "zsh completion describes $command for git subcommand listing" "#description $description" "$ROOT/completions/$command.zsh" 2
   if command -v zsh >/dev/null 2>&1; then
     if zsh -n "$ROOT/completions/$command.zsh"; then
       _pass "zsh completion parses for $command"

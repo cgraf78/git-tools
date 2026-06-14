@@ -1,4 +1,5 @@
 #compdef git-pr-restack
+#description rebase one GitHub pull request branch onto a base
 
 _git_pr_restack_refs() {
   local -a refs

@@ -1,4 +1,5 @@
 #compdef git-pr-land-stack
+#description land a ready linear GitHub pull request stack
 
 _git_pr_land_stack_refs() {
   local -a refs

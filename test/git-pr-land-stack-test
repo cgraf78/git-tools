@@ -189,12 +189,13 @@ git -C "$repo" branch feature/c
 _write_tool_stubs "$bin_dir"
 
 PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" git -C "$repo" pr-land-stack 1 >/tmp/pr-land-stack.out 2>&1
-expected="$(cat <<'EOF'
+expected="$(
+  cat <<'EOF'
 land 1 --method squash --keep-branch
-restack 2 --base main
+restack 2 --base main --fork feature/a
 checks pr checks 2 --json bucket --jq [.[].bucket] | group_by(.) | map({key: .[0], value: length}) | from_entries
 land 2 --method squash --keep-branch
-restack 3 --base main
+restack 3 --base main --fork feature/b
 checks pr checks 3 --json bucket --jq [.[].bucket] | group_by(.) | map({key: .[0], value: length}) | from_entries
 land 3 --method squash
 EOF
@@ -215,12 +216,12 @@ if git -C "$repo" show-ref --verify --quiet refs/heads/feature/c; then
 else
   _fail "leaves final branch cleanup to git pr-land"
 fi
-_assert_contains "reports stack completion" "landed stack rooted at PR #1" "$(< /tmp/pr-land-stack.out)"
+_assert_contains "reports stack completion" "landed stack rooted at PR #1" "$(</tmp/pr-land-stack.out)"
 
 log_dirty=$(_tmpdir)/stack.log
 view_count=$(_tmpdir)/view-count
 PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" GH_MERGE_CASE=dirty-then-clean GH_VIEW_COUNT="$view_count" STACK_LOG="$log_dirty" git -C "$repo" pr-land-stack 1 --check-timeout 3 --check-interval 1 >/tmp/pr-land-stack-dirty.out 2>&1
-_assert_contains "waits through transient dirty merge state" "waiting for PR #2 after restack: merge DIRTY, checks pass" "$(< /tmp/pr-land-stack-dirty.out)"
+_assert_contains "waits through transient dirty merge state" "waiting for PR #2 after restack: merge DIRTY, checks pass" "$(</tmp/pr-land-stack-dirty.out)"
 _assert_contains "lands after transient dirty merge state" "land 3 --method squash" "$(cat "$log_dirty")"
 
 result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" GH_MERGE_CASE=dirty STACK_LOG="$log" git -C "$repo" pr-land-stack 1 --check-timeout 1 --check-interval 1 2>&1 || true)
@@ -233,7 +234,7 @@ _assert_contains "passes keep-branch to land" "land 1 --method merge --keep-bran
 log_dry=$(_tmpdir)/stack.log
 PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log_dry" git -C "$repo" pr-land-stack 1 --dry-run >/tmp/pr-land-stack-dry.out 2>&1
 _assert_contains "dry run passes through to land" "land 1 --method squash --keep-branch --dry-run" "$(cat "$log_dry")"
-_assert_contains "dry run passes through to restack" "restack 2 --base main --dry-run" "$(cat "$log_dry")"
+_assert_contains "dry run passes through to restack" "restack 2 --base main --fork feature/a --dry-run" "$(cat "$log_dry")"
 
 result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_CASE=blocked STACK_LOG="$log" git -C "$repo" pr-land-stack 1 2>&1 || true)
 _assert_contains "refuses unready stacks before landing" "PR #2 is not ready: checks pending" "$result"

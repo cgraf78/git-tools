@@ -99,6 +99,36 @@ _init_stack_repo() {
   git -C "$repo" push origin main >/dev/null 2>&1
 }
 
+# Build a stack where the parent has been squash-merged: main carries a new
+# commit touching parent.txt with different content than the parent branch's
+# own commit, so a plain rebase of the child would re-apply (and conflict on)
+# the parent commit.
+_init_squash_repo() {
+  local repo="$1"
+  local remote="$2"
+
+  git init --bare --initial-branch=main "$remote" >/dev/null
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+  _commit_file "$repo" README.md base base
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -u origin main >/dev/null 2>&1
+
+  git -C "$repo" switch --quiet -c parent
+  _commit_file "$repo" parent.txt v1 parent
+  git -C "$repo" push -u origin parent >/dev/null 2>&1
+
+  git -C "$repo" switch --quiet -c child
+  _commit_file "$repo" child.txt child child
+  git -C "$repo" push -u origin child >/dev/null 2>&1
+
+  git -C "$repo" switch --quiet main
+  _commit_file "$repo" parent.txt squashed "squash parent"
+  git -C "$repo" push origin main >/dev/null 2>&1
+}
+
 _write_gh_stub() {
   local dir="$1"
   local bin="$dir/gh"
@@ -181,6 +211,27 @@ _assert_contains "refuses dirty worktrees" "worktree must be clean" "$result"
 
 result=$(GH_PR_CASE=draft GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-restack 2 --base main 2>&1 || true)
 _assert_contains "refuses draft PRs" "PR #2 is a draft" "$result"
+
+repo_fork=$(_tmpdir)
+remote_fork=$(_tmpdir)
+log_fork=$(_tmpdir)/gh.log
+_init_squash_repo "$repo_fork" "$remote_fork"
+result=$(GH_LOG="$log_fork" PATH="$bin_dir:$PATH" git -C "$repo_fork" pr-restack 2 --base main --fork parent 2>&1)
+_assert_contains "fork rebases with --onto from the old base" "dropping commits up to origin/parent" "$result"
+_assert_eq "fork drops the squash-merged parent commit" "squashed" "$(git -C "$repo_fork" show child:parent.txt)"
+_assert_eq "fork keeps the child's own change" "child" "$(git -C "$repo_fork" show child:child.txt)"
+if git -C "$repo_fork" merge-base --is-ancestor origin/main child; then
+  _pass "fork rebases the child onto the squashed base"
+else
+  _fail "fork rebases the child onto the squashed base"
+fi
+
+repo_badfork=$(_tmpdir)
+remote_badfork=$(_tmpdir)
+log_badfork=$(_tmpdir)/gh.log
+_init_squash_repo "$repo_badfork" "$remote_badfork"
+result=$(GH_LOG="$log_badfork" PATH="$bin_dir:$PATH" git -C "$repo_badfork" pr-restack 2 --base main --fork nope 2>&1 || true)
+_assert_contains "rejects an unknown fork ref" "fork is not a local or origin branch: nope" "$result"
 
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2

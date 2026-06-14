@@ -124,6 +124,14 @@ Use `--base` when a parent PR landed and the child should now target the landed
 base branch. The command updates the PR base after the local rebase succeeds.
 With `--no-push`, it rebases locally and skips remote PR base edits.
 
+A plain rebase replays everything since the merge base, which re-applies a
+squash-merged parent's commits and conflicts. Use `--fork <ref>` to name the old
+base so its commits are dropped instead (`git rebase --onto <base> <ref>`):
+
+```sh
+git pr-restack 123 --base main --fork parent-branch
+```
+
 ### `git pr-land`
 
 Verifies and merges one ready GitHub PR, then syncs the base branch locally and
@@ -151,7 +159,9 @@ git pr-land-stack 123 --dry-run
 The command composes `git pr-stack`, `git pr-land`, and `git pr-restack`. It
 refuses the whole stack before merging anything if any PR is not ready. As each
 parent lands, the next child is restacked onto the root base branch before it is
-landed.
+landed. The restack passes the just-landed parent's head as `git pr-restack
+--fork`, so squash-merged parent commits drop out cleanly instead of conflicting
+when they are replayed onto the root base. This works for every merge method.
 
 ### `git branch-audit`
 

@@ -8,12 +8,14 @@ if command -v shellcheck >/dev/null 2>&1; then
   shellcheck "$ROOT/bin/git-absorb-and-rebase" \
     "$ROOT/bin/git-cleanup-repo" \
     "$ROOT/bin/git-pr-ready" \
+    "$ROOT/bin/git-pr-restack" \
     "$ROOT/bin/git-pr-stack" \
     "$ROOT/lib/git-tools-pr.sh" \
     "$ROOT/install.sh" \
     "$ROOT/test/git-absorb-and-rebase-test" \
     "$ROOT/test/git-cleanup-repo-test" \
     "$ROOT/test/git-pr-ready-test" \
+    "$ROOT/test/git-pr-restack-test" \
     "$ROOT/test/git-pr-stack-test" \
     "$ROOT/test/run"
 fi
@@ -21,4 +23,5 @@ fi
 "$ROOT/test/git-absorb-and-rebase-test"
 "$ROOT/test/git-cleanup-repo-test"
 "$ROOT/test/git-pr-ready-test"
+"$ROOT/test/git-pr-restack-test"
 "$ROOT/test/git-pr-stack-test"

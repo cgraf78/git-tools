@@ -111,3 +111,21 @@ gt_resolve_base() {
 
   return 1
 }
+
+# @brief Print the worktree path that has the given branch checked out.
+# Prints nothing and returns 0 when the branch is not checked out in any
+# worktree; callers test for an empty result.
+gt_worktree_for_branch() {
+  local branch="$1"
+  git worktree list --porcelain |
+    awk -v want="branch refs/heads/$branch" '
+      /^worktree / {
+        path = substr($0, 10)
+        next
+      }
+      $0 == want {
+        print path
+        exit
+      }
+    '
+}

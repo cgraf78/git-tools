@@ -91,6 +91,9 @@ _description_for() {
     git-absorb-and-rebase)
       printf '%s\n' 'absorb staged changes into earlier commits'
       ;;
+    git-branch-audit)
+      printf '%s\n' 'audit local branches against the default branch'
+      ;;
     git-cleanup-repo)
       printf '%s\n' 'clean stale local branches and worktrees'
       ;;
@@ -135,6 +138,7 @@ _description_for() {
 
 _commands=(
   git-absorb-and-rebase
+  git-branch-audit
   git-cleanup-repo
   git-pr-checks
   git-pr-land

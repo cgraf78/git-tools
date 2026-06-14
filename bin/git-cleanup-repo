@@ -160,26 +160,11 @@ _delete_reason() {
   return 1
 }
 
-_worktree_for_branch() {
-  local branch="$1"
-  git worktree list --porcelain |
-    awk -v want="branch refs/heads/$branch" '
-      /^worktree / {
-        path = substr($0, 10)
-        next
-      }
-      $0 == want {
-        print path
-        exit
-      }
-    '
-}
-
 _remove_branch_worktree_if_needed() {
   local branch="$1"
   local path
 
-  path=$(_worktree_for_branch "$branch")
+  path=$(gt_worktree_for_branch "$branch")
   [[ -n "$path" ]] || return 0
 
   if [[ "$_remove_worktrees" != 1 ]]; then

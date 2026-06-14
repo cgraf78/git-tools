@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_eq() {
+  local name="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %q\n' "$expected" >&2
+    printf '  actual:   %q\n' "$actual" >&2
+  fi
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %q\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_assert_not_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" != *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output NOT to contain: %q\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_git_init() {
+  local repo="$1"
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+}
+
+_commit_file() {
+  local repo="$1" path="$2" content="$3" message="$4"
+  printf '%s\n' "$content" >"$repo/$path"
+  git -C "$repo" add "$path"
+  git -C "$repo" commit -q -m "$message"
+}
+
+_write_gh_stub() {
+  cat >"$1/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1 $2" == "auth status" ]]; then exit 0; fi
+if [[ "$1 $2" == "pr list" ]]; then
+  printf '101\tOPEN\tfalse\tCLEAN\tahead\tmain\thttps://example/pr/101\tAhead PR\n'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 99
+EOF
+  chmod +x "$1/gh"
+}
+
+_write_unauthenticated_gh_stub() {
+  cat >"$1/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1 $2" == "auth status" ]]; then exit 1; fi
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 99
+EOF
+  chmod +x "$1/gh"
+}
+
+# Build a repo with a merged branch, an ahead branch, and a branch whose
+# upstream was deleted. Echoes the repo path.
+_build_repo() {
+  local remote repo
+  remote=$(_tmpdir)
+  repo=$(_tmpdir)
+  git init -q --bare --initial-branch=main "$remote"
+  _git_init "$repo"
+  _commit_file "$repo" README.md base base
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -q -u origin main
+
+  git -C "$repo" switch -q -c merged
+  _commit_file "$repo" merged.txt merged "merged work"
+  git -C "$repo" switch -q main
+  git -C "$repo" merge -q --no-ff merged -m "merge merged"
+
+  git -C "$repo" switch -q -c ahead
+  _commit_file "$repo" ahead.txt ahead "ahead work"
+  git -C "$repo" switch -q main
+
+  git -C "$repo" switch -q -c gone
+  _commit_file "$repo" gone.txt gone "gone work"
+  git -C "$repo" push -q -u origin gone
+  git -C "$repo" push -q origin --delete gone
+  git -C "$repo" fetch -q --prune origin
+  git -C "$repo" switch -q main
+
+  printf '%s\n' "$repo"
+}
+
+echo "=== git branch-audit ==="
+
+repo=$(_build_repo)
+bin_dir=$(_tmpdir)
+_write_gh_stub "$bin_dir"
+
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" branch-audit --porcelain 2>&1)
+_assert_contains "porcelain reports ahead branch with PR" $'branch\tahead\tfalse\t1\t0\t101\t' "$result"
+_assert_contains "porcelain reports merged branch" $'branch\tmerged\ttrue\t0\t1\t\t' "$result"
+_assert_not_contains "porcelain omits the default branch" $'branch\tmain\t' "$result"
+
+gone_line=$(printf '%s\n' "$result" | grep -F $'branch\tgone\t')
+_assert_contains "porcelain reports gone branch counts" $'branch\tgone\tfalse\t1\t0\t\t' "$gone_line"
+_assert_eq "gone branch flags a deleted upstream" "true" "$(printf '%s' "$gone_line" | awk -F'\t' '{print $NF}')"
+
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" branch-audit 2>&1)
+_assert_contains "human reports merged state" "merged merged=true ahead=0 behind=1" "$result"
+_assert_contains "human reports ahead branch with PR" "ahead merged=false ahead=1 behind=0 gone=false pr=#101" "$result"
+
+# Best-effort PR lookup: still works when gh is unauthenticated.
+unauth=$(_tmpdir)
+_write_unauthenticated_gh_stub "$unauth"
+result=$(PATH="$unauth:$PATH" git -C "$repo" branch-audit --porcelain 2>&1)
+_assert_contains "lists branches without authenticated gh" $'branch\tahead\tfalse\t1\t0\t\t' "$result"
+
+# Destructive path.
+result=$(git -C "$repo" branch-audit --drop-merged 2>&1 || true)
+_assert_contains "drop requires confirmation" "--drop-merged requires --yes or --dry-run" "$result"
+
+result=$(git -C "$repo" branch-audit --drop-merged --dry-run 2>&1)
+_assert_contains "dry run reports merged deletion" "would delete merged (merged)" "$result"
+_assert_eq "dry run keeps all branches" "ahead gone main merged" \
+  "$(git -C "$repo" branch --format='%(refname:short)' | sort | tr '\n' ' ' | sed 's/ $//')"
+
+result=$(git -C "$repo" branch-audit --drop-merged --yes 2>&1)
+_assert_contains "drops merged branch" "deleted merged (merged)" "$result"
+_assert_eq "only merged branch removed" "ahead gone main" \
+  "$(git -C "$repo" branch --format='%(refname:short)' | sort | tr '\n' ' ' | sed 's/ $//')"
+
+# The current branch is never deleted even when merged.
+git -C "$repo" switch -q -c merged2
+_commit_file "$repo" merged2.txt merged2 "merged2 work"
+git -C "$repo" switch -q main
+git -C "$repo" merge -q --no-ff merged2 -m "merge merged2"
+git -C "$repo" switch -q merged2
+result=$(git -C "$repo" branch-audit --drop-merged --yes 2>&1)
+_assert_contains "skips the current branch" "skipping merged2; current branch" "$result"
+
+outside=$(_tmpdir)
+result=$(git -C "$outside" branch-audit 2>&1 || true)
+_assert_contains "requires git repo" "not inside a git repository" "$result"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

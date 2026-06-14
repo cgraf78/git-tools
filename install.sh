@@ -23,6 +23,7 @@ COMMANDS=(
   git-pr-stack
   git-pr-sync-stack
   git-repo-state
+  git-resolve-base
   git-stash-audit
 )
 

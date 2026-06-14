@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_eq() {
+  local name="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %s\n' "$expected" >&2
+    printf '  actual:   %s\n' "$actual" >&2
+  fi
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_git_init() {
+  local repo="$1"
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+  printf 'base\n' >"$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -q -m base
+}
+
+echo "=== git resolve-base ==="
+
+# A branch taken off a local default branch resolves to that branch's tip.
+repo=$(_tmpdir)
+_git_init "$repo"
+printf 'main work\n' >>"$repo/README.md"
+git -C "$repo" commit -q -am "main work"
+branch_point=$(git -C "$repo" rev-parse HEAD)
+git -C "$repo" switch -q -c feature
+printf 'feature\n' >>"$repo/README.md"
+git -C "$repo" commit -q -am "feature work"
+
+result=$(git -C "$repo" resolve-base 2>&1)
+_assert_eq "prints merge-base commit by default" "$branch_point" "$result"
+
+result=$(git -C "$repo" resolve-base --ref 2>&1)
+_assert_eq "--ref prints the local default base ref" "main" "$result"
+
+result=$(git -C "$repo" resolve-base --short 2>&1)
+_assert_eq "--short abbreviates the merge-base commit" "$(git -C "$repo" rev-parse --short "$branch_point")" "$result"
+
+# An explicit upstream is preferred over default-branch heuristics.
+git -C "$repo" switch -q -c tracked main
+git -C "$repo" branch -q --set-upstream-to main >/dev/null
+printf 'tracked\n' >>"$repo/README.md"
+git -C "$repo" commit -q -am "tracked work"
+result=$(git -C "$repo" resolve-base --ref 2>&1)
+_assert_eq "--ref reports the configured upstream" "main" "$result"
+
+# A branch off a remote default with no upstream resolves through origin/HEAD.
+remote=$(_tmpdir)
+clone=$(_tmpdir)
+git init -q --bare --initial-branch=main "$remote"
+git -C "$repo" remote add origin "$remote" 2>/dev/null || true
+git -C "$repo" switch -q main
+git -C "$repo" push -q -u origin main
+rm -rf "$clone"
+git clone -q "$remote" "$clone"
+git -C "$clone" config user.email "test@test.com"
+git -C "$clone" config user.name "Test"
+remote_point=$(git -C "$clone" rev-parse origin/main)
+git -C "$clone" switch -q -c topic
+printf 'topic\n' >>"$clone/README.md"
+git -C "$clone" commit -q -am "topic work"
+result=$(git -C "$clone" resolve-base 2>&1)
+_assert_eq "resolves the remote default branch point" "$remote_point" "$result"
+
+# Guard rails.
+result=$(git -C "$repo" resolve-base --ref --short 2>&1 || true)
+_assert_contains "rejects --ref with --short" "cannot be combined with --ref" "$result"
+
+git -C "$repo" switch -q --detach HEAD
+result=$(git -C "$repo" resolve-base 2>&1 || true)
+_assert_contains "rejects detached HEAD" "detached HEAD has no branch point" "$result"
+
+outside=$(_tmpdir)
+result=$(git -C "$outside" resolve-base 2>&1 || true)
+_assert_contains "requires git repo" "not inside a git repository" "$result"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

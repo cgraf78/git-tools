@@ -208,6 +208,24 @@ git stash-audit --drop-obsolete --yes
 Obsolete classification is conservative: a stash is obsolete only when Git's
 stash subject identifies a local origin branch and that local branch is gone.
 
+### `git resolve-base`
+
+Resolves the branch point the current branch diverged from and prints it. The
+base ref is inferred in order: the configured upstream, a remote default branch
+(`origin/HEAD` and friends), then a local default branch (`main`, `master`, or
+`trunk`).
+
+```sh
+git resolve-base
+git resolve-base --ref
+git resolve-base --short
+```
+
+By default the merge-base commit (the branch point) is printed. Use `--ref` to
+print the base ref that resolution selected instead. This is the single source
+of branch-base detection that `git absorb-and-rebase` and other commands
+compose, so the inference logic lives in one place.
+
 ### `git absorb-and-rebase`
 
 Creates `git-absorb` fixup commits for staged changes, then folds those fixups
@@ -260,6 +278,7 @@ git pr-restack
 git pr-stack
 git pr-sync-stack
 git repo-state
+git resolve-base
 git stash-audit
 ```
 
@@ -298,6 +317,7 @@ Or run the focused command test directly:
 ```sh
 test/extras-test
 test/git-absorb-and-rebase-test
+test/git-resolve-base-test
 test/git-cleanup-repo-test
 test/git-pr-land-test
 test/git-pr-land-stack-test

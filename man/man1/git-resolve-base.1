@@ -1,0 +1,42 @@
+.TH GIT-RESOLVE-BASE 1 "2026-06-13" "git-tools" "User Commands"
+.SH NAME
+git-resolve-base \- print the inferred branch point of the current branch
+.SH SYNOPSIS
+.B git resolve-base
+.RI [ options ]
+.SH DESCRIPTION
+.B git resolve-base
+resolves the branch point that the current branch diverged from and prints it.
+The base ref is inferred in order: the configured upstream, a remote default
+branch
+.RB ( origin/HEAD
+and friends), then a local default branch
+.RB ( main ,
+.BR master ,
+or
+.BR trunk ).
+.PP
+By default the merge-base commit (the branch point) is printed. Other git-tools
+commands compose this command so base detection stays defined in one place.
+.SH OPTIONS
+.TP
+.B \-\-ref
+Print the resolved base ref instead of the merge-base commit.
+.TP
+.B \-\-short
+Abbreviate the merge-base commit id. Cannot be combined with
+.BR \-\-ref .
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH EXIT STATUS
+.TP
+.B 0
+Base resolved and printed.
+.TP
+.B 2
+Usage error, not in a repository, or base could not be determined.
+.SH SEE ALSO
+.BR git-absorb-and-rebase (1),
+.BR git-repo-state (1),
+.BR git-merge-base (1)

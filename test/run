@@ -16,8 +16,10 @@ if command -v shellcheck >/dev/null 2>&1; then
     "$ROOT/bin/git-pr-stack" \
     "$ROOT/bin/git-pr-sync-stack" \
     "$ROOT/bin/git-repo-state" \
+    "$ROOT/bin/git-resolve-base" \
     "$ROOT/bin/git-stash-audit" \
     "$ROOT"/completions/*.bash \
+    "$ROOT/lib/git-tools-base.sh" \
     "$ROOT/lib/git-tools-pr.sh" \
     "$ROOT/install.sh" \
     "$ROOT/test/extras-test" \
@@ -32,6 +34,7 @@ if command -v shellcheck >/dev/null 2>&1; then
     "$ROOT/test/git-pr-stack-test" \
     "$ROOT/test/git-pr-sync-stack-test" \
     "$ROOT/test/git-repo-state-test" \
+    "$ROOT/test/git-resolve-base-test" \
     "$ROOT/test/git-stash-audit-test" \
     "$ROOT/test/run"
 fi
@@ -48,4 +51,5 @@ fi
 "$ROOT/test/git-pr-stack-test"
 "$ROOT/test/git-pr-sync-stack-test"
 "$ROOT/test/git-repo-state-test"
+"$ROOT/test/git-resolve-base-test"
 "$ROOT/test/git-stash-audit-test"

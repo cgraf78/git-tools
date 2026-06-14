@@ -18,6 +18,8 @@ done
 _root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
 # shellcheck disable=SC1091
 . "$_root/lib/git-tools-pr.sh"
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-base.sh"
 
 _usage() {
   cat <<'EOF'
@@ -62,32 +64,6 @@ while (($#)); do
       ;;
   esac
 done
-
-_default_branch() {
-  local ref
-
-  ref=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)
-  if [[ -n "$ref" ]]; then
-    printf '%s\n' "${ref#origin/}"
-    return 0
-  fi
-
-  for ref in origin/main origin/master origin/trunk; do
-    if git show-ref --verify --quiet "refs/remotes/$ref"; then
-      printf '%s\n' "${ref#origin/}"
-      return 0
-    fi
-  done
-
-  for ref in main master trunk; do
-    if git show-ref --verify --quiet "refs/heads/$ref"; then
-      printf '%s\n' "$ref"
-      return 0
-    fi
-  done
-
-  printf 'unknown\n'
-}
 
 _operation() {
   local git_dir="$1"
@@ -223,24 +199,34 @@ _print_porcelain() {
 
 _print_json() {
   printf '{'
-  printf '"repo":'; _json_string "$_repo_root"
-  printf ',"branch":'; _json_string "$_branch"
-  printf ',"default":'; _json_string "$_default"
-  printf ',"upstream":'; _json_string "$_upstream"
+  printf '"repo":'
+  _json_string "$_repo_root"
+  printf ',"branch":'
+  _json_string "$_branch"
+  printf ',"default":'
+  _json_string "$_default"
+  printf ',"upstream":'
+  _json_string "$_upstream"
   printf ',"ahead":%s' "${_ahead:-0}"
   printf ',"behind":%s' "${_behind:-0}"
   printf ',"dirty":%s' "$_dirty"
   printf ',"staged":%s' "$_staged"
   printf ',"unstaged":%s' "$_unstaged"
   printf ',"untracked":%s' "$_untracked"
-  printf ',"operation":'; _json_string "$_operation"
+  printf ',"operation":'
+  _json_string "$_operation"
   printf ',"stashes":%s' "$_stashes"
   printf ',"pr_available":%s' "$_pr_available"
-  printf ',"pr_number":'; _json_string "$_pr_number"
-  printf ',"pr_base":'; _json_string "$_pr_base"
-  printf ',"pr_head":'; _json_string "$_pr_head"
-  printf ',"pr_checks":'; _json_string "$_pr_checks"
-  printf ',"pr_url":'; _json_string "$_pr_url"
+  printf ',"pr_number":'
+  _json_string "$_pr_number"
+  printf ',"pr_base":'
+  _json_string "$_pr_base"
+  printf ',"pr_head":'
+  _json_string "$_pr_head"
+  printf ',"pr_checks":'
+  _json_string "$_pr_checks"
+  printf ',"pr_url":'
+  _json_string "$_pr_url"
   printf '}\n'
 }
 
@@ -249,7 +235,9 @@ gt_require_repo
 _repo_root=$(git rev-parse --show-toplevel)
 _git_dir=$(git rev-parse --git-dir)
 _branch=$(git symbolic-ref -q --short HEAD 2>/dev/null || printf 'DETACHED')
-_default=$(_default_branch)
+# An unresolvable default branch is informational here, not fatal. repo-state
+# has always reported origin's default, so name the remote explicitly.
+_default=$(gt_default_branch origin || printf 'unknown')
 _operation=$(_operation "$_git_dir")
 _stashes=$(_stash_count)
 

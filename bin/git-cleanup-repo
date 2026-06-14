@@ -3,6 +3,19 @@
 
 set -euo pipefail
 
+_script_path="${BASH_SOURCE[0]}"
+while [[ -L "$_script_path" ]]; do
+  _script_dir=$(cd -P -- "$(dirname -- "$_script_path")" && pwd)
+  _link=$(readlink "$_script_path")
+  case "$_link" in
+    /*) _script_path="$_link" ;;
+    *) _script_path="$_script_dir/$_link" ;;
+  esac
+done
+_root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-base.sh"
+
 _usage() {
   cat <<'EOF'
 Usage: git cleanup-repo [options]
@@ -84,27 +97,13 @@ _remote_branch_exists() {
 }
 
 _default_branch() {
-  local ref candidate
-
   if [[ -n "$_base" ]]; then
     printf '%s\n' "$_base"
     return 0
   fi
 
-  ref=$(git symbolic-ref -q --short "refs/remotes/$_remote/HEAD" 2>/dev/null || true)
-  if [[ "$ref" == "$_remote/"* ]]; then
-    printf '%s\n' "${ref#"$_remote"/}"
-    return 0
-  fi
-
-  for candidate in main master trunk; do
-    if _remote_branch_exists "$candidate" || _local_branch_exists "$candidate"; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-
-  _die "could not determine base branch; pass --base <branch>"
+  gt_default_branch "$_remote" ||
+    _die "could not determine base branch; pass --base <branch>"
 }
 
 _checkout_base() {

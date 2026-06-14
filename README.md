@@ -9,6 +9,23 @@ Small Git workflow tools.
 
 ## Commands
 
+### `git pr-ready`
+
+Checks whether a GitHub pull request is open, non-draft, conflict-free, and has
+passing checks.
+
+```sh
+git pr-ready
+git pr-ready 123
+git pr-ready feature/my-branch
+```
+
+Use `--porcelain` for stable `key=value` output that other scripts can compose:
+
+```sh
+git pr-ready --porcelain
+```
+
 ### `git cleanup-repo`
 
 Fetches and prunes the remote, updates the repository's default branch, then
@@ -84,13 +101,14 @@ changes behind.
 
 ## Install
 
-Put `bin/` on `PATH`, or link `bin/git-absorb-and-rebase` into a directory on
-`PATH`. Git discovers executable files named `git-*`, so the installed commands
-are invoked as:
+Put `bin/` on `PATH`, or link the command files under `bin/` into a directory
+on `PATH`. Git discovers executable files named `git-*`, so the installed
+commands are invoked as:
 
 ```sh
 git cleanup-repo
 git absorb-and-rebase
+git pr-ready
 ```
 
 For a simple local install:
@@ -114,6 +132,7 @@ Or run the focused command test directly:
 ```sh
 test/git-absorb-and-rebase-test
 test/git-cleanup-repo-test
+test/git-pr-ready-test
 ```
 
 If `git-absorb` is not installed, the test suite verifies the dependency error

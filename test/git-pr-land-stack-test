@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_eq() {
+  local name="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %q\n' "$expected" >&2
+    printf '  actual:   %q\n' "$actual" >&2
+  fi
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_git_init() {
+  local repo="$1"
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+  printf 'base\n' >"$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m base >/dev/null
+}
+
+_write_tool_stubs() {
+  local dir="$1"
+
+  cat >"$dir/git-pr-stack" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${STACK_CASE:-ready}" in
+  ready)
+    printf 'pr\t0\t1\tmain\tfeature/a\ttrue\tready\tpass\thttps://example/pr/1\n'
+    printf 'pr\t1\t2\tfeature/a\tfeature/b\ttrue\tready\tpass\thttps://example/pr/2\n'
+    printf 'pr\t2\t3\tfeature/b\tfeature/c\ttrue\tready\tpass\thttps://example/pr/3\n'
+    ;;
+  blocked)
+    printf 'pr\t0\t1\tmain\tfeature/a\ttrue\tready\tpass\thttps://example/pr/1\n'
+    printf 'pr\t1\t2\tfeature/a\tfeature/b\tfalse\tchecks pending\tpending\thttps://example/pr/2\n'
+    ;;
+esac
+EOF
+
+  cat >"$dir/git-pr-land" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'land %s\n' "$*" >>"${STACK_LOG:?}"
+EOF
+
+  cat >"$dir/git-pr-restack" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'restack %s\n' "$*" >>"${STACK_LOG:?}"
+EOF
+
+  cat >"$dir/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1 $2" == "auth status" ]]; then
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 99
+EOF
+
+  chmod +x "$dir/git-pr-stack" "$dir/git-pr-land" "$dir/git-pr-restack" "$dir/gh"
+}
+
+echo "=== git pr-land-stack ==="
+
+repo=$(_tmpdir)
+bin_dir=$(_tmpdir)
+log=$(_tmpdir)/stack.log
+_git_init "$repo"
+_write_tool_stubs "$bin_dir"
+
+PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" git -C "$repo" pr-land-stack 1 >/tmp/pr-land-stack.out 2>&1
+expected="$(cat <<'EOF'
+land 1 --method squash
+restack 2 --base main
+land 2 --method squash
+restack 3 --base main
+land 3 --method squash
+EOF
+)"
+_assert_eq "lands and restacks in stack order" "$expected" "$(cat "$log")"
+_assert_contains "reports stack completion" "landed stack rooted at PR #1" "$(< /tmp/pr-land-stack.out)"
+
+log_keep=$(_tmpdir)/stack.log
+PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log_keep" git -C "$repo" pr-land-stack 1 --method merge --keep-branch >/tmp/pr-land-stack-keep.out 2>&1
+_assert_contains "passes keep-branch to land" "land 1 --method merge --keep-branch" "$(cat "$log_keep")"
+
+log_dry=$(_tmpdir)/stack.log
+PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log_dry" git -C "$repo" pr-land-stack 1 --dry-run >/tmp/pr-land-stack-dry.out 2>&1
+_assert_contains "dry run passes through to land" "land 1 --method squash --dry-run" "$(cat "$log_dry")"
+_assert_contains "dry run passes through to restack" "restack 2 --base main --dry-run" "$(cat "$log_dry")"
+
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_CASE=blocked STACK_LOG="$log" git -C "$repo" pr-land-stack 1 2>&1 || true)
+_assert_contains "refuses unready stacks before landing" "PR #2 is not ready: checks pending" "$result"
+
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" git -C "$repo" pr-land-stack 1 --method bad 2>&1 || true)
+_assert_contains "validates merge method" "merge method must be squash, merge, or rebase" "$result"
+
+outside=$(_tmpdir)
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" git -C "$outside" pr-land-stack 1 2>&1 || true)
+_assert_contains "requires git repo" "not inside a git repository" "$result"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

@@ -1,0 +1,46 @@
+.TH GIT-PR-SYNC-STACK 1 "2026-06-14" "git-tools" "User Commands"
+.SH NAME
+git-pr-sync-stack \- restack a GitHub pull request stack
+.SH SYNOPSIS
+.B git pr-sync-stack
+.RI [ options ]
+.RI [ number|url|branch ]
+.SH DESCRIPTION
+.B git pr-sync-stack
+discovers the linear pull request stack connected to a target PR, then restacks
+each PR parent-to-child without merging anything. Without a target, it uses the
+pull request for the current branch.
+.PP
+The command composes
+.BR git-pr-stack (1)
+and
+.BR git-pr-restack (1)
+so force-with-lease push behavior stays centralized in the single-PR restack
+primitive.
+.SH OPTIONS
+.TP
+.BI "\-b, \-\-base " branch
+Rebase the root PR onto this base branch.
+.TP
+.B \-\-no-push
+Rebase locally without pushing or editing PR bases.
+.TP
+.BR \-n ", " \-\-dry-run
+Print actions without changing anything.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH EXIT STATUS
+.TP
+.B 0
+Stack was synced.
+.TP
+.B 1
+Stack discovery or restack failed.
+.TP
+.B 2
+Usage or local environment error.
+.SH SEE ALSO
+.BR git-pr-stack (1),
+.BR git-pr-restack (1),
+.BR git-pr-land-stack (1)

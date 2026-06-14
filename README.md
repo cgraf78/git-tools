@@ -80,6 +80,20 @@ git pr-stack --porcelain
 If a stack branches into multiple child PRs, the command stops instead of
 guessing a landing order.
 
+### `git pr-sync-stack`
+
+Restacks every PR in a linear stack, parent-to-child, without merging anything.
+
+```sh
+git pr-sync-stack 123
+git pr-sync-stack 123 --dry-run
+git pr-sync-stack 123 --base main --no-push
+```
+
+The command composes `git pr-stack` and `git pr-restack`. Use `--base` to
+override only the root PR's base; child PRs continue to rebase onto their parent
+heads.
+
 ### `git pr-restack`
 
 Rebases one open PR's head branch onto a target base and pushes with
@@ -212,6 +226,7 @@ git pr-land-stack
 git pr-ready
 git pr-restack
 git pr-stack
+git pr-sync-stack
 git repo-state
 ```
 

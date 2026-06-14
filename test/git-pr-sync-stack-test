@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_git_init() {
+  local repo="$1"
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+  printf 'base\n' >"$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m base >/dev/null
+}
+
+_write_tool_stubs() {
+  local dir="$1"
+
+  cat >"$dir/git-pr-stack" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${STACK_LOG:?}"
+case "${STACK_CASE:-linear}" in
+  linear)
+    printf 'pr\t0\t1\tmain\tfeature/a\ttrue\tready\tpass\thttps://example/pr/1\n'
+    printf 'pr\t1\t2\tfeature/a\tfeature/b\ttrue\tready\tpass\thttps://example/pr/2\n'
+    printf 'pr\t2\t3\tfeature/b\tfeature/c\ttrue\tready\tpass\thttps://example/pr/3\n'
+    ;;
+  empty)
+    ;;
+  fail)
+    printf 'stack failed\n' >&2
+    exit 1
+    ;;
+esac
+EOF
+
+  cat >"$dir/git-pr-restack" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${RESTACK_LOG:?}"
+exit "${RESTACK_STATUS:-0}"
+EOF
+
+  chmod +x "$dir/git-pr-stack" "$dir/git-pr-restack"
+}
+
+echo "=== git pr-sync-stack ==="
+
+repo=$(_tmpdir)
+bin_dir=$(_tmpdir)
+stack_log=$(_tmpdir)/stack.log
+restack_log=$(_tmpdir)/restack.log
+export STACK_LOG="$stack_log"
+export RESTACK_LOG="$restack_log"
+_git_init "$repo"
+_write_tool_stubs "$bin_dir"
+
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-sync-stack 2 2>&1)
+_assert_contains "passes target to stack" "--porcelain 2" "$(<"$stack_log")"
+_assert_contains "restacks root onto current base" "1 --base main" "$(<"$restack_log")"
+_assert_contains "restacks child onto parent head" "2 --base feature/a" "$(<"$restack_log")"
+_assert_contains "restacks grandchild onto parent head" "3 --base feature/b" "$(<"$restack_log")"
+_assert_contains "reports stack sync" "synced 3 PR(s)" "$result"
+
+: >"$stack_log"
+: >"$restack_log"
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-sync-stack 2 --base release --no-push --dry-run 2>&1)
+_assert_contains "root base can be overridden" "1 --base release --no-push --dry-run" "$(<"$restack_log")"
+_assert_contains "children still rebase onto parent heads" "2 --base feature/a --no-push --dry-run" "$(<"$restack_log")"
+_assert_contains "dry run reports composed restack" "would run:" "$result"
+
+result=$(STACK_CASE=empty PATH="$bin_dir:$PATH" git -C "$repo" pr-sync-stack 2 2>&1 || true)
+_assert_contains "requires stack records" "no pull requests found in stack" "$result"
+
+result=$(RESTACK_STATUS=9 PATH="$bin_dir:$PATH" git -C "$repo" pr-sync-stack 2 2>&1 || true)
+_assert_contains "propagates restack failure" "restacking PR #1" "$result"
+
+outside=$(_tmpdir)
+result=$(PATH="$bin_dir:$PATH" git -C "$outside" pr-sync-stack 2>&1 || true)
+_assert_contains "requires git repo" "not inside a git repository" "$result"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

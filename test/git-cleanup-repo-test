@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_eq() {
+  local name="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %q\n' "$expected" >&2
+    printf '  actual:   %q\n' "$actual" >&2
+  fi
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_git_init() {
+  local repo="$1"
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+}
+
+_commit_file() {
+  local repo="$1"
+  local path="$2"
+  local content="$3"
+  local message="$4"
+
+  mkdir -p "$(dirname "$repo/$path")"
+  printf '%s\n' "$content" >"$repo/$path"
+  git -C "$repo" add "$path"
+  git -C "$repo" commit -m "$message" >/dev/null
+}
+
+_clone_remote() {
+  local remote repo
+
+  remote=$(_tmpdir)
+  repo=$(_tmpdir)
+  git init --bare --initial-branch=main "$remote" >/dev/null
+  _git_init "$repo"
+  _commit_file "$repo" README.md base base
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -u origin main >/dev/null 2>&1
+  printf '%s\n' "$repo"
+}
+
+_branches() {
+  local repo="$1"
+  git -C "$repo" branch --format='%(refname:short)' | sort
+}
+
+echo "=== git cleanup-repo ==="
+
+repo=$(_clone_remote)
+git -C "$repo" switch --quiet -c merged
+_commit_file "$repo" merged.txt merged "add merged"
+git -C "$repo" switch --quiet main
+git -C "$repo" merge --no-ff merged -m "merge merged" >/dev/null
+
+git -C "$repo" switch --quiet -c gone
+_commit_file "$repo" gone.txt gone "add gone"
+git -C "$repo" push -u origin gone >/dev/null 2>&1
+git -C "$repo" switch --quiet main
+git -C "$repo" push origin --delete gone >/dev/null 2>&1
+
+git -C "$repo" switch --quiet -c keep
+_commit_file "$repo" keep.txt keep "add keep"
+git -C "$repo" push -u origin keep >/dev/null 2>&1
+git -C "$repo" switch --quiet main
+
+result=$(git -C "$repo" cleanup-repo 2>&1)
+_assert_contains "reports deleted branches" "deleted 1 branch(es), skipped 2" "$result"
+expected="$(printf 'gone\nkeep\nmain')"
+_assert_eq "deletes only merged branches by default" "$expected" "$(_branches "$repo")"
+result=$(git -C "$repo" cleanup-repo --gone 2>&1)
+_assert_contains "gone deletes branches with removed upstreams" \
+  "deleting gone (upstream gone)" "$result"
+expected="$(printf 'keep\nmain')"
+_assert_eq "gone leaves unmerged branches with live upstreams" "$expected" "$(_branches "$repo")"
+
+dry_repo=$(_clone_remote)
+git -C "$dry_repo" switch --quiet -c dry
+_commit_file "$dry_repo" dry.txt dry "add dry"
+git -C "$dry_repo" switch --quiet main
+git -C "$dry_repo" merge --no-ff dry -m "merge dry" >/dev/null
+result=$(git -C "$dry_repo" cleanup-repo --dry-run 2>&1)
+_assert_contains "dry run reports branch deletion" "deleting dry (merged)" "$result"
+_assert_contains "dry run reports would-delete summary" "would delete 1 branch(es)" "$result"
+expected="$(printf 'dry\nmain')"
+_assert_eq "dry run keeps branches" "$expected" "$(_branches "$dry_repo")"
+
+all_repo=$(_clone_remote)
+git -C "$all_repo" switch --quiet -c unmerged
+_commit_file "$all_repo" unmerged.txt unmerged "add unmerged"
+git -C "$all_repo" push -u origin unmerged >/dev/null 2>&1
+git -C "$all_repo" switch --quiet main
+result=$(git -C "$all_repo" cleanup-repo --all 2>&1)
+_assert_contains "all deletes unmerged local branches" "deleting unmerged (all)" "$result"
+_assert_eq "all leaves only main" "main" "$(_branches "$all_repo")"
+
+worktree_repo=$(_clone_remote)
+git -C "$worktree_repo" switch --quiet -c work
+_commit_file "$worktree_repo" work.txt work "add work"
+git -C "$worktree_repo" switch --quiet main
+worktree_dir=$(_tmpdir)
+rm -rf "$worktree_dir"
+git -C "$worktree_repo" worktree add "$worktree_dir" work >/dev/null 2>&1
+result=$(git -C "$worktree_repo" cleanup-repo --all 2>&1)
+_assert_contains "keeps checked-out branches without worktree removal" \
+  "skipping work; checked out in worktree" "$result"
+expected="$(printf 'main\nwork')"
+_assert_eq "branch remains while worktree is kept" "$expected" "$(_branches "$worktree_repo")"
+result=$(git -C "$worktree_repo" cleanup-repo --all --remove-worktrees 2>&1)
+_assert_contains "removes clean linked worktrees" "deleting work (all)" "$result"
+_assert_eq "worktree cleanup leaves only main" "main" "$(_branches "$worktree_repo")"
+
+dirty_repo=$(_clone_remote)
+printf 'dirty\n' >"$dirty_repo/dirty.txt"
+result=$(git -C "$dirty_repo" cleanup-repo 2>&1 || true)
+_assert_contains "refuses dirty worktrees" "worktree must be clean" "$result"
+result=$(git -C "$dirty_repo" cleanup-repo --dry-run 2>&1)
+_assert_contains "dry run can inspect dirty worktrees" \
+  "real cleanup would stop before changing refs" "$result"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

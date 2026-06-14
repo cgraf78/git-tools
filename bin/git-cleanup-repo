@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+# Clean up stale local Git branches after PR stacks have landed.
+
+set -euo pipefail
+
+_usage() {
+  cat <<'EOF'
+Usage: git cleanup-repo [options]
+
+Fetch/prune the remote, update the default branch, then delete stale local
+branches. By default this removes local branches that are already merged into
+the base branch. Use --gone for branches whose upstream is gone, or --all to
+delete every local branch except the base branch.
+
+Options:
+  -b, --base <branch>       Base branch to keep and update.
+  -r, --remote <name>       Remote to fetch/pull from (default: origin).
+      --gone                Also delete branches whose upstream is gone.
+  -a, --all                 Delete all local branches except the base branch.
+      --remove-worktrees    Remove clean linked worktrees for deleted branches.
+  -n, --dry-run             Print actions without changing anything.
+  -h, --help                Show this help.
+EOF
+}
+
+_die() {
+  printf 'git cleanup-repo: %s\n' "$*" >&2
+  exit 2
+}
+
+_say() {
+  printf 'git cleanup-repo: %s\n' "$*" >&2
+}
+
+_run() {
+  if [[ "$_dry_run" == 1 ]]; then
+    printf 'git cleanup-repo: would run:' >&2
+    printf ' %q' "$@" >&2
+    printf '\n' >&2
+    return 0
+  fi
+  "$@"
+}
+
+_git_path_exists() {
+  local path
+  path=$(git rev-parse --git-path "$1") || return 1
+  [[ -e "$path" ]]
+}
+
+_ensure_repo_ready() {
+  git rev-parse --git-dir >/dev/null 2>&1 ||
+    _die "not inside a git repository"
+  [[ "$(git rev-parse --is-bare-repository)" == "false" ]] ||
+    _die "bare repositories are not supported"
+
+  if _git_path_exists rebase-merge || _git_path_exists rebase-apply ||
+    _git_path_exists MERGE_HEAD || _git_path_exists CHERRY_PICK_HEAD ||
+    _git_path_exists REVERT_HEAD; then
+    _die "repository already has an active rebase, merge, cherry-pick, or revert"
+  fi
+
+  # Switching branches and fast-forwarding the base should not trample pending
+  # edits. Keep cleanup focused on refs, not worktree conflict resolution.
+  if [[ -n "$(git status --porcelain)" ]]; then
+    if [[ "$_dry_run" == 1 ]]; then
+      _say "worktree is dirty; real cleanup would stop before changing refs"
+      return 0
+    fi
+    _die "worktree must be clean before cleanup"
+  fi
+}
+
+_remote_exists() {
+  git remote get-url "$_remote" >/dev/null 2>&1
+}
+
+_local_branch_exists() {
+  git show-ref --verify --quiet "refs/heads/$1"
+}
+
+_remote_branch_exists() {
+  git show-ref --verify --quiet "refs/remotes/$_remote/$1"
+}
+
+_default_branch() {
+  local ref candidate
+
+  if [[ -n "$_base" ]]; then
+    printf '%s\n' "$_base"
+    return 0
+  fi
+
+  ref=$(git symbolic-ref -q --short "refs/remotes/$_remote/HEAD" 2>/dev/null || true)
+  if [[ "$ref" == "$_remote/"* ]]; then
+    printf '%s\n' "${ref#"$_remote"/}"
+    return 0
+  fi
+
+  for candidate in main master trunk; do
+    if _remote_branch_exists "$candidate" || _local_branch_exists "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  _die "could not determine base branch; pass --base <branch>"
+}
+
+_checkout_base() {
+  if _local_branch_exists "$_base"; then
+    _run git switch --quiet "$_base"
+    return 0
+  fi
+
+  if _remote_branch_exists "$_base"; then
+    _run git switch --quiet -c "$_base" --track "$_remote/$_base"
+    return 0
+  fi
+
+  _die "base branch does not exist locally or on $_remote: $_base"
+}
+
+_update_base() {
+  _run git fetch --quiet --prune --tags "$_remote"
+  _checkout_base
+
+  if _remote_branch_exists "$_base"; then
+    _run git pull --quiet --ff-only "$_remote" "$_base"
+  else
+    _say "base has no $_remote branch; skipping pull"
+  fi
+}
+
+_branch_upstream_gone() {
+  local track
+  track=$(git for-each-ref --format='%(upstream:track)' "refs/heads/$1")
+  [[ "$track" == "[gone]" ]]
+}
+
+_branch_merged_into_base() {
+  git merge-base --is-ancestor "$1" "$_base" 2>/dev/null
+}
+
+_delete_reason() {
+  local branch="$1"
+
+  if [[ "$_all" == 1 ]]; then
+    printf 'all\n'
+    return 0
+  fi
+  if _branch_merged_into_base "$branch"; then
+    printf 'merged\n'
+    return 0
+  fi
+  if [[ "$_gone" == 1 ]] && _branch_upstream_gone "$branch"; then
+    printf 'upstream gone\n'
+    return 0
+  fi
+
+  return 1
+}
+
+_worktree_for_branch() {
+  local branch="$1"
+  git worktree list --porcelain |
+    awk -v want="branch refs/heads/$branch" '
+      /^worktree / {
+        path = substr($0, 10)
+        next
+      }
+      $0 == want {
+        print path
+        exit
+      }
+    '
+}
+
+_remove_branch_worktree_if_needed() {
+  local branch="$1"
+  local path
+
+  path=$(_worktree_for_branch "$branch")
+  [[ -n "$path" ]] || return 0
+
+  if [[ "$_remove_worktrees" != 1 ]]; then
+    _say "skipping $branch; checked out in worktree $path"
+    return 1
+  fi
+
+  if [[ -n "$(git -C "$path" status --porcelain)" ]]; then
+    _say "skipping $branch; worktree has uncommitted changes: $path"
+    return 1
+  fi
+
+  _run git worktree remove "$path"
+}
+
+_cleanup_branches() {
+  local branch reason
+  local deleted=0 skipped=0
+
+  while IFS= read -r branch; do
+    [[ -n "$branch" ]] || continue
+    [[ "$branch" != "$_base" ]] || continue
+
+    reason=$(_delete_reason "$branch") || {
+      _say "keeping $branch; not merged and upstream still exists"
+      skipped=$((skipped + 1))
+      continue
+    }
+
+    if ! _remove_branch_worktree_if_needed "$branch"; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    _say "deleting $branch ($reason)"
+    _run git branch -D "$branch"
+    deleted=$((deleted + 1))
+  done < <(git for-each-ref --format='%(refname:short)' refs/heads)
+
+  _run git fetch --quiet --prune --tags "$_remote"
+  if [[ "$_dry_run" == 1 ]]; then
+    _say "done; would delete $deleted branch(es), skipped $skipped"
+  else
+    _say "done; deleted $deleted branch(es), skipped $skipped"
+  fi
+}
+
+_parse_args() {
+  _base=""
+  _remote="origin"
+  _all=0
+  _gone=0
+  _dry_run=0
+  _remove_worktrees=0
+
+  while (($#)); do
+    case "$1" in
+      -b | --base)
+        local opt="$1"
+        shift
+        (($#)) || _die "$opt requires a value"
+        _base="$1"
+        shift
+        ;;
+      --base=*)
+        _base="${1#--base=}"
+        [[ -n "$_base" ]] || _die "--base requires a value"
+        shift
+        ;;
+      -r | --remote)
+        local opt="$1"
+        shift
+        (($#)) || _die "$opt requires a value"
+        _remote="$1"
+        shift
+        ;;
+      --remote=*)
+        _remote="${1#--remote=}"
+        [[ -n "$_remote" ]] || _die "--remote requires a value"
+        shift
+        ;;
+      -a | --all)
+        _all=1
+        shift
+        ;;
+      --gone)
+        _gone=1
+        shift
+        ;;
+      --remove-worktrees)
+        _remove_worktrees=1
+        shift
+        ;;
+      -n | --dry-run)
+        _dry_run=1
+        shift
+        ;;
+      -h | --help)
+        _usage
+        exit 0
+        ;;
+      --)
+        shift
+        (($# == 0)) || _die "unexpected argument: $1"
+        ;;
+      *)
+        _die "unexpected argument: $1"
+        ;;
+    esac
+  done
+}
+
+_parse_args "$@"
+_ensure_repo_ready
+_remote_exists || _die "remote does not exist: $_remote"
+
+_base=$(_default_branch)
+_update_base
+_cleanup_branches

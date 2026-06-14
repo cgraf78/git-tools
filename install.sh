@@ -20,6 +20,7 @@ COMMANDS=(
   git-pr-ready
   git-pr-restack
   git-pr-stack
+  git-repo-state
 )
 
 mkdir -p "$BIN_DIR"

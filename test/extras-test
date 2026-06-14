@@ -112,6 +112,9 @@ _description_for() {
     git-pr-stack)
       printf '%s\n' 'discover a linear GitHub pull request stack'
       ;;
+    git-repo-state)
+      printf '%s\n' 'report repository workflow state'
+      ;;
     *)
       return 1
       ;;
@@ -127,6 +130,7 @@ _commands=(
   git-pr-ready
   git-pr-restack
   git-pr-stack
+  git-repo-state
 )
 
 echo "=== extras ==="

@@ -135,3 +135,38 @@ gt_bool() {
     *) return 1 ;;
   esac
 }
+
+# @brief Load open PRs once for repeated by-branch lookups.
+# Best-effort: GitHub data is optional, so a missing or unauthenticated gh
+# leaves GT_PR_AVAILABLE=false and callers fall back to local-only output.
+# Sets GT_PR_AVAILABLE and caches records in GT_PR_RECORDS.
+gt_pr_load() {
+  GT_PR_AVAILABLE=false
+  GT_PR_RECORDS=""
+
+  command -v gh >/dev/null 2>&1 || return 0
+  gh auth status >/dev/null 2>&1 || return 0
+
+  GT_PR_RECORDS=$(gt_pr_list_open_tsv 2>/dev/null || true)
+  GT_PR_AVAILABLE=true
+}
+
+# @brief Print the open PR number whose head ref is the given branch.
+# Requires a prior gt_pr_load. Returns 1 when no PR matches or PR data is
+# unavailable.
+gt_pr_number_for_branch() {
+  local branch="$1" number head
+
+  [[ "${GT_PR_AVAILABLE:-false}" == true ]] || return 1
+  [[ -n "${GT_PR_RECORDS:-}" ]] || return 1
+
+  # gt_pr_list_open_tsv fields: number, state, isDraft, mergeStateStatus,
+  # headRefName, then base, url, and title (unused here).
+  while IFS=$'\t' read -r number _ _ _ head _; do
+    [[ "$head" == "$branch" ]] || continue
+    printf '%s\n' "$number"
+    return 0
+  done <<<"$GT_PR_RECORDS"
+
+  return 1
+}

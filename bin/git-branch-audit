@@ -114,37 +114,6 @@ _resolve_default() {
   fi
 }
 
-# GitHub data is optional. When gh is missing or unauthenticated the audit still
-# reports local branch state and simply omits PR numbers.
-_load_prs() {
-  _pr_available=false
-  _pr_records=""
-
-  command -v gh >/dev/null 2>&1 || return 0
-  gh auth status >/dev/null 2>&1 || return 0
-
-  _pr_records=$(gt_pr_list_open_tsv 2>/dev/null || true)
-  _pr_available=true
-}
-
-_pr_for_branch() {
-  local branch="$1"
-  local number head
-
-  [[ "$_pr_available" == true ]] || return 1
-  [[ -n "$_pr_records" ]] || return 1
-
-  # Fields: number, state, isDraft, mergeStateStatus, headRefName, then base,
-  # url, and title (unused here). Match the open PR whose head is this branch.
-  while IFS=$'\t' read -r number _ _ _ head _; do
-    [[ "$head" == "$branch" ]] || continue
-    printf '%s\n' "$number"
-    return 0
-  done <<<"$_pr_records"
-
-  return 1
-}
-
 _branch_records() {
   git for-each-ref \
     --format='%(refname:short)%09%(committerdate:unix)%09%(committerdate:relative)%09%(upstream:track)' \
@@ -163,7 +132,7 @@ _list() {
     git merge-base --is-ancestor "$name" "$_default_ref" 2>/dev/null && merged=true
     gone=false
     [[ "$track" == "[gone]" ]] && gone=true
-    pr=$(_pr_for_branch "$name" || true)
+    pr=$(gt_pr_number_for_branch "$name" || true)
 
     if [[ "$_porcelain" == 1 ]]; then
       printf 'branch\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -227,5 +196,5 @@ if [[ "$_drop_merged" == 1 ]]; then
   exit 0
 fi
 
-_load_prs
+gt_pr_load
 _list

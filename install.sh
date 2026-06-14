@@ -26,6 +26,7 @@ COMMANDS=(
   git-repo-state
   git-resolve-base
   git-stash-audit
+  git-worktree-audit
 )
 
 mkdir -p "$BIN_DIR"

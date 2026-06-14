@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_eq() {
+  local name="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %q\n' "$expected" >&2
+    printf '  actual:   %q\n' "$actual" >&2
+  fi
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_git_init() {
+  local repo="$1"
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+  printf 'base\n' >"$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m base >/dev/null
+}
+
+_write_gh_stub() {
+  local bin="$1/gh"
+  cat >"$bin" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$1 $2" == "auth status" ]]; then
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr view" ]]; then
+  case "${GH_PR_CASE:-ready}" in
+    ready)
+      printf '12\tOPEN\tfalse\tCLEAN\tfeature/a\tmain\thttps://example/pr/12\tReady PR\n'
+      ;;
+    draft)
+      printf '12\tOPEN\ttrue\tCLEAN\tfeature/a\tmain\thttps://example/pr/12\tDraft PR\n'
+      ;;
+    dirty)
+      printf '12\tOPEN\tfalse\tDIRTY\tfeature/a\tmain\thttps://example/pr/12\tDirty PR\n'
+      ;;
+  esac
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr checks" ]]; then
+  case "${GH_CHECK_CASE:-pass}" in
+    pass) printf '{"pass":2}\n' ;;
+    pending) printf '{"pass":1,"pending":1}\n'; exit 8 ;;
+    fail) printf '{"pass":1,"fail":1}\n' ;;
+    none) printf "no checks reported on the 'feature/a' branch\n"; exit 1 ;;
+  esac
+  exit 0
+fi
+
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 99
+EOF
+  chmod +x "$bin"
+}
+
+echo "=== git pr-ready ==="
+
+repo=$(_tmpdir)
+bin_dir=$(_tmpdir)
+_git_init "$repo"
+_write_gh_stub "$bin_dir"
+
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-ready 2>&1)
+_assert_contains "reports ready PR" "ready" "$result"
+
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-ready --porcelain)
+_assert_contains "porcelain includes ready flag" "ready=true" "$result"
+_assert_contains "porcelain includes check state" "checks=pass" "$result"
+
+result=$(GH_PR_CASE=draft PATH="$bin_dir:$PATH" git -C "$repo" pr-ready --porcelain 2>&1 || true)
+_assert_contains "draft PR is not ready" "reason=draft" "$result"
+
+result=$(GH_PR_CASE=dirty PATH="$bin_dir:$PATH" git -C "$repo" pr-ready --porcelain 2>&1 || true)
+_assert_contains "dirty PR is not ready" "reason=merge state DIRTY" "$result"
+
+result=$(GH_CHECK_CASE=pending PATH="$bin_dir:$PATH" git -C "$repo" pr-ready --porcelain 2>&1 || true)
+_assert_contains "pending checks are not ready" "reason=checks pending" "$result"
+
+result=$(GH_CHECK_CASE=fail PATH="$bin_dir:$PATH" git -C "$repo" pr-ready --porcelain 2>&1 || true)
+_assert_contains "failing checks are not ready" "reason=checks fail" "$result"
+
+result=$(GH_CHECK_CASE=none PATH="$bin_dir:$PATH" git -C "$repo" pr-ready --porcelain 2>&1 || true)
+_assert_contains "missing checks are not ready" "reason=checks none" "$result"
+
+outside=$(_tmpdir)
+result=$(PATH="$bin_dir:$PATH" git -C "$outside" pr-ready 2>&1 || true)
+_assert_contains "requires git repo" "not inside a git repository" "$result"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

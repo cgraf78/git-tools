@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Report whether a GitHub pull request is ready to merge.
+
+set -euo pipefail
+
+# shellcheck disable=SC2034 # consumed by lib/git-tools-pr.sh after dynamic source
+gt_command="git pr-ready"
+
+_script_path="${BASH_SOURCE[0]}"
+while [[ -L "$_script_path" ]]; do
+  _script_dir=$(cd -P -- "$(dirname -- "$_script_path")" && pwd)
+  _link=$(readlink "$_script_path")
+  case "$_link" in
+    /*) _script_path="$_link" ;;
+    *) _script_path="$_script_dir/$_link" ;;
+  esac
+done
+_root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-pr.sh"
+
+_usage() {
+  cat <<'EOF'
+Usage: git pr-ready [options] [<number|url|branch>]
+
+Check whether a GitHub pull request is open, non-draft, conflict-free, and has
+passing checks. Without a target, uses the PR for the current branch.
+
+Options:
+      --porcelain   Print stable key=value output.
+  -h, --help        Show this help.
+
+Exit status:
+  0  PR is ready.
+  1  PR is not ready, or GitHub status could not be read.
+  2  Usage or local environment error.
+EOF
+}
+
+_target=""
+_porcelain=0
+
+while (($#)); do
+  case "$1" in
+    --porcelain)
+      _porcelain=1
+      shift
+      ;;
+    -h | --help)
+      _usage
+      exit 0
+      ;;
+    --)
+      shift
+      (($# <= 1)) || gt_usage_error "expected at most one target"
+      _target="${1:-}"
+      break
+      ;;
+    -*)
+      gt_usage_error "unexpected option: $1"
+      ;;
+    *)
+      [[ -z "$_target" ]] || gt_usage_error "expected at most one target"
+      _target="$1"
+      shift
+      ;;
+  esac
+done
+
+gt_require_repo
+gt_require_gh
+
+_view=$(gt_pr_view_tsv "$_target") || gt_die "could not read pull request"
+IFS=$'\t' read -r _number _state _draft _merge_state _head _base _url _title <<<"$_view"
+
+_checks=$(gt_pr_checks_status "$_target") || gt_die "could not read pull request checks"
+_checks_state=$(gt_checks_ready_state "$_checks")
+
+_ready=true
+_reason="ready"
+
+if [[ "$_state" != "OPEN" ]]; then
+  _ready=false
+  _reason="state ${_state}"
+elif gt_bool "$_draft"; then
+  _ready=false
+  _reason="draft"
+elif [[ "$_merge_state" != "CLEAN" ]]; then
+  _ready=false
+  _reason="merge state ${_merge_state}"
+elif [[ "$_checks_state" != "pass" ]]; then
+  _ready=false
+  _reason="checks ${_checks_state}"
+fi
+
+if [[ "$_porcelain" == 1 ]]; then
+  printf 'ready=%s\n' "$_ready"
+  printf 'reason=%s\n' "$_reason"
+  printf 'number=%s\n' "$_number"
+  printf 'state=%s\n' "$_state"
+  printf 'draft=%s\n' "$_draft"
+  printf 'merge_state=%s\n' "$_merge_state"
+  printf 'checks=%s\n' "$_checks_state"
+  printf 'head=%s\n' "$_head"
+  printf 'base=%s\n' "$_base"
+  printf 'url=%s\n' "$_url"
+else
+  printf 'PR #%s: %s\n' "$_number" "$_title"
+  printf '  head: %s\n' "$_head"
+  printf '  base: %s\n' "$_base"
+  printf '  state: %s\n' "$_state"
+  printf '  draft: %s\n' "$_draft"
+  printf '  merge: %s\n' "$_merge_state"
+  printf '  checks: %s\n' "$_checks_state"
+  printf '  url: %s\n' "$_url"
+  if [[ "$_ready" == true ]]; then
+    printf 'ready\n'
+  else
+    printf 'not ready: %s\n' "$_reason"
+  fi
+fi
+
+[[ "$_ready" == true ]]

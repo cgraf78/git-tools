@@ -26,6 +26,26 @@ Use `--porcelain` for stable `key=value` output that other scripts can compose:
 git pr-ready --porcelain
 ```
 
+### `git pr-stack`
+
+Discovers the linear GitHub PR stack connected to a target PR and prints it in
+parent-to-child order.
+
+```sh
+git pr-stack
+git pr-stack 123
+git pr-stack feature/my-branch
+```
+
+Use `--porcelain` for tab-separated records that other scripts can compose:
+
+```sh
+git pr-stack --porcelain
+```
+
+If a stack branches into multiple child PRs, the command stops instead of
+guessing a landing order.
+
 ### `git cleanup-repo`
 
 Fetches and prunes the remote, updates the repository's default branch, then
@@ -109,6 +129,7 @@ commands are invoked as:
 git cleanup-repo
 git absorb-and-rebase
 git pr-ready
+git pr-stack
 ```
 
 For a simple local install:
@@ -133,6 +154,7 @@ Or run the focused command test directly:
 test/git-absorb-and-rebase-test
 test/git-cleanup-repo-test
 test/git-pr-ready-test
+test/git-pr-stack-test
 ```
 
 If `git-absorb` is not installed, the test suite verifies the dependency error

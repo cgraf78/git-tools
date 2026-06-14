@@ -1,0 +1,64 @@
+.TH GIT-WORKTREE-AUDIT 1 "2026-06-13" "git-tools" "User Commands"
+.SH NAME
+git-worktree-audit \- report state across all worktrees
+.SH SYNOPSIS
+.B git worktree-audit
+.RI [ options ]
+.SH DESCRIPTION
+.B git worktree-audit
+lists every worktree with its path, checked-out branch, dirty state, last commit
+age, and the open pull request number when GitHub data is available.
+.PP
+A worktree whose directory no longer exists is reported as an orphan. Dirty
+state is reported as
+.B unknown
+for bare or orphaned worktrees, which have no working tree to inspect. PR lookup
+is best-effort: when
+.B gh
+is missing or unauthenticated the audit still reports local worktree state and
+omits PR numbers.
+.SH OPTIONS
+.TP
+.B \-\-porcelain
+Print stable tab-separated
+.B worktree
+records:
+.BR path ,
+.B branch
+(or
+.B detached
+or
+.BR bare ),
+.B dirty
+(true/false/unknown),
+.B orphan
+(true/false),
+.B pr
+number (may be empty),
+.B HEAD
+commit, and
+.B committerdate
+as a Unix timestamp.
+.TP
+.B \-\-prune-orphan
+Prune worktrees whose directory no longer exists, delegating to
+.BR "git worktree prune" .
+.TP
+.BR \-n ", " \-\-dry-run
+With
+.BR \-\-prune-orphan ,
+print what would be pruned without changing anything.
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH EXIT STATUS
+.TP
+.B 0
+Audit or prune completed.
+.TP
+.B 2
+Usage or local environment error.
+.SH SEE ALSO
+.BR git-worktree (1),
+.BR git-branch-audit (1),
+.BR git-repo-state (1)

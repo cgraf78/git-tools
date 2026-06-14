@@ -130,6 +130,9 @@ _description_for() {
     git-stash-audit)
       printf '%s\n' 'inspect and clean git stashes'
       ;;
+    git-worktree-audit)
+      printf '%s\n' 'report state across all worktrees'
+      ;;
     *)
       return 1
       ;;
@@ -151,6 +154,7 @@ _commands=(
   git-repo-state
   git-resolve-base
   git-stash-audit
+  git-worktree-audit
 )
 
 echo "=== extras ==="

@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %q\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_assert_not_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" != *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output NOT to contain: %q\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_git_init() {
+  local repo="$1"
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+  printf 'base\n' >"$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -q -m base
+}
+
+_write_gh_stub() {
+  cat >"$1/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1 $2" == "auth status" ]]; then exit 0; fi
+if [[ "$1 $2" == "pr list" ]]; then
+  printf '202\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/202\tFeature PR\n'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 99
+EOF
+  chmod +x "$1/gh"
+}
+
+_write_unauthenticated_gh_stub() {
+  cat >"$1/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1 $2" == "auth status" ]]; then exit 1; fi
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 99
+EOF
+  chmod +x "$1/gh"
+}
+
+echo "=== git worktree-audit ==="
+
+repo=$(_tmpdir)
+_git_init "$repo"
+bin_dir=$(_tmpdir)
+_write_gh_stub "$bin_dir"
+
+feature_dir=$(_tmpdir)
+rm -rf "$feature_dir"
+git -C "$repo" worktree add -q -b feature "$feature_dir" >/dev/null
+
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" worktree-audit --porcelain 2>&1)
+_assert_contains "porcelain reports the main worktree" $'\tmain\tfalse\tfalse\t\t' "$result"
+_assert_contains "porcelain reports the feature worktree with PR" $'\tfeature\tfalse\tfalse\t202\t' "$result"
+
+# A dirty linked worktree is reported as dirty.
+printf 'edit\n' >>"$feature_dir/README.md"
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" worktree-audit --porcelain 2>&1)
+_assert_contains "porcelain reflects a dirty worktree" $'\tfeature\ttrue\tfalse\t202\t' "$result"
+
+result=$(PATH="$bin_dir:$PATH" git -C "$repo" worktree-audit 2>&1)
+_assert_contains "human reports the feature worktree" "branch=feature dirty=true orphan=false" "$result"
+_assert_contains "human reports the PR number" "pr=#202" "$result"
+
+# PR lookup is best-effort: still lists worktrees when gh is unauthenticated.
+unauth=$(_tmpdir)
+_write_unauthenticated_gh_stub "$unauth"
+result=$(PATH="$unauth:$PATH" git -C "$repo" worktree-audit --porcelain 2>&1)
+_assert_contains "lists worktrees without authenticated gh" $'\tfeature\ttrue\tfalse\t\t' "$result"
+
+# A worktree whose directory vanished is an orphan with unknown dirty state.
+orphan_dir=$(_tmpdir)
+rm -rf "$orphan_dir"
+git -C "$repo" worktree add -q -b temp "$orphan_dir" >/dev/null
+rm -rf "$orphan_dir"
+result=$(git -C "$repo" worktree-audit --porcelain 2>&1)
+_assert_contains "porcelain flags an orphaned worktree" $'\ttemp\tunknown\ttrue\t' "$result"
+
+result=$(git -C "$repo" worktree-audit --prune-orphan --dry-run 2>&1)
+_assert_contains "dry-run prune reports the orphan" "Removing" "$result"
+result=$(git -C "$repo" worktree-audit --porcelain 2>&1)
+_assert_contains "dry-run prune keeps the orphan listed" $'\ttemp\t' "$result"
+
+result=$(git -C "$repo" worktree-audit --prune-orphan 2>&1)
+result=$(git -C "$repo" worktree-audit --porcelain 2>&1)
+_assert_not_contains "prune removes the orphan worktree" $'\ttemp\t' "$result"
+
+outside=$(_tmpdir)
+result=$(git -C "$outside" worktree-audit 2>&1 || true)
+_assert_contains "requires git repo" "not inside a git repository" "$result"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

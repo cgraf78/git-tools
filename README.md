@@ -237,6 +237,30 @@ git stash-audit --drop-obsolete --yes
 Obsolete classification is conservative: a stash is obsolete only when Git's
 stash subject identifies a local origin branch and that local branch is gone.
 
+### `git worktree-audit`
+
+Reports state across every worktree: path, checked-out branch, dirty state, last
+commit age, and the open PR number when GitHub data is available. Worktrees whose
+directory no longer exists are reported as orphans.
+
+```sh
+git worktree-audit
+git worktree-audit --porcelain
+```
+
+Use `--porcelain` for stable tab-separated `worktree` records (path, branch,
+dirty, orphan, PR number, HEAD commit, commit timestamp). Dirty state is
+`unknown` for bare or orphaned worktrees, which have no working tree to inspect.
+PR lookup is best-effort and degrades to local-only output without `gh`.
+
+Use `--prune-orphan` to prune worktrees whose directory no longer exists. With
+`--dry-run` it prints what would be pruned:
+
+```sh
+git worktree-audit --prune-orphan --dry-run
+git worktree-audit --prune-orphan
+```
+
 ### `git resolve-base`
 
 Resolves the branch point the current branch diverged from and prints it. The
@@ -310,6 +334,7 @@ git pr-sync-stack
 git repo-state
 git resolve-base
 git stash-audit
+git worktree-audit
 ```
 
 For a simple local install:

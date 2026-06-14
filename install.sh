@@ -14,6 +14,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 COMMANDS=(
   git-absorb-and-rebase
   git-cleanup-repo
+  git-pr-checks
   git-pr-land
   git-pr-land-stack
   git-pr-ready

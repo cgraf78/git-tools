@@ -26,6 +26,25 @@ Use `--porcelain` for stable `key=value` output that other scripts can compose:
 git pr-ready --porcelain
 ```
 
+### `git pr-checks`
+
+Summarizes GitHub pull request checks with stable aggregate output.
+
+```sh
+git pr-checks
+git pr-checks 123
+git pr-checks feature/my-branch --watch
+```
+
+Use `--porcelain` for stable aggregate fields and tab-separated check records:
+
+```sh
+git pr-checks --porcelain
+```
+
+The command returns `0` when checks pass, `8` while checks are pending, and `1`
+when checks fail, are cancelled, or are missing.
+
 ### `git pr-stack`
 
 Discovers the linear GitHub PR stack connected to a target PR and prints it in
@@ -172,6 +191,7 @@ commands are invoked as:
 ```sh
 git cleanup-repo
 git absorb-and-rebase
+git pr-checks
 git pr-land
 git pr-land-stack
 git pr-ready

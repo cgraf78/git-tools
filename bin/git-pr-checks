@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# Summarize GitHub pull-request checks with stable machine output.
+
+set -euo pipefail
+
+# shellcheck disable=SC2034 # consumed by lib/git-tools-pr.sh after dynamic source
+gt_command="git pr-checks"
+
+_script_path="${BASH_SOURCE[0]}"
+while [[ -L "$_script_path" ]]; do
+  _script_dir=$(cd -P -- "$(dirname -- "$_script_path")" && pwd)
+  _link=$(readlink "$_script_path")
+  case "$_link" in
+    /*) _script_path="$_link" ;;
+    *) _script_path="$_script_dir/$_link" ;;
+  esac
+done
+_root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-pr.sh"
+
+_usage() {
+  cat <<'EOF'
+Usage: git pr-checks [options] [<number|url|branch>]
+
+Summarize GitHub pull request checks. Without a target, uses the PR for the
+current branch.
+
+Options:
+      --porcelain       Print stable key=value output and tab-separated records.
+      --required-only   Only include checks required by branch protection.
+  -w, --watch           Wait for checks to finish before summarizing.
+  -i, --interval <sec>  Refresh interval in seconds for --watch (default: 10).
+  -h, --help            Show this help.
+
+Exit status:
+  0  Checks passed.
+  1  Checks failed, were cancelled, are missing, or could not be read.
+  2  Usage or local environment error.
+  8  Checks are still pending.
+EOF
+}
+
+_target=""
+_porcelain=0
+_required=0
+_watch=0
+_interval=10
+
+while (($#)); do
+  case "$1" in
+    --porcelain)
+      _porcelain=1
+      shift
+      ;;
+    --required-only | --required)
+      _required=1
+      shift
+      ;;
+    -w | --watch)
+      _watch=1
+      shift
+      ;;
+    -i | --interval)
+      _opt="$1"
+      shift
+      (($#)) || gt_usage_error "$_opt requires a value"
+      _interval="$1"
+      shift
+      ;;
+    --interval=*)
+      _interval="${1#--interval=}"
+      [[ -n "$_interval" ]] || gt_usage_error "--interval requires a value"
+      shift
+      ;;
+    -h | --help)
+      _usage
+      exit 0
+      ;;
+    --)
+      shift
+      (($# <= 1)) || gt_usage_error "expected at most one target"
+      _target="${1:-}"
+      break
+      ;;
+    -*)
+      gt_usage_error "unexpected option: $1"
+      ;;
+    *)
+      [[ -z "$_target" ]] || gt_usage_error "expected at most one target"
+      _target="$1"
+      shift
+      ;;
+  esac
+done
+
+case "$_interval" in
+  '' | *[!0-9]*)
+    gt_usage_error "--interval must be a positive integer"
+    ;;
+  0)
+    gt_usage_error "--interval must be greater than zero"
+    ;;
+esac
+
+_gh_pr_checks_args() {
+  [[ -z "$_target" ]] || printf '%s\n' "$_target"
+  [[ "$_required" == 0 ]] || printf '%s\n' "--required"
+}
+
+_read_checks() {
+  local output status
+  local -a args=(pr checks)
+
+  while IFS= read -r _arg; do
+    args+=("$_arg")
+  done < <(_gh_pr_checks_args)
+  args+=(--json "name,bucket,state,workflow,link")
+  args+=(--jq '.[] | [.name,.bucket,.state,(.workflow // "" ),(.link // "" )] | @tsv')
+
+  set +e
+  output=$(gh "${args[@]}" 2>&1)
+  status=$?
+  set -e
+
+  case "$status" in
+    0 | 8)
+      printf '%s\n' "$output"
+      return 0
+      ;;
+    *)
+      case "$output" in
+        *"no checks reported"*)
+          return 0
+          ;;
+      esac
+      printf '%s\n' "$output" >&2
+      return "$status"
+      ;;
+  esac
+}
+
+_watch_checks() {
+  local -a args=(pr checks)
+
+  while IFS= read -r _arg; do
+    args+=("$_arg")
+  done < <(_gh_pr_checks_args)
+  args+=(--watch --interval "$_interval")
+
+  # The watch command exits non-zero for failed checks. That is useful for
+  # one-shot shell use, but this wrapper still reads the final structured
+  # status afterward so callers get the same summary shape for pass and fail.
+  gh "${args[@]}" || true
+}
+
+_state_from_counts() {
+  if ((_none > 0 || _fail > 0 || _cancel > 0)); then
+    printf 'fail\n'
+  elif ((_pending > 0)); then
+    printf 'pending\n'
+  else
+    printf 'pass\n'
+  fi
+}
+
+_print_summary() {
+  local state="$1"
+
+  if [[ "$_porcelain" == 1 ]]; then
+    printf 'checks=%s\n' "$state"
+    printf 'total=%s\n' "$_total"
+    printf 'pass=%s\n' "$_pass"
+    printf 'fail=%s\n' "$_fail"
+    printf 'pending=%s\n' "$_pending"
+    printf 'cancel=%s\n' "$_cancel"
+    printf 'skipping=%s\n' "$_skipping"
+    printf 'none=%s\n' "$_none"
+    return 0
+  fi
+
+  if ((_none > 0)); then
+    printf 'checks: none\n'
+    return 0
+  fi
+
+  printf 'checks: %s' "$state"
+  printf ' (%s pass' "$_pass"
+  ((_fail == 0)) || printf ', %s fail' "$_fail"
+  ((_pending == 0)) || printf ', %s pending' "$_pending"
+  ((_cancel == 0)) || printf ', %s cancel' "$_cancel"
+  ((_skipping == 0)) || printf ', %s skipping' "$_skipping"
+  printf ')\n'
+}
+
+_print_check() {
+  local name="$1"
+  local bucket="$2"
+  local state="$3"
+  local workflow="$4"
+  local link="$5"
+
+  if [[ "$_porcelain" == 1 ]]; then
+    printf 'check\t%s\t%s\t%s\t%s\t%s\n' "$bucket" "$state" "$name" "$workflow" "$link"
+    return 0
+  fi
+
+  printf '  %s  %s' "$bucket" "$name"
+  [[ -z "$workflow" ]] || printf ' [%s]' "$workflow"
+  [[ -z "$state" ]] || printf ' state=%s' "$state"
+  [[ -z "$link" ]] || printf ' %s' "$link"
+  printf '\n'
+}
+
+gt_require_repo
+gt_require_gh
+
+if [[ "$_watch" == 1 ]]; then
+  _watch_checks
+fi
+
+_checks=$(_read_checks) || gt_die "could not read pull request checks"
+
+_pass=0
+_fail=0
+_pending=0
+_cancel=0
+_skipping=0
+_none=0
+_total=0
+
+_records=()
+while IFS= read -r _record; do
+  [[ -n "$_record" ]] || continue
+  _records+=("$_record")
+done <<<"$_checks"
+
+if ((${#_records[@]} == 0)); then
+  _none=1
+else
+  for _record in "${_records[@]}"; do
+    IFS=$'\t' read -r _name _bucket _state _workflow _link <<<"$_record"
+    _total=$((_total + 1))
+    case "$_bucket" in
+      pass) _pass=$((_pass + 1)) ;;
+      fail) _fail=$((_fail + 1)) ;;
+      pending) _pending=$((_pending + 1)) ;;
+      cancel) _cancel=$((_cancel + 1)) ;;
+      skipping) _skipping=$((_skipping + 1)) ;;
+      *) _fail=$((_fail + 1)) ;;
+    esac
+  done
+fi
+
+_checks_state=$(_state_from_counts)
+_print_summary "$_checks_state"
+
+for _record in "${_records[@]}"; do
+  IFS=$'\t' read -r _name _bucket _state _workflow _link <<<"$_record"
+  _print_check "$_name" "$_bucket" "$_state" "$_workflow" "$_link"
+done
+
+case "$_checks_state" in
+  pass) exit 0 ;;
+  pending) exit 8 ;;
+  *) exit 1 ;;
+esac

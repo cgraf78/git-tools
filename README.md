@@ -61,6 +61,20 @@ Use `--base` when a parent PR landed and the child should now target the landed
 base branch. The command updates the PR base after the local rebase succeeds.
 With `--no-push`, it rebases locally and skips remote PR base edits.
 
+### `git pr-land`
+
+Verifies and merges one ready GitHub PR, then syncs the base branch locally and
+deletes the local PR branch.
+
+```sh
+git pr-land 123
+git pr-land 123 --method merge
+git pr-land 123 --keep-branch
+```
+
+The default merge method is `squash`. The command refuses draft PRs, merge
+conflicts, and non-passing checks.
+
 ### `git cleanup-repo`
 
 Fetches and prunes the remote, updates the repository's default branch, then
@@ -143,6 +157,7 @@ commands are invoked as:
 ```sh
 git cleanup-repo
 git absorb-and-rebase
+git pr-land
 git pr-ready
 git pr-restack
 git pr-stack
@@ -169,6 +184,7 @@ Or run the focused command test directly:
 ```sh
 test/git-absorb-and-rebase-test
 test/git-cleanup-repo-test
+test/git-pr-land-test
 test/git-pr-ready-test
 test/git-pr-restack-test
 test/git-pr-stack-test

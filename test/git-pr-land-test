@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+_temps=()
+
+_tmpdir() {
+  local dir
+  dir=$(mktemp -d)
+  _temps+=("$dir")
+  printf '%s\n' "$dir"
+}
+
+_cleanup() {
+  local dir
+  for dir in "${_temps[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap _cleanup EXIT
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_eq() {
+  local name="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %q\n' "$expected" >&2
+    printf '  actual:   %q\n' "$actual" >&2
+  fi
+}
+
+_assert_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_commit_file() {
+  local repo="$1"
+  local path="$2"
+  local content="$3"
+  local message="$4"
+
+  mkdir -p "$(dirname "$repo/$path")"
+  printf '%s\n' "$content" >"$repo/$path"
+  git -C "$repo" add "$path"
+  git -C "$repo" commit -m "$message" >/dev/null
+}
+
+_init_repo() {
+  local repo="$1"
+  local remote="$2"
+
+  git init --bare --initial-branch=main "$remote" >/dev/null
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+  _commit_file "$repo" README.md base base
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -u origin main >/dev/null 2>&1
+  git -C "$repo" switch --quiet -c feature
+  _commit_file "$repo" feature.txt feature feature
+  git -C "$repo" push -u origin feature >/dev/null 2>&1
+  git -C "$repo" switch --quiet feature
+}
+
+_write_gh_stub() {
+  local dir="$1"
+  local bin="$dir/gh"
+  cat >"$bin" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+log="${GH_LOG:?}"
+
+if [[ "$1 $2" == "auth status" ]]; then
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr view" ]]; then
+  case "${GH_PR_CASE:-ready}" in
+    ready)
+      printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      ;;
+    pending)
+      printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      ;;
+    dirty)
+      printf '4\tOPEN\tfalse\tDIRTY\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      ;;
+  esac
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr checks" ]]; then
+  case "${GH_PR_CASE:-ready}" in
+    pending) printf '{"pending":1}\n'; exit 8 ;;
+    *) printf '{"pass":2}\n' ;;
+  esac
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr merge" ]]; then
+  printf '%s\n' "$*" >>"$log"
+  exit 0
+fi
+
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 99
+EOF
+  chmod +x "$bin"
+}
+
+echo "=== git pr-land ==="
+
+repo=$(_tmpdir)
+remote=$(_tmpdir)
+bin_dir=$(_tmpdir)
+log=$(_tmpdir)/gh.log
+_init_repo "$repo" "$remote"
+_write_gh_stub "$bin_dir"
+
+result=$(GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-land 4 2>&1)
+_assert_contains "merges ready PR" "merging PR #4 with squash" "$result"
+_assert_eq "uses squash delete-branch merge" "pr merge 4 --squash --delete-branch" "$(cat "$log")"
+_assert_eq "syncs base branch" "main" "$(git -C "$repo" branch --show-current)"
+if git -C "$repo" show-ref --verify --quiet refs/heads/feature; then
+  _fail "deletes local feature branch"
+else
+  _pass "deletes local feature branch"
+fi
+
+repo_keep=$(_tmpdir)
+remote_keep=$(_tmpdir)
+log_keep=$(_tmpdir)/gh.log
+_init_repo "$repo_keep" "$remote_keep"
+result=$(GH_LOG="$log_keep" PATH="$bin_dir:$PATH" git -C "$repo_keep" pr-land 4 --method merge --keep-branch 2>&1)
+_assert_contains "supports merge method" "merging PR #4 with merge" "$result"
+_assert_eq "keep branch omits delete flag" "pr merge 4 --merge" "$(cat "$log_keep")"
+if git -C "$repo_keep" show-ref --verify --quiet refs/heads/feature; then
+  _pass "keep branch preserves local branch"
+else
+  _fail "keep branch preserves local branch"
+fi
+
+repo_dry=$(_tmpdir)
+remote_dry=$(_tmpdir)
+log_dry=$(_tmpdir)/gh.log
+_init_repo "$repo_dry" "$remote_dry"
+result=$(GH_LOG="$log_dry" PATH="$bin_dir:$PATH" git -C "$repo_dry" pr-land 4 --dry-run 2>&1)
+_assert_contains "dry run prints merge command" "would run: gh pr merge 4 --squash --delete-branch" "$result"
+_assert_eq "dry run keeps branch checked out" "feature" "$(git -C "$repo_dry" branch --show-current)"
+
+result=$(GH_PR_CASE=pending GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-land 4 2>&1 || true)
+_assert_contains "refuses pending checks" "checks are pending" "$result"
+
+result=$(GH_PR_CASE=pending GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-land 4 --dry-run 2>&1 || true)
+_assert_contains "dry run still refuses unready PRs" "checks are pending" "$result"
+
+result=$(GH_PR_CASE=dirty GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-land 4 2>&1 || true)
+_assert_contains "refuses dirty merge state" "merge state is DIRTY" "$result"
+
+result=$(GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-land 4 --method bad 2>&1 || true)
+_assert_contains "validates merge method" "merge method must be squash, merge, or rebase" "$result"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

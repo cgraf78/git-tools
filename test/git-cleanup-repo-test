@@ -149,9 +149,15 @@ git -C "$rebase_repo" switch --quiet -c rebased
 _commit_file "$rebase_repo" r1.txt one "rebased step 1"
 _commit_file "$rebase_repo" r2.txt two "rebased step 2"
 git -C "$rebase_repo" switch --quiet main
-# Simulate a rebase merge: each branch commit replayed onto main as a NEW commit
-# (different ids). The collapsed-diff probe will not match, but every commit's
-# patch-id is present, which the per-commit check detects.
+# main advances independently first (as it has by the time a PR lands), so the
+# replayed commits get new ids and the branch tip is definitively not an
+# ancestor of main. Without this, cherry-pick can reproduce byte-identical SHAs
+# (same content + same-second committer date) and the branch would be detected
+# as a plain ancestor merge instead of a content (patch-id) merge.
+_commit_file "$rebase_repo" mainline.txt main "unrelated mainline commit"
+# Simulate a rebase merge: each branch commit replayed onto main as a NEW commit.
+# The collapsed-diff probe will not match, but every commit's patch-id is
+# present, which the per-commit check detects.
 git -C "$rebase_repo" cherry-pick rebased~1 rebased >/dev/null 2>&1
 result=$(git -C "$rebase_repo" cleanup-repo 2>&1)
 _assert_contains "default deletes multi-commit rebase-merged branches" \

@@ -128,6 +128,84 @@ _assert_contains "gone deletes branches with removed upstreams" \
 expected="$(printf 'keep\nmain')"
 _assert_eq "gone leaves unmerged branches with live upstreams" "$expected" "$(_branches "$repo")"
 
+squash_repo=$(_clone_remote)
+git -C "$squash_repo" switch --quiet -c squashed
+_commit_file "$squash_repo" squashed.txt one "add squashed step 1"
+_commit_file "$squash_repo" squashed.txt two "edit squashed step 2"
+git -C "$squash_repo" switch --quiet main
+# Simulate a squash merge: the branch's net change applied as ONE new commit on
+# main with a different commit id, exactly what GitHub's squash merge produces.
+# The branch tip is not an ancestor of main, so only patch-id detection finds it.
+printf '%s\n' two >"$squash_repo/squashed.txt"
+git -C "$squash_repo" add squashed.txt
+git -C "$squash_repo" commit --quiet -m "squashed (#1)" >/dev/null
+result=$(git -C "$squash_repo" cleanup-repo 2>&1)
+_assert_contains "default deletes squash-merged branches" \
+  "deleting squashed (content-merged)" "$result"
+_assert_eq "squash-merged branch removed by default" "main" "$(_branches "$squash_repo")"
+
+rebase_repo=$(_clone_remote)
+git -C "$rebase_repo" switch --quiet -c rebased
+_commit_file "$rebase_repo" r1.txt one "rebased step 1"
+_commit_file "$rebase_repo" r2.txt two "rebased step 2"
+git -C "$rebase_repo" switch --quiet main
+# Simulate a rebase merge: each branch commit replayed onto main as a NEW commit
+# (different ids). The collapsed-diff probe will not match, but every commit's
+# patch-id is present, which the per-commit check detects.
+git -C "$rebase_repo" cherry-pick rebased~1 rebased >/dev/null 2>&1
+result=$(git -C "$rebase_repo" cleanup-repo 2>&1)
+_assert_contains "default deletes multi-commit rebase-merged branches" \
+  "deleting rebased (content-merged)" "$result"
+_assert_eq "rebase-merged branch removed by default" "main" "$(_branches "$rebase_repo")"
+
+unmerged_repo=$(_clone_remote)
+git -C "$unmerged_repo" switch --quiet -c partial
+_commit_file "$unmerged_repo" partial.txt one "add partial step 1"
+git -C "$unmerged_repo" switch --quiet main
+# Only part of the branch's diff is on main (a different file), so the patch-id
+# check must NOT consider it merged and the branch must be kept by default.
+_commit_file "$unmerged_repo" other.txt other "add unrelated commit"
+result=$(git -C "$unmerged_repo" cleanup-repo 2>&1)
+_assert_contains "keeps branches that are not content-merged" \
+  "keeping partial; not merged" "$result"
+_assert_eq "unmerged branch survives default cleanup" \
+  "$(printf 'main\npartial')" "$(_branches "$unmerged_repo")"
+
+# Any unmerged content must keep the branch, even when some of it landed. A
+# rebase that replayed only the first commit leaves a second commit unmerged.
+rebase_partial_repo=$(_clone_remote)
+git -C "$rebase_partial_repo" switch --quiet -c rebased-extra
+_commit_file "$rebase_partial_repo" re1.txt one "rebased-extra step 1"
+_commit_file "$rebase_partial_repo" re2.txt two "rebased-extra step 2"
+git -C "$rebase_partial_repo" switch --quiet main
+git -C "$rebase_partial_repo" cherry-pick rebased-extra~1 >/dev/null 2>&1
+result=$(git -C "$rebase_partial_repo" cleanup-repo 2>&1)
+_assert_contains "keeps a partially rebase-merged branch with an extra commit" \
+  "keeping rebased-extra; not merged" "$result"
+_assert_eq "partially rebase-merged branch survives" \
+  "$(printf 'main\nrebased-extra')" "$(_branches "$rebase_partial_repo")"
+
+# Squash-merge the branch's first commits, then add one more commit that was
+# never merged. The collapsed-diff probe will not match (extra content) and the
+# per-commit check sees the unmerged commit, so the branch must be kept.
+squash_partial_repo=$(_clone_remote)
+git -C "$squash_partial_repo" switch --quiet -c squashed-extra
+_commit_file "$squash_partial_repo" se1.txt one "squashed-extra step 1"
+_commit_file "$squash_partial_repo" se2.txt two "squashed-extra step 2"
+git -C "$squash_partial_repo" switch --quiet main
+printf '%s\n' one >"$squash_partial_repo/se1.txt"
+printf '%s\n' two >"$squash_partial_repo/se2.txt"
+git -C "$squash_partial_repo" add se1.txt se2.txt
+git -C "$squash_partial_repo" commit --quiet -m "squashed-extra (#1)"
+git -C "$squash_partial_repo" switch --quiet squashed-extra
+_commit_file "$squash_partial_repo" se3.txt three "squashed-extra step 3 (unmerged)"
+git -C "$squash_partial_repo" switch --quiet main
+result=$(git -C "$squash_partial_repo" cleanup-repo 2>&1)
+_assert_contains "keeps a squash-merged branch with an extra unmerged commit" \
+  "keeping squashed-extra; not merged" "$result"
+_assert_eq "squash-merged branch with extra work survives" \
+  "$(printf 'main\nsquashed-extra')" "$(_branches "$squash_partial_repo")"
+
 dry_repo=$(_clone_remote)
 git -C "$dry_repo" switch --quiet -c dry
 _commit_file "$dry_repo" dry.txt dry "add dry"

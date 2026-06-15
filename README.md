@@ -183,6 +183,11 @@ upstreams) that other scripts can filter.
 PR lookup is best-effort: when `gh` is missing or unauthenticated, the audit
 still reports local branch state and omits PR numbers.
 
+A branch counts as merged when its tip is an ancestor of the default branch or
+when its collapsed diff is already present there by patch-id. The patch-id check
+recognizes squash- and rebase-merged branches that a plain ancestor test would
+report as unmerged; it applies to both the `merged` column and `--drop-merged`.
+
 Use `--drop-merged` to delete branches already merged into the default branch.
 The current branch and branches checked out in a worktree are skipped. The
 deletion requires `--yes` unless `--dry-run` is also given:
@@ -202,11 +207,15 @@ git cleanup-repo
 ```
 
 By default the command deletes only local branches that are already merged into
-the base branch. Use `--gone` to also delete local branches whose upstream
+the base branch. This includes squash- and rebase-merged branches: their
+collapsed diff is compared against the base by patch-id, so a clean squash merge
+is recognized as merged even though its commits are not ancestors of the base —
+no `--all` needed. Use `--gone` to also delete local branches whose upstream
 branch was removed.
 
-Use `--all` when a stack was squash-merged and you intentionally want to delete
-every local branch except the base branch:
+Use `--all` to delete every local branch except the base branch regardless of
+merge state (for example, to reset a checkout with abandoned work you no longer
+need):
 
 ```sh
 git cleanup-repo --all

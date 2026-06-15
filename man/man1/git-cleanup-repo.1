@@ -10,8 +10,11 @@ fetches and prunes the remote, updates the repository default branch, then
 deletes stale local branches.
 .PP
 By default it deletes local branches that are already merged into the base
-branch. It can also delete branches whose upstream is gone or every local
-branch except the base branch.
+branch. This includes squash- and rebase-merged branches: the branch's
+collapsed diff is compared against the base by patch-id, so a clean squash merge
+is recognized as merged even though its commits are not ancestors of the base.
+It can also delete branches whose upstream is gone or every local branch except
+the base branch.
 .SH OPTIONS
 .TP
 .BR \-b ", " \-\-base " " \fIbranch\fR

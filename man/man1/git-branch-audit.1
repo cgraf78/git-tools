@@ -15,6 +15,14 @@ lookup is best-effort: when
 .B gh
 is missing or unauthenticated the audit still reports local branch state and
 omits PR numbers.
+.PP
+A branch counts as merged when its tip is an ancestor of the default branch or
+when its collapsed diff is already present in the default branch by patch-id.
+The patch-id check recognizes squash- and rebase-merged branches, which a plain
+ancestor test reports as unmerged. This applies to both the
+.B merged
+column and
+.BR \-\-drop-merged .
 .SH OPTIONS
 .TP
 .B \-\-porcelain

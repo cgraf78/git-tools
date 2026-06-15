@@ -129,7 +129,9 @@ _list() {
 
     read -r behind ahead < <(git rev-list --left-right --count "$_default_ref...$name" 2>/dev/null || printf '0 0\n')
     merged=false
-    git merge-base --is-ancestor "$name" "$_default_ref" 2>/dev/null && merged=true
+    # Squash/rebase merges are recognized too, so the merged flag is not stuck
+    # on "false" for branches landed via a squash PR.
+    gt_branch_merged "$name" "$_default_ref" && merged=true
     gone=false
     [[ "$track" == "[gone]" ]] && gone=true
     pr=$(gt_pr_number_for_branch "$name" || true)
@@ -157,7 +159,7 @@ _drop() {
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     [[ "$name" != "$_default" ]] || continue
-    git merge-base --is-ancestor "$name" "$_default_ref" 2>/dev/null || continue
+    gt_branch_merged "$name" "$_default_ref" || continue
 
     if [[ "$name" == "$current" ]]; then
       gt_say "skipping $name; current branch"

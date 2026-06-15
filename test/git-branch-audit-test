@@ -195,6 +195,42 @@ git -C "$repo" switch -q merged2
 result=$(git -C "$repo" branch-audit --drop-merged --yes 2>&1)
 _assert_contains "skips the current branch" "skipping merged2; current branch" "$result"
 
+# Squash and rebase merges are recognized by patch-id, not just ancestry, so
+# branches landed via squash/rebase PRs are reported merged and dropped.
+squash_repo=$(_tmpdir)
+_git_init "$squash_repo"
+_commit_file "$squash_repo" README.md base base
+
+git -C "$squash_repo" switch -q -c feature
+_commit_file "$squash_repo" feature.txt one "feature step 1"
+_commit_file "$squash_repo" feature.txt two "feature step 2"
+
+# A multi-commit branch landed via rebase merge: each commit replayed as a new
+# commit on main, so only the per-commit patch-id check finds it.
+git -C "$squash_repo" switch -q main
+git -C "$squash_repo" switch -q -c rebased
+_commit_file "$squash_repo" rebased.txt r1 "rebased step 1"
+_commit_file "$squash_repo" rebased2.txt r2 "rebased step 2"
+
+git -C "$squash_repo" switch -q main
+# Squash-merge feature: its net change as ONE new commit on main.
+printf '%s\n' two >"$squash_repo/feature.txt"
+git -C "$squash_repo" add feature.txt
+git -C "$squash_repo" commit -q -m "feature (#1)"
+# Rebase-merge rebased: replay each commit as a new commit on main.
+git -C "$squash_repo" cherry-pick rebased~1 rebased >/dev/null 2>&1
+
+result=$(PATH="$unauth:$PATH" git -C "$squash_repo" branch-audit --porcelain 2>&1)
+_assert_contains "porcelain marks squash-merged branch as merged" \
+  $'branch\tfeature\ttrue\t' "$result"
+_assert_contains "porcelain marks rebase-merged branch as merged" \
+  $'branch\trebased\ttrue\t' "$result"
+result=$(git -C "$squash_repo" branch-audit --drop-merged --yes 2>&1)
+_assert_contains "drops squash-merged branch" "deleted feature (merged)" "$result"
+_assert_contains "drops rebase-merged branch" "deleted rebased (merged)" "$result"
+_assert_eq "squash- and rebase-merged branches removed" "main" \
+  "$(git -C "$squash_repo" branch --format='%(refname:short)' | sort | tr '\n' ' ' | sed 's/ $//')"
+
 outside=$(_tmpdir)
 result=$(git -C "$outside" branch-audit 2>&1 || true)
 _assert_contains "requires git repo" "not inside a git repository" "$result"

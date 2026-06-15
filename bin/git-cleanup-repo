@@ -21,9 +21,12 @@ _usage() {
 Usage: git cleanup-repo [options]
 
 Fetch/prune the remote, update the default branch, then delete stale local
-branches. By default this removes local branches that are already merged into
-the base branch. Use --gone for branches whose upstream is gone, or --all to
-delete every local branch except the base branch.
+branches. By default this removes local branches already merged into the base
+branch, including squash- and rebase-merged branches: their collapsed diff is
+compared against the base by patch-id, so a clean squash merge is recognized as
+merged even though its commits are not ancestors of the base. Use --gone for
+branches whose upstream is gone, or --all to delete every local branch except
+the base branch.
 
 Options:
   -b, --base <branch>       Base branch to keep and update.
@@ -137,6 +140,9 @@ _branch_upstream_gone() {
   [[ "$track" == "[gone]" ]]
 }
 
+# Ancestor-only merge check. Squash/rebase merges are detected separately via
+# the shared `gt_branch_content_merged` so `_delete_reason` can report a distinct
+# reason for each.
 _branch_merged_into_base() {
   git merge-base --is-ancestor "$1" "$_base" 2>/dev/null
 }
@@ -150,6 +156,10 @@ _delete_reason() {
   fi
   if _branch_merged_into_base "$branch"; then
     printf 'merged\n'
+    return 0
+  fi
+  if gt_branch_content_merged "$branch" "$_base"; then
+    printf 'content-merged\n'
     return 0
   fi
   if [[ "$_gone" == 1 ]] && _branch_upstream_gone "$branch"; then

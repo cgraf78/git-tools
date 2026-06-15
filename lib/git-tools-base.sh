@@ -112,6 +112,60 @@ gt_resolve_base() {
   return 1
 }
 
+# @brief Return 0 when <branch>'s changes are already present in <base> via a
+# squash, rebase, or cherry-pick merge.
+# These merge methods replay a branch's changes as brand-new commit(s) on the
+# base, so the branch tip is never an ancestor of the base and both
+# `git merge-base --is-ancestor` and `git branch -d` report it as unmerged.
+# Detect content-equivalence by patch-id instead. Two shapes must be handled:
+#
+#   1. Squash merge: the whole branch lands as ONE new commit. Collapse the
+#      branch's entire diff (merge-base..branch) into a single probe commit and
+#      look for its patch-id in the base.
+#   2. Rebase / cherry-pick merge: each branch commit is replayed separately, so
+#      every merge-base..branch commit has an equivalent patch-id in the base.
+#      `git cherry` prints '+' for any branch commit NOT yet in the base; none
+#      missing (with at least one compared) means the whole branch is applied.
+#
+# The squash probe and the per-commit check are complementary: a multi-commit
+# squash matches only #1, a multi-commit rebase matches only #2. Returns 1 for a
+# branch with no unique diff; that degenerate case has no patch-id to match and
+# is already covered by the plain ancestor check.
+gt_branch_content_merged() {
+  local branch="$1" base="$2"
+  local merge_base tree base_tree probe cherry
+
+  merge_base=$(git merge-base "$base" "$branch" 2>/dev/null) || return 1
+  tree=$(git rev-parse "$branch^{tree}" 2>/dev/null) || return 1
+  base_tree=$(git rev-parse "$merge_base^{tree}" 2>/dev/null) || return 1
+  [[ "$tree" != "$base_tree" ]] || return 1
+
+  # Shape 1: squash merge.
+  probe=$(git commit-tree "$tree" -p "$merge_base" -m gt-content-probe 2>/dev/null) ||
+    return 1
+  [[ "$(git cherry "$base" "$probe" 2>/dev/null)" == "-"* ]] && return 0
+
+  # Shape 2: rebase / cherry-pick merge.
+  cherry=$(git cherry "$base" "$branch" 2>/dev/null) || return 1
+  [[ -n "$cherry" ]] || return 1
+  if grep -q '^+' <<<"$cherry"; then
+    return 1
+  fi
+  return 0
+}
+
+# @brief Return 0 when <branch> is merged into <base> by any means.
+# True when the branch tip is an ancestor of the base (plain merge / fast
+# forward) OR when its changes are already in the base by patch-id (squash,
+# rebase, or cherry-pick merge). This is the merge predicate branch-cleanup
+# tooling should use so squash/rebase-merged branches are not stranded as
+# "unmerged".
+gt_branch_merged() {
+  local branch="$1" base="$2"
+  git merge-base --is-ancestor "$branch" "$base" 2>/dev/null && return 0
+  gt_branch_content_merged "$branch" "$base"
+}
+
 # @brief Print the worktree path that has the given branch checked out.
 # Prints nothing and returns 0 when the branch is not checked out in any
 # worktree; callers test for an empty result.

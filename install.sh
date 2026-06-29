@@ -11,23 +11,13 @@ ZSH_COMPLETION_DIR="${ZSH_COMPLETION_DIR:-$SHARE_DIR/zsh/site-functions}"
 FISH_COMPLETION_DIR="${FISH_COMPLETION_DIR:-$SHARE_DIR/fish/vendor_completions.d}"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-COMMANDS=(
-  git-absorb-and-rebase
-  git-branch-audit
-  git-cleanup-repo
-  git-pr-checks
-  git-pr-land
-  git-pr-land-stack
-  git-pr-open
-  git-pr-ready
-  git-pr-restack
-  git-pr-stack
-  git-pr-sync-stack
-  git-repo-state
-  git-resolve-base
-  git-stash-audit
-  git-worktree-audit
-)
+# shellcheck source=lib/git-tools-inventory.sh
+. "$ROOT/lib/git-tools-inventory.sh"
+
+COMMANDS=()
+while IFS= read -r command; do
+  COMMANDS+=("$command")
+done < <(git_tools_commands "$ROOT")
 
 mkdir -p "$BIN_DIR"
 for command in "${COMMANDS[@]}"; do

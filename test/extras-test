@@ -4,6 +4,9 @@ set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
+# shellcheck source=lib/git-tools-inventory.sh
+. "$ROOT/lib/git-tools-inventory.sh"
+
 _failures=0
 _temps=()
 
@@ -65,6 +68,20 @@ _assert_contains() {
   else
     _fail "$name"
     printf '  expected %s to contain: %s\n' "$path" "$needle" >&2
+  fi
+}
+
+_assert_eq() {
+  local name="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %s\n' "$expected" >&2
+    printf '  actual: %s\n' "$actual" >&2
   fi
 }
 
@@ -139,28 +156,35 @@ _description_for() {
   esac
 }
 
-_commands=(
-  git-absorb-and-rebase
-  git-branch-audit
-  git-cleanup-repo
-  git-pr-checks
-  git-pr-land
-  git-pr-land-stack
-  git-pr-open
-  git-pr-ready
-  git-pr-restack
-  git-pr-stack
-  git-pr-sync-stack
-  git-repo-state
-  git-resolve-base
-  git-stash-audit
-  git-worktree-audit
-)
+inventory_root=$(_tmpdir)
+mkdir -p "$inventory_root/bin"
+touch "$inventory_root/bin/git-zed" "$inventory_root/bin/git-alpha" "$inventory_root/bin/git-beta"
+chmod +x "$inventory_root/bin/git-zed" "$inventory_root/bin/git-alpha"
+shopt -u nullglob
+inventory_result=$(git_tools_commands "$inventory_root")
+inventory_expected="$(printf 'git-alpha\ngit-zed')"
+_assert_eq "command inventory lists executable git-* files in stable order" \
+  "$inventory_expected" "$inventory_result"
+if shopt -q nullglob; then
+  _fail "command inventory does not leak nullglob state"
+else
+  _pass "command inventory does not leak nullglob state"
+fi
+
+_commands=()
+while IFS= read -r command; do
+  _commands+=("$command")
+done < <(git_tools_commands "$ROOT")
 
 echo "=== extras ==="
 
 for command in "${_commands[@]}"; do
-  description=$(_description_for "$command")
+  if description=$(_description_for "$command"); then
+    _pass "description expectation exists for $command"
+  else
+    _fail "description expectation exists for $command"
+    continue
+  fi
 
   _assert_file "man page exists for $command" "$ROOT/man/man1/$command.1"
   _assert_contains "man page names $command" "$command" "$ROOT/man/man1/$command.1"

@@ -4,58 +4,32 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
+# shellcheck source=lib/git-tools-inventory.sh
+. "$ROOT/lib/git-tools-inventory.sh"
+
+commands=()
+while IFS= read -r command; do
+  commands+=("$command")
+done < <(git_tools_commands "$ROOT")
+test_files=()
+for command in "${commands[@]}"; do
+  test_files+=("$ROOT/test/$command-test")
+done
+
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck "$ROOT/bin/git-absorb-and-rebase" \
-    "$ROOT/bin/git-branch-audit" \
-    "$ROOT/bin/git-cleanup-repo" \
-    "$ROOT/bin/git-pr-checks" \
-    "$ROOT/bin/git-pr-land" \
-    "$ROOT/bin/git-pr-land-stack" \
-    "$ROOT/bin/git-pr-open" \
-    "$ROOT/bin/git-pr-ready" \
-    "$ROOT/bin/git-pr-restack" \
-    "$ROOT/bin/git-pr-stack" \
-    "$ROOT/bin/git-pr-sync-stack" \
-    "$ROOT/bin/git-repo-state" \
-    "$ROOT/bin/git-resolve-base" \
-    "$ROOT/bin/git-stash-audit" \
-    "$ROOT/bin/git-worktree-audit" \
+  shellcheck -x -P "$ROOT" \
+    "${commands[@]/#/$ROOT/bin/}" \
     "$ROOT"/completions/*.bash \
     "$ROOT/lib/git-tools-base.sh" \
+    "$ROOT/lib/git-tools-inventory.sh" \
     "$ROOT/lib/git-tools-pr.sh" \
     "$ROOT/install.sh" \
     "$ROOT/test/extras-test" \
-    "$ROOT/test/git-absorb-and-rebase-test" \
-    "$ROOT/test/git-branch-audit-test" \
-    "$ROOT/test/git-cleanup-repo-test" \
-    "$ROOT/test/git-pr-checks-test" \
-    "$ROOT/test/git-pr-land-test" \
-    "$ROOT/test/git-pr-land-stack-test" \
-    "$ROOT/test/git-pr-open-test" \
-    "$ROOT/test/git-pr-ready-test" \
-    "$ROOT/test/git-pr-restack-test" \
-    "$ROOT/test/git-pr-stack-test" \
-    "$ROOT/test/git-pr-sync-stack-test" \
-    "$ROOT/test/git-repo-state-test" \
-    "$ROOT/test/git-resolve-base-test" \
-    "$ROOT/test/git-stash-audit-test" \
-    "$ROOT/test/git-worktree-audit-test" \
+    "${test_files[@]}" \
     "$ROOT/test/run"
 fi
 
 "$ROOT/test/extras-test"
-"$ROOT/test/git-absorb-and-rebase-test"
-"$ROOT/test/git-branch-audit-test"
-"$ROOT/test/git-cleanup-repo-test"
-"$ROOT/test/git-pr-checks-test"
-"$ROOT/test/git-pr-land-test"
-"$ROOT/test/git-pr-land-stack-test"
-"$ROOT/test/git-pr-open-test"
-"$ROOT/test/git-pr-ready-test"
-"$ROOT/test/git-pr-restack-test"
-"$ROOT/test/git-pr-stack-test"
-"$ROOT/test/git-pr-sync-stack-test"
-"$ROOT/test/git-repo-state-test"
-"$ROOT/test/git-resolve-base-test"
-"$ROOT/test/git-stash-audit-test"
-"$ROOT/test/git-worktree-audit-test"
+for command in "${commands[@]}"; do
+  "$ROOT/test/$command-test"
+done

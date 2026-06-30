@@ -159,13 +159,13 @@ if [[ "$1 $2" == "pr checks" ]]; then
   printf 'checks %s\n' "$*" >>"${STACK_LOG:?}"
   case "${GH_CHECK_CASE:-pass}" in
     pass)
-      printf '{"pass":2}\n'
+      printf 'pass\n'
       ;;
     fail)
-      printf '{"fail":1}\n'
+      printf 'fail\n'
       ;;
     none)
-      printf '{"none":1}\n'
+      printf 'none\n'
       ;;
   esac
   exit 0
@@ -193,10 +193,10 @@ expected="$(
   cat <<'EOF'
 land 1 --method squash --keep-branch
 restack 2 --base main --fork feature/a
-checks pr checks 2 --json bucket --jq [.[].bucket] | group_by(.) | map({key: .[0], value: length}) | from_entries
+checks pr checks 2 --json bucket --jq [.[].bucket] as $buckets | if any($buckets[]; . != "pass" and . != "skipping" and . != "fail" and . != "cancel" and . != "pending") then error("unknown check bucket") elif ($buckets | length) == 0 then "none" elif any($buckets[]; . == "fail" or . == "cancel") then "fail" elif any($buckets[]; . == "pending") then "pending" else "pass" end
 land 2 --method squash --keep-branch
 restack 3 --base main --fork feature/b
-checks pr checks 3 --json bucket --jq [.[].bucket] | group_by(.) | map({key: .[0], value: length}) | from_entries
+checks pr checks 3 --json bucket --jq [.[].bucket] as $buckets | if any($buckets[]; . != "pass" and . != "skipping" and . != "fail" and . != "cancel" and . != "pending") then error("unknown check bucket") elif ($buckets | length) == 0 then "none" elif any($buckets[]; . == "fail" or . == "cancel") then "fail" elif any($buckets[]; . == "pending") then "pending" else "pass" end
 land 3 --method squash
 EOF
 )"

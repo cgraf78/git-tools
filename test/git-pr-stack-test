@@ -109,8 +109,8 @@ if [[ "$1 $2" == "pr checks" ]]; then
     exit 1
   fi
   case "${3:-}" in
-    3) printf '{"pass":1,"pending":1}\n'; exit 8 ;;
-    *) printf '{"pass":2}\n' ;;
+    3) printf 'pending\n'; exit 8 ;;
+    *) printf 'pass\n' ;;
   esac
   exit 0
 fi

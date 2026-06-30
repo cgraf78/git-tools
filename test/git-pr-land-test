@@ -121,8 +121,8 @@ fi
 
 if [[ "$1 $2" == "pr checks" ]]; then
   case "${GH_PR_CASE:-ready}" in
-    pending) printf '{"pending":1}\n'; exit 8 ;;
-    *) printf '{"pass":2}\n' ;;
+    pending) printf 'pending\n'; exit 8 ;;
+    *) printf 'pass\n' ;;
   esac
   exit 0
 fi

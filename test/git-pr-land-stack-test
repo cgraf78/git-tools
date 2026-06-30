@@ -188,6 +188,50 @@ git -C "$repo" branch feature/b
 git -C "$repo" branch feature/c
 _write_tool_stubs "$bin_dir"
 
+# Regression: a dry run must NOT delete intermediate stack branches. The bug was
+# that _run_tool printed "would run" but fell through to execute the raw
+# git branch -D / git push --delete in _delete_landed_head. Use a dedicated repo
+# so this holds regardless of the destructive real runs below (which is why the
+# existing bottom-of-file dry-run test could not catch it).
+dry_repo=$(_tmpdir)
+dry_log=$(_tmpdir)/stack.log
+_git_init "$dry_repo"
+git -C "$dry_repo" branch feature/a
+git -C "$dry_repo" branch feature/b
+git -C "$dry_repo" branch feature/c
+PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$dry_log" git -C "$dry_repo" pr-land-stack 1 --dry-run >/tmp/pr-land-stack-dryrun-safe.out 2>&1
+for _dry_branch in feature/a feature/b feature/c; do
+  if git -C "$dry_repo" show-ref --verify --quiet "refs/heads/$_dry_branch"; then
+    _pass "dry run keeps $_dry_branch"
+  else
+    _fail "dry run keeps $_dry_branch"
+  fi
+done
+_assert_contains "dry run still plans the land" "land 1 --method squash --keep-branch --dry-run" "$(cat "$dry_log")"
+
+# Regression: a dry run must NOT delete the REMOTE intermediate branches either
+# (the most destructive path: git push --delete). Wire a real bare remote so
+# _remote_branch_exists is true and _delete_landed_head reaches the push.
+remote_repo=$(_tmpdir)
+git init -q --bare "$remote_repo"
+dry_remote_repo=$(_tmpdir)
+dry_remote_log=$(_tmpdir)/stack.log
+_git_init "$dry_remote_repo"
+git -C "$dry_remote_repo" branch feature/a
+git -C "$dry_remote_repo" branch feature/b
+git -C "$dry_remote_repo" branch feature/c
+git -C "$dry_remote_repo" remote add origin "$remote_repo"
+git -C "$dry_remote_repo" push -q origin feature/a feature/b feature/c
+git -C "$dry_remote_repo" fetch -q origin
+PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$dry_remote_log" git -C "$dry_remote_repo" pr-land-stack 1 --dry-run >/tmp/pr-land-stack-dryrun-remote.out 2>&1
+for _dry_branch in feature/a feature/b feature/c; do
+  if git -C "$remote_repo" show-ref --verify --quiet "refs/heads/$_dry_branch"; then
+    _pass "dry run keeps remote $_dry_branch"
+  else
+    _fail "dry run keeps remote $_dry_branch"
+  fi
+done
+
 PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" git -C "$repo" pr-land-stack 1 >/tmp/pr-land-stack.out 2>&1
 expected="$(
   cat <<'EOF'

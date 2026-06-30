@@ -75,11 +75,27 @@ _dry_run=0
 _check_timeout=900
 _check_interval=10
 
+# Invoke a sub-tool that understands --dry-run (git pr-land / pr-restack). The
+# caller appends --dry-run, so the sub-tool self-describes; we always execute it,
+# including in dry-run, where the sub-tool emits its own plan rather than acting.
 _run_tool() {
   if [[ "$_dry_run" == 1 ]]; then
     printf 'git pr-land-stack: would run:' >&2
     printf ' %q' "$@" >&2
     printf '\n' >&2
+  fi
+  "$@"
+}
+
+# Run a raw command that has no dry-run mode of its own (e.g. git branch -D in
+# _delete_landed_head). Unlike _run_tool, this MUST NOT fall through in dry-run —
+# otherwise a dry run would force-delete stack branches locally and remotely.
+_run_local() {
+  if [[ "$_dry_run" == 1 ]]; then
+    printf 'git pr-land-stack: would run:' >&2
+    printf ' %q' "$@" >&2
+    printf '\n' >&2
+    return 0
   fi
   "$@"
 }
@@ -117,10 +133,10 @@ _delete_landed_head() {
   # the child PR. Clean it up only once the child no longer points at it.
   remote=$(_remote_for_branch "$head")
   if _remote_branch_exists "$remote" "$head"; then
-    _run_tool git push "$remote" --delete "$head"
+    _run_local git push "$remote" --delete "$head"
   fi
   if _local_branch_exists "$head"; then
-    _run_tool git branch -D "$head"
+    _run_local git branch -D "$head"
   fi
 }
 

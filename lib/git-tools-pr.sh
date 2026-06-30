@@ -66,7 +66,7 @@ gt_pr_checks_status() {
   local output status
   local -a args=(pr checks)
   # shellcheck disable=SC2016 # `$buckets` is jq state inside gh's --jq filter.
-  local check_state_filter='[.[].bucket] as $buckets | if ($buckets | length) == 0 then "none" elif any($buckets[]; . == "fail" or . == "cancel") then "fail" elif any($buckets[]; . == "pending") then "pending" else "pass" end'
+  local check_state_filter='[.[].bucket] as $buckets | if any($buckets[]; . != "pass" and . != "skipping" and . != "fail" and . != "cancel" and . != "pending") then error("unknown check bucket") elif ($buckets | length) == 0 then "none" elif any($buckets[]; . == "fail" or . == "cancel") then "fail" elif any($buckets[]; . == "pending") then "pending" else "pass" end'
   [[ -z "$target" ]] || args+=("$target")
 
   set +e

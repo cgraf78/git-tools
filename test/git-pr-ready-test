@@ -104,6 +104,7 @@ if [[ "$1 $2" == "pr checks" ]]; then
     fail) printf 'fail\n' ;;
     none) printf "no checks reported on the 'feature/a' branch\n"; exit 1 ;;
     malformed) printf 'wat\n' ;;
+    unknown-bucket) printf 'jq: error: unknown check bucket\n' >&2; exit 1 ;;
   esac
   exit 0
 fi
@@ -146,6 +147,10 @@ _assert_contains "missing checks are not ready" "reason=checks none" "$result"
 result=$(GH_CHECK_CASE=malformed PATH="$bin_dir:$PATH" git -C "$repo" pr-ready --porcelain 2>&1 || true)
 _assert_contains "malformed check state fails closed" \
   "could not parse pull request check status" "$result"
+
+result=$(GH_CHECK_CASE=unknown-bucket PATH="$bin_dir:$PATH" git -C "$repo" pr-ready --porcelain 2>&1 || true)
+_assert_contains "unknown raw check bucket fails closed" \
+  "could not read pull request checks" "$result"
 
 outside=$(_tmpdir)
 result=$(PATH="$bin_dir:$PATH" git -C "$outside" pr-ready 2>&1 || true)

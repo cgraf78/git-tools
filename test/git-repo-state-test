@@ -74,7 +74,7 @@ if [[ "$1 $2" == "pr view" ]]; then
 fi
 
 if [[ "$1 $2" == "pr checks" ]]; then
-  printf '{"pass":2}\n'
+  printf 'pass\n'
   exit 0
 fi
 

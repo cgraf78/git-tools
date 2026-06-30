@@ -99,10 +99,11 @@ fi
 
 if [[ "$1 $2" == "pr checks" ]]; then
   case "${GH_CHECK_CASE:-pass}" in
-    pass) printf '{"pass":2}\n' ;;
-    pending) printf '{"pass":1,"pending":1}\n'; exit 8 ;;
-    fail) printf '{"pass":1,"fail":1}\n' ;;
+    pass) printf 'pass\n' ;;
+    pending) printf 'pending\n'; exit 8 ;;
+    fail) printf 'fail\n' ;;
     none) printf "no checks reported on the 'feature/a' branch\n"; exit 1 ;;
+    malformed) printf 'wat\n' ;;
   esac
   exit 0
 fi
@@ -141,6 +142,10 @@ _assert_contains "failing checks are not ready" "reason=checks fail" "$result"
 
 result=$(GH_CHECK_CASE=none PATH="$bin_dir:$PATH" git -C "$repo" pr-ready --porcelain 2>&1 || true)
 _assert_contains "missing checks are not ready" "reason=checks none" "$result"
+
+result=$(GH_CHECK_CASE=malformed PATH="$bin_dir:$PATH" git -C "$repo" pr-ready --porcelain 2>&1 || true)
+_assert_contains "malformed check state fails closed" \
+  "could not parse pull request check status" "$result"
 
 outside=$(_tmpdir)
 result=$(PATH="$bin_dir:$PATH" git -C "$outside" pr-ready 2>&1 || true)

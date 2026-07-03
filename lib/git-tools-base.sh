@@ -166,6 +166,27 @@ gt_branch_merged() {
   gt_branch_content_merged "$branch" "$base"
 }
 
+# @brief Run git after clearing repository-local environment inherited from git.
+# @param ... Arguments passed to git.
+#
+# Git external commands are launched with local state such as GIT_DIR,
+# GIT_WORK_TREE, GIT_PREFIX, and GIT_COMMON_DIR exported for the repository that
+# resolved the command. That is correct for normal same-repo subcommands, but it
+# makes `git -C <other-worktree> ...` inspect the original worktree instead of
+# the requested path. Clear exactly the variables Git documents as local before
+# crossing to another worktree or repository.
+gt_git_without_local_env() {
+  local name
+  local -a env_args=()
+
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    env_args+=("-u" "$name")
+  done < <(git rev-parse --local-env-vars)
+
+  env "${env_args[@]}" git "$@"
+}
+
 # @brief Print the worktree path that has the given branch checked out.
 # Prints nothing and returns 0 when the branch is not checked out in any
 # worktree; callers test for an empty result.

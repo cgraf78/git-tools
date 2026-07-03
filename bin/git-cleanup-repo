@@ -170,9 +170,30 @@ _delete_reason() {
   return 1
 }
 
+_worktree_dirty_state() {
+  local path="$1"
+  local output
+
+  # This status check is the safety gate before deleting a linked worktree
+  # directory. Treat an unreadable/corrupt worktree as dirty so cleanup never
+  # falls through to `git worktree remove` just because a preflight failed.
+  if ! output=$(
+    gt_git_without_local_env -C "$path" status --porcelain 2>/dev/null
+  ); then
+    printf 'dirty\n'
+    return 0
+  fi
+
+  if [[ -n "$output" ]]; then
+    printf 'dirty\n'
+  else
+    printf 'clean\n'
+  fi
+}
+
 _remove_branch_worktree_if_needed() {
   local branch="$1"
-  local path
+  local path state
 
   path=$(gt_worktree_for_branch "$branch")
   [[ -n "$path" ]] || return 0
@@ -182,7 +203,8 @@ _remove_branch_worktree_if_needed() {
     return 1
   fi
 
-  if [[ -n "$(git -C "$path" status --porcelain)" ]]; then
+  state=$(_worktree_dirty_state "$path")
+  if [[ "$state" != clean ]]; then
     _say "skipping $branch; worktree has uncommitted changes: $path"
     return 1
   fi

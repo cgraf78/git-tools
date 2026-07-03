@@ -87,11 +87,19 @@ _branch_label() {
 # working tree to inspect.
 _dirty_state() {
   local orphan="$1"
+  local output
   if [[ "$_wt_bare" == 1 || "$orphan" == true ]]; then
     printf 'unknown\n'
     return 0
   fi
-  if [[ -n "$(git -C "$_wt_path" status --porcelain 2>/dev/null)" ]]; then
+  # A linked worktree can exist in `git worktree list` while its checkout is no
+  # longer readable or its .git file is corrupt. Reporting "clean" in that case
+  # hides exactly the state an audit is supposed to surface.
+  if ! output=$(
+    gt_git_without_local_env -C "$_wt_path" status --porcelain 2>/dev/null
+  ); then
+    printf 'unknown\n'
+  elif [[ -n "$output" ]]; then
     printf 'true\n'
   else
     printf 'false\n'

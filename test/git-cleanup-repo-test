@@ -61,6 +61,20 @@ _assert_contains() {
   fi
 }
 
+_assert_not_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" != *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output NOT to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
 _git_init() {
   local repo="$1"
   git init -q --initial-branch=main "$repo"
@@ -247,6 +261,46 @@ _assert_eq "branch remains while worktree is kept" "$expected" "$(_branches "$wo
 result=$(git -C "$worktree_repo" cleanup-repo --all --remove-worktrees 2>&1)
 _assert_contains "removes clean linked worktrees" "deleting work (all)" "$result"
 _assert_eq "worktree cleanup leaves only main" "main" "$(_branches "$worktree_repo")"
+
+dirty_worktree_repo=$(_clone_remote)
+git -C "$dirty_worktree_repo" switch --quiet -c dirty-work
+_commit_file "$dirty_worktree_repo" dirty-work.txt clean "add dirty work"
+git -C "$dirty_worktree_repo" switch --quiet main
+dirty_worktree_git_dir=$(git -C "$dirty_worktree_repo" rev-parse --absolute-git-dir)
+dirty_worktree_dir=$(_tmpdir)
+rm -rf "$dirty_worktree_dir"
+git -C "$dirty_worktree_repo" worktree add "$dirty_worktree_dir" dirty-work >/dev/null 2>&1
+printf '%s\n' dirty >"$dirty_worktree_dir/dirty-work.txt"
+result=$(
+  GIT_DIR="$dirty_worktree_git_dir" GIT_WORK_TREE="$dirty_worktree_repo" \
+    git cleanup-repo --all --remove-worktrees 2>&1
+)
+_assert_contains "skips dirty linked worktrees before removal" \
+  "skipping dirty-work; worktree has uncommitted changes" "$result"
+_assert_not_contains "does not let git worktree remove reject dirty worktrees" \
+  "fatal:" "$result"
+_assert_eq "dirty worktree branch remains" \
+  "$(printf 'dirty-work\nmain')" "$(_branches "$dirty_worktree_repo")"
+
+corrupt_worktree_repo=$(_clone_remote)
+git -C "$corrupt_worktree_repo" switch --quiet -c corrupt-work
+_commit_file "$corrupt_worktree_repo" corrupt-work.txt clean "add corrupt work"
+git -C "$corrupt_worktree_repo" switch --quiet main
+corrupt_worktree_git_dir=$(git -C "$corrupt_worktree_repo" rev-parse --absolute-git-dir)
+corrupt_worktree_dir=$(_tmpdir)
+rm -rf "$corrupt_worktree_dir"
+git -C "$corrupt_worktree_repo" worktree add "$corrupt_worktree_dir" corrupt-work >/dev/null 2>&1
+printf 'gitdir: /nonexistent/gitdir\n' >"$corrupt_worktree_dir/.git"
+result=$(
+  GIT_DIR="$corrupt_worktree_git_dir" GIT_WORK_TREE="$corrupt_worktree_repo" \
+    git cleanup-repo --all --remove-worktrees 2>&1
+)
+_assert_contains "skips linked worktrees when status cannot run" \
+  "skipping corrupt-work; worktree has uncommitted changes" "$result"
+_assert_not_contains "does not remove corrupt worktrees after failed status" \
+  "fatal:" "$result"
+_assert_eq "corrupt worktree branch remains" \
+  "$(printf 'corrupt-work\nmain')" "$(_branches "$corrupt_worktree_repo")"
 
 dirty_repo=$(_clone_remote)
 printf 'dirty\n' >"$dirty_repo/dirty.txt"

@@ -102,6 +102,7 @@ echo "=== git worktree-audit ==="
 
 repo=$(_tmpdir)
 _git_init "$repo"
+repo_git_dir=$(git -C "$repo" rev-parse --absolute-git-dir)
 bin_dir=$(_tmpdir)
 _write_gh_stub "$bin_dir"
 
@@ -115,7 +116,10 @@ _assert_contains "porcelain reports the feature worktree with PR" $'\tfeature\tf
 
 # A dirty linked worktree is reported as dirty.
 printf 'edit\n' >>"$feature_dir/README.md"
-result=$(PATH="$bin_dir:$PATH" git -C "$repo" worktree-audit --porcelain 2>&1)
+result=$(
+  GIT_DIR="$repo_git_dir" GIT_WORK_TREE="$repo" PATH="$bin_dir:$PATH" \
+    git worktree-audit --porcelain 2>&1
+)
 _assert_contains "porcelain reflects a dirty worktree" $'\tfeature\ttrue\tfalse\t202\t' "$result"
 
 result=$(PATH="$bin_dir:$PATH" git -C "$repo" worktree-audit 2>&1)
@@ -127,6 +131,16 @@ unauth=$(_tmpdir)
 _write_unauthenticated_gh_stub "$unauth"
 result=$(PATH="$unauth:$PATH" git -C "$repo" worktree-audit --porcelain 2>&1)
 _assert_contains "lists worktrees without authenticated gh" $'\tfeature\ttrue\tfalse\t\t' "$result"
+
+# A listed worktree whose checkout cannot be inspected is not clean; its state
+# is unknown because status itself failed.
+corrupt_dir=$(_tmpdir)
+rm -rf "$corrupt_dir"
+git -C "$repo" worktree add -q -b broken "$corrupt_dir" >/dev/null
+printf 'gitdir: /nonexistent/gitdir\n' >"$corrupt_dir/.git"
+result=$(git -C "$repo" worktree-audit --porcelain 2>&1)
+_assert_contains "porcelain reports unreadable worktree dirty state as unknown" \
+  $'\tbroken\tunknown\tfalse\t' "$result"
 
 # A worktree whose directory vanished is an orphan with unknown dirty state.
 orphan_dir=$(_tmpdir)

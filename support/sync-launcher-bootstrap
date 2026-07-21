@@ -32,7 +32,7 @@ git_tools_validate_commands "$ROOT"
 
 tmpdir=$(mktemp -d)
 update_tmp=''
-# shellcheck disable=SC2329 # invoked indirectly by the EXIT trap
+# shellcheck disable=SC2317,SC2329 # invoked indirectly by the EXIT trap
 cleanup() {
   rm -rf "$tmpdir"
   if [[ -n "$update_tmp" ]]; then

@@ -165,6 +165,28 @@ inventory_result=$(git_tools_commands "$inventory_root")
 inventory_expected="$(printf 'git-alpha\ngit-zed')"
 _assert_eq "command inventory lists executable git-* files in stable order" \
   "$inventory_expected" "$inventory_result"
+if git_tools_validate_commands "$inventory_root" >/dev/null 2>&1; then
+  _fail 'command inventory rejects a launcher without its executable bit'
+else
+  _pass 'command inventory rejects a launcher without its executable bit'
+fi
+chmod +x "$inventory_root/bin/git-beta"
+if git_tools_validate_commands "$inventory_root" >/dev/null 2>&1; then
+  _pass 'command inventory accepts executable launchers'
+else
+  _fail 'command inventory accepts executable launchers'
+fi
+ln -s git-alpha "$inventory_root/bin/git-live-link"
+ln -s missing "$inventory_root/bin/git-dangling-link"
+if git_tools_validate_commands "$inventory_root" >/dev/null 2>&1; then
+  _fail 'command inventory rejects live and dangling launcher symlinks'
+else
+  _pass 'command inventory rejects live and dangling launcher symlinks'
+fi
+symlink_inventory=$(git_tools_commands "$inventory_root")
+symlink_expected="$(printf 'git-alpha\ngit-beta\ngit-zed')"
+_assert_eq 'command inventory excludes live and dangling launcher symlinks' \
+  "$symlink_expected" "$symlink_inventory"
 if shopt -q nullglob; then
   _fail "command inventory does not leak nullglob state"
 else
@@ -231,6 +253,15 @@ for command in "${_commands[@]}"; do
   _assert_symlink "installs $command zsh completion" "$prefix/share/zsh/site-functions/_$command"
   _assert_symlink "installs $command fish completion" "$prefix/share/fish/vendor_completions.d/$command.fish"
 done
+
+installed_help=$(_tmpdir)/repo-state-help.out
+if "$prefix/bin/git-repo-state" --help >"$installed_help" 2>&1; then
+  _pass 'installed symlinked launcher executes'
+else
+  _fail 'installed symlinked launcher executes'
+fi
+_assert_contains 'installed symlinked launcher resolves repository libraries' \
+  'Usage: git repo-state' "$installed_help"
 
 _assert_contains "install reports man destination" "installed man pages to" "$install_out"
 _assert_contains "install reports bash destination" "installed bash completions to" "$install_out"

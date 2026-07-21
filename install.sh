@@ -14,6 +14,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib/git-tools-inventory.sh
 . "$ROOT/lib/git-tools-inventory.sh"
 
+git_tools_validate_commands "$ROOT"
+
 COMMANDS=()
 while IFS= read -r command; do
   COMMANDS+=("$command")

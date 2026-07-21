@@ -96,7 +96,8 @@ if "$sync" >"$output" 2>&1; then
 else
   pass 'synchronizer rejects a template without a final newline'
 fi
-if cmp -s "$launcher" "$TMPDIR_ROOT/launcher-before-template-error"; then
+if git diff --no-index --quiet -- \
+  "$launcher" "$TMPDIR_ROOT/launcher-before-template-error"; then
   pass 'malformed template leaves launcher unchanged'
 else
   fail 'malformed template leaves launcher unchanged'

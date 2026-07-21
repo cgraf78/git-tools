@@ -7,6 +7,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=lib/git-tools-inventory.sh
 . "$ROOT/lib/git-tools-inventory.sh"
 
+git_tools_validate_commands "$ROOT"
+
 commands=()
 while IFS= read -r command; do
   commands+=("$command")
@@ -16,6 +18,8 @@ for command in "${commands[@]}"; do
   test_files+=("$ROOT/test/$command-test")
 done
 
+"$ROOT/support/sync-launcher-bootstrap" --check
+
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck -x -P "$ROOT" \
     "${commands[@]/#/$ROOT/bin/}" \
@@ -24,11 +28,14 @@ if command -v shellcheck >/dev/null 2>&1; then
     "$ROOT/lib/git-tools-inventory.sh" \
     "$ROOT/lib/git-tools-pr.sh" \
     "$ROOT/install.sh" \
+    "$ROOT/support/sync-launcher-bootstrap" \
     "$ROOT/test/extras-test" \
+    "$ROOT/test/launcher-bootstrap-test" \
     "${test_files[@]}" \
     "$ROOT/test/run"
 fi
 
+"$ROOT/test/launcher-bootstrap-test"
 "$ROOT/test/extras-test"
 for command in "${commands[@]}"; do
   "$ROOT/test/$command-test"

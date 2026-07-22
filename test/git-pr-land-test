@@ -16,6 +16,10 @@ _tmpdir() {
   printf '%s\n' "$dir"
 }
 
+_canonical_path() {
+  (cd -P -- "$1" && pwd)
+}
+
 _cleanup() {
   local dir
   for dir in "${_temps[@]}"; do
@@ -211,7 +215,7 @@ result=$(GH_LOG="$log_linked" PATH="$bin_dir:$PATH" git -C "$feature_linked" pr-
 rc=$?
 _assert_eq "linked feature: refuses unsafe cleanup before merge" "1" "$rc"
 _assert_contains "linked feature: explains base ownership" \
-  "cannot delete feature while main is checked out in $repo_linked" "$result"
+  "cannot delete feature while main is checked out in $(_canonical_path "$repo_linked")" "$result"
 if [[ -s "$log_linked" ]]; then
   _fail "linked feature: does not merge before refusal"
 else
@@ -238,7 +242,7 @@ result=$(GH_LOG="$log_head_linked" PATH="$bin_dir:$PATH" git -C "$repo_head_link
 rc=$?
 _assert_eq "linked head: refuses unsafe cleanup before merge" "1" "$rc"
 _assert_contains "linked head: explains branch ownership" \
-  "PR branch is checked out in another worktree: $feature_head_linked" "$result"
+  "PR branch is checked out in another worktree: $(_canonical_path "$feature_head_linked")" "$result"
 if [[ -s "$log_head_linked" ]]; then
   _fail "linked head: does not merge before refusal"
 else

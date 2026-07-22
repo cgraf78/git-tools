@@ -211,6 +211,27 @@ else
   _pass "linked stack: does not land before refusal"
 fi
 
+base_topology_repo=$(_tmpdir)
+base_topology_worktree=$(_tmpdir)
+base_topology_log=$(_tmpdir)/stack.log
+_git_init "$base_topology_repo"
+git -C "$base_topology_repo" branch feature/a
+git -C "$base_topology_repo" branch feature/b
+git -C "$base_topology_repo" branch feature/c
+git -C "$base_topology_repo" switch --quiet -c runner
+git -C "$base_topology_repo" worktree add --quiet "$base_topology_worktree" main
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$base_topology_log" \
+  git -C "$base_topology_repo" pr-land-stack 1 2>&1)
+rc=$?
+_assert_eq "linked stack base: refuses before first merge" "1" "$rc"
+_assert_contains "linked stack base: reports final cleanup conflict" \
+  "cannot delete feature/c while main is checked out or reserved" "$result"
+if [[ -s "$base_topology_log" ]]; then
+  _fail "linked stack base: does not land before refusal"
+else
+  _pass "linked stack base: does not land before refusal"
+fi
+
 race_repo=$(_tmpdir)
 race_worktree=$(_tmpdir)
 race_log=$(_tmpdir)/stack.log
@@ -231,6 +252,41 @@ else
   _fail "stack cleanup race: preserves local branch"
 fi
 
+push_race_repo=$(_tmpdir)
+push_race_remote=$(_tmpdir)
+push_race_worktree=$(_tmpdir)
+push_race_hooks=$(_tmpdir)
+push_race_log=$(_tmpdir)/stack.log
+_git_init "$push_race_repo"
+git -C "$push_race_repo" branch feature/a
+git -C "$push_race_repo" branch feature/b
+git -C "$push_race_repo" branch feature/c
+git init -q --bare "$push_race_remote"
+git -C "$push_race_repo" remote add origin "$push_race_remote"
+git -C "$push_race_repo" push --quiet origin main feature/a feature/b feature/c
+git -C "$push_race_repo" fetch --quiet origin
+cat >"$push_race_hooks/pre-push" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+git branch feature/a refs/remotes/origin/feature/a >/dev/null
+git worktree add --quiet "$push_race_worktree" feature/a
+EOF
+chmod +x "$push_race_hooks/pre-push"
+git -C "$push_race_repo" config core.hooksPath "$push_race_hooks"
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$push_race_log" \
+  git -C "$push_race_repo" pr-land-stack 1 2>&1)
+rc=$?
+_assert_eq "stack push race: reports partial cleanup" "1" "$rc"
+_assert_contains "stack push race: explains recreated local branch" \
+  "remote branch origin/feature/a was deleted but the local branch was recreated" "$result"
+if git -C "$push_race_remote" show-ref --verify --quiet refs/heads/feature/a; then
+  _fail "stack push race: remote deletion completed"
+else
+  _pass "stack push race: remote deletion completed"
+fi
+_assert_eq "stack push race: preserves concurrent checkout" \
+  "feature/a" "$(git -C "$push_race_worktree" branch --show-current)"
+
 # Regression: a dry run must NOT delete intermediate stack branches. The bug was
 # that _run_tool printed "would run" but fell through to execute the raw
 # git branch -D / git push --delete in _delete_landed_head. Use a dedicated repo
@@ -243,6 +299,8 @@ git -C "$dry_repo" branch feature/a
 git -C "$dry_repo" branch feature/b
 git -C "$dry_repo" branch feature/c
 PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$dry_log" git -C "$dry_repo" pr-land-stack 1 --dry-run >/tmp/pr-land-stack-dryrun-safe.out 2>&1
+rc=$?
+_assert_eq "dry run completes successfully" "0" "$rc"
 for _dry_branch in feature/a feature/b feature/c; do
   if git -C "$dry_repo" show-ref --verify --quiet "refs/heads/$_dry_branch"; then
     _pass "dry run keeps $_dry_branch"
@@ -267,6 +325,8 @@ git -C "$dry_remote_repo" remote add origin "$remote_repo"
 git -C "$dry_remote_repo" push -q origin feature/a feature/b feature/c
 git -C "$dry_remote_repo" fetch -q origin
 PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$dry_remote_log" git -C "$dry_remote_repo" pr-land-stack 1 --dry-run >/tmp/pr-land-stack-dryrun-remote.out 2>&1
+rc=$?
+_assert_eq "dry run with remote branches completes successfully" "0" "$rc"
 for _dry_branch in feature/a feature/b feature/c; do
   if git -C "$remote_repo" show-ref --verify --quiet "refs/heads/$_dry_branch"; then
     _pass "dry run keeps remote $_dry_branch"

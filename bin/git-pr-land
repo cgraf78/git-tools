@@ -163,8 +163,8 @@ _preflight_local_plan() {
   operation=$(gt_worktree_operation "$current_worktree")
   [[ -z "$operation" ]] ||
     gt_die "current worktree has $operation in progress: $current_worktree"
-  base_worktree=$(gt_worktree_for_branch "$base")
-  head_worktree=$(gt_worktree_for_branch "$head")
+  base_worktree=$(gt_worktree_reserving_branch "$base")
+  head_worktree=$(gt_worktree_reserving_branch "$head")
 
   if [[ -n "$base_worktree" ]]; then
     operation=$(gt_worktree_operation "$base_worktree")
@@ -192,10 +192,10 @@ _sync_base() {
   _fetch_remote "$remote" || return 1
   _remote_branch_exists "$remote" "$base" || return 1
   current_worktree=$(_current_worktree) || return 1
-  base_worktree=$(gt_worktree_for_branch "$base")
+  base_worktree=$(gt_worktree_reserving_branch "$base")
 
   if [[ -n "$base_worktree" && "$base_worktree" != "$current_worktree" ]]; then
-    gt_git_without_local_env -C "$base_worktree" merge --quiet --ff-only "$remote/$base" ||
+    _run gt_git_without_local_env -C "$base_worktree" merge --quiet --ff-only "$remote/$base" ||
       return 1
     return 0
   fi
@@ -223,7 +223,7 @@ _delete_local_head() {
   fi
   current=$(git symbolic-ref -q --short HEAD 2>/dev/null || true)
   [[ "$current" != "$head" ]] || return 1
-  worktree=$(gt_worktree_for_branch "$head")
+  worktree=$(gt_worktree_reserving_branch "$head")
   [[ -z "$worktree" ]] || return 1
   _run git branch -D "$head"
 }

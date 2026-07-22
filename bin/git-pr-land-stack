@@ -137,20 +137,27 @@ _delete_landed_head() {
   # In a stack, a parent PR branch is still the next PR's base until after that
   # child has been restacked. Deleting it as part of the merge makes GitHub close
   # the child PR. Clean it up only once the child no longer points at it.
-  worktree=$(gt_worktree_for_branch "$head")
+  worktree=$(gt_worktree_reserving_branch "$head")
   [[ -z "$worktree" ]] ||
     gt_die "cannot delete $head; branch is checked out or reserved in $worktree"
+  # Delete locally before crossing the network boundary. A concurrent checkout
+  # can no longer make the ordinary local cleanup fail after remote deletion.
+  if _local_branch_exists "$head"; then
+    _run_local git branch -D "$head"
+  fi
   remote=$(_remote_for_branch "$head")
   if _remote_branch_exists "$remote" "$head"; then
     _run_local git push "$remote" --delete "$head"
   fi
+  [[ "$_dry_run" == 0 ]] || return 0
   if _local_branch_exists "$head"; then
-    _run_local git branch -D "$head"
+    worktree=$(gt_worktree_reserving_branch "$head")
+    gt_die "remote branch $remote/$head was deleted but the local branch was recreated${worktree:+ in $worktree}"
   fi
 }
 
 _preflight_stack_topology() {
-  local current base_worktree head_worktree index last_index
+  local current base_worktree final_will_be_current head_worktree index last_index
 
   current=$(git rev-parse --show-toplevel) || gt_die "could not resolve current worktree"
   for index in "${!_heads[@]}"; do
@@ -159,7 +166,7 @@ _preflight_stack_topology() {
     if ((index == 0)) && [[ "$_keep_branch" == 1 ]]; then
       continue
     fi
-    head_worktree=$(gt_worktree_for_branch "${_heads[$index]}")
+    head_worktree=$(gt_worktree_reserving_branch "${_heads[$index]}")
     if [[ -n "$head_worktree" && "$head_worktree" != "$current" ]]; then
       gt_die "stack branch ${_heads[$index]} is checked out or reserved in another worktree: $head_worktree"
     fi
@@ -167,9 +174,13 @@ _preflight_stack_topology() {
 
   [[ "$_keep_branch" == 0 ]] || return 0
   last_index=$((${#_heads[@]} - 1))
-  base_worktree=$(gt_worktree_for_branch "${_bases[0]}")
-  head_worktree=$(gt_worktree_for_branch "${_heads[$last_index]}")
-  if [[ -n "$head_worktree" && "$head_worktree" == "$current" &&
+  base_worktree=$(gt_worktree_reserving_branch "${_bases[0]}")
+  head_worktree=$(gt_worktree_reserving_branch "${_heads[$last_index]}")
+  final_will_be_current=0
+  if ((${#_heads[@]} > 1)) || [[ "$head_worktree" == "$current" ]]; then
+    final_will_be_current=1
+  fi
+  if [[ "$final_will_be_current" == 1 &&
     -n "$base_worktree" && "$base_worktree" != "$current" ]]; then
     gt_die "cannot delete ${_heads[$last_index]} while ${_bases[0]} is checked out or reserved in $base_worktree"
   fi

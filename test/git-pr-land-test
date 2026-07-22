@@ -222,6 +222,32 @@ _assert_contains "dry run prints merge command" "would run: gh pr merge 4 --squa
 _assert_eq "dry run succeeds" "0" "$rc"
 _assert_eq "dry run keeps branch checked out" "feature" "$(git -C "$repo_dry" branch --show-current)"
 
+repo_dry_linked=$(_tmpdir)
+remote_dry_linked=$(_tmpdir)
+main_dry_linked=$(_tmpdir)
+updater_dry_linked=$(_tmpdir)
+log_dry_linked=$(_tmpdir)/gh.log
+_init_repo "$repo_dry_linked" "$remote_dry_linked"
+git -C "$repo_dry_linked" worktree add --quiet "$main_dry_linked" main
+git clone --quiet "$remote_dry_linked" "$updater_dry_linked"
+git -C "$updater_dry_linked" config user.email test@test.com
+git -C "$updater_dry_linked" config user.name Test
+git -C "$updater_dry_linked" config core.hooksPath /dev/null
+_commit_file "$updater_dry_linked" base-2.txt base-2 base-2
+git -C "$updater_dry_linked" push --quiet origin main
+git -C "$repo_dry_linked" fetch --quiet origin
+dry_linked_base_before=$(git -C "$main_dry_linked" rev-parse HEAD)
+result=$(GH_LOG="$log_dry_linked" PATH="$bin_dir:$PATH" \
+  git -C "$repo_dry_linked" pr-land 4 --dry-run --keep-branch 2>&1)
+rc=$?
+_assert_eq "linked base dry run: succeeds" "0" "$rc"
+_assert_contains "linked base dry run: prints external fast-forward" \
+  "would run: gt_git_without_local_env -C" "$result"
+_assert_eq "linked base dry run: does not advance base" \
+  "$dry_linked_base_before" "$(git -C "$main_dry_linked" rev-parse HEAD)"
+_assert_eq "linked base dry run: leaves base worktree on main" \
+  "main" "$(git -C "$main_dry_linked" branch --show-current)"
+
 repo_linked=$(_tmpdir)
 remote_linked=$(_tmpdir)
 feature_linked=$(_tmpdir)

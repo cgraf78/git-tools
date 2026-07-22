@@ -187,21 +187,12 @@ gt_git_without_local_env() {
   env "${env_args[@]}" git "$@"
 }
 
-# @brief Print the worktree path that owns or reserves the given branch.
-#
-# A rebase temporarily detaches HEAD while retaining the original branch in
-# rebase metadata. Git still reserves that branch, so checking only the
-# `branch` records from `git worktree list --porcelain` creates a false gap
-# before commands that switch or delete it.
-#
-# Prints nothing and returns 0 when no worktree owns the branch.
+# @brief Print the worktree path that has the given branch checked out.
+# Prints nothing and returns 0 when the branch is not checked out in any
+# worktree; callers test for an empty result.
 gt_worktree_for_branch() {
   local branch="$1"
-  local line path state_file state_head
-
-  # Prefer porcelain branch records. They remain available even when the
-  # worktree path itself is temporarily unreadable or corrupt.
-  path=$(git worktree list --porcelain |
+  git worktree list --porcelain |
     awk -v want="branch refs/heads/$branch" '
       /^worktree / {
         path = substr($0, 10)
@@ -211,14 +202,24 @@ gt_worktree_for_branch() {
         print path
         exit
       }
-    ')
+    '
+}
+
+# @brief Print the worktree path that owns or reserves the given branch.
+#
+# A rebase temporarily detaches HEAD while retaining the original branch in
+# rebase metadata. Irreversible workflows need this stronger check, while
+# ordinary inventory consumers retain the checked-out-only contract above.
+gt_worktree_reserving_branch() {
+  local branch="$1"
+  local line path state_file state_head
+
+  path=$(gt_worktree_for_branch "$branch")
   if [[ -n "$path" ]]; then
     printf '%s\n' "$path"
     return 0
   fi
 
-  # A detached rebase has no branch record, so inspect only its reservation
-  # metadata after the resilient porcelain lookup above.
   while IFS= read -r line; do
     [[ "$line" == "worktree "* ]] || continue
     path="${line#worktree }"

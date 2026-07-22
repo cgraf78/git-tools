@@ -101,6 +101,9 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'restack %s\n' "$*" >>"${STACK_LOG:?}"
+if [[ -n "${STACK_RACE_REPO:-}" && "${1:-}" == 2 ]]; then
+  git -C "$STACK_RACE_REPO" worktree add --quiet "${STACK_RACE_WORKTREE:?}" feature/a
+fi
 EOF
 
   cat >"$dir/gh" <<'EOF'
@@ -187,6 +190,46 @@ git -C "$repo" branch feature/a
 git -C "$repo" branch feature/b
 git -C "$repo" branch feature/c
 _write_tool_stubs "$bin_dir"
+
+topology_repo=$(_tmpdir)
+topology_worktree=$(_tmpdir)
+topology_log=$(_tmpdir)/stack.log
+_git_init "$topology_repo"
+git -C "$topology_repo" branch feature/a
+git -C "$topology_repo" branch feature/b
+git -C "$topology_repo" branch feature/c
+git -C "$topology_repo" worktree add --quiet "$topology_worktree" feature/b
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$topology_log" \
+  git -C "$topology_repo" pr-land-stack 1 2>&1)
+rc=$?
+_assert_eq "linked stack: refuses before first merge" "1" "$rc"
+_assert_contains "linked stack: reports reserved child branch" \
+  "stack branch feature/b is checked out or reserved in another worktree" "$result"
+if [[ -s "$topology_log" ]]; then
+  _fail "linked stack: does not land before refusal"
+else
+  _pass "linked stack: does not land before refusal"
+fi
+
+race_repo=$(_tmpdir)
+race_worktree=$(_tmpdir)
+race_log=$(_tmpdir)/stack.log
+_git_init "$race_repo"
+git -C "$race_repo" branch feature/a
+git -C "$race_repo" branch feature/b
+git -C "$race_repo" branch feature/c
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$race_log" \
+  STACK_RACE_REPO="$race_repo" STACK_RACE_WORKTREE="$race_worktree" \
+  git -C "$race_repo" pr-land-stack 1 2>&1)
+rc=$?
+_assert_eq "stack cleanup race: exits before branch deletion" "1" "$rc"
+_assert_contains "stack cleanup race: reports new branch owner" \
+  "cannot delete feature/a; branch is checked out or reserved" "$result"
+if git -C "$race_repo" show-ref --verify --quiet refs/heads/feature/a; then
+  _pass "stack cleanup race: preserves local branch"
+else
+  _fail "stack cleanup race: preserves local branch"
+fi
 
 # Regression: a dry run must NOT delete intermediate stack branches. The bug was
 # that _run_tool printed "would run" but fell through to execute the raw

@@ -103,6 +103,7 @@ _write_gh_stub() {
 set -euo pipefail
 
 log="${GH_LOG:?}"
+state_file="${GH_STATE:-$log.state}"
 
 if [[ "$1 $2" == "auth status" ]]; then
   exit 0
@@ -111,7 +112,11 @@ fi
 if [[ "$1 $2" == "pr view" ]]; then
   case "${GH_PR_CASE:-ready}" in
     ready)
-      printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      if [[ -f "$state_file" ]]; then
+        printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      else
+        printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      fi
       ;;
     pending)
       printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
@@ -120,13 +125,20 @@ if [[ "$1 $2" == "pr view" ]]; then
       printf '4\tOPEN\tfalse\tDIRTY\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
       ;;
     merged-after-error)
-      if [[ -f "${GH_STATE:?}" ]]; then
+      if [[ -f "$state_file" ]]; then
         printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
       else
         printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
       fi
       ;;
     checkout-head-after-merge)
+      if [[ -f "$state_file" ]]; then
+        printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      else
+        printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      fi
+      ;;
+    queued)
       printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
       ;;
   esac
@@ -145,11 +157,18 @@ if [[ "$1 $2" == "pr merge" ]]; then
   printf '%s\n' "$*" >>"$log"
   case "${GH_PR_CASE:-ready}" in
     merged-after-error)
-      : >"${GH_STATE:?}"
+      : >"$state_file"
       exit 1
       ;;
     checkout-head-after-merge)
       git -C "${GH_REPO:?}" worktree add "${GH_WORKTREE:?}" feature >/dev/null 2>&1
+      : >"$state_file"
+      ;;
+    queued)
+      exit 0
+      ;;
+    *)
+      : >"$state_file"
       ;;
   esac
   exit 0
@@ -261,6 +280,46 @@ _assert_eq "ambiguous merge: reconciles merged state" "0" "$rc"
 _assert_contains "ambiguous merge: reports verified server state" \
   "is merged despite merge command exit 1" "$result"
 _assert_contains "ambiguous merge: completes landing" "landed PR #4" "$result"
+
+repo_queued=$(_tmpdir)
+remote_queued=$(_tmpdir)
+log_queued=$(_tmpdir)/gh.log
+_init_repo "$repo_queued" "$remote_queued"
+result=$(GH_PR_CASE=queued GH_LOG="$log_queued" PATH="$bin_dir:$PATH" \
+  git -C "$repo_queued" pr-land 4 2>&1)
+rc=$?
+_assert_eq "queued merge: exits nonzero while PR remains open" "1" "$rc"
+_assert_contains "queued merge: reports unmerged server state" \
+  "is not merged after merge command (state: OPEN); local cleanup skipped" "$result"
+_assert_eq "queued merge: keeps feature checked out" \
+  "feature" "$(git -C "$repo_queued" branch --show-current)"
+if git -C "$repo_queued" show-ref --verify --quiet refs/heads/feature; then
+  _pass "queued merge: preserves local feature branch"
+else
+  _fail "queued merge: preserves local feature branch"
+fi
+
+repo_rebase=$(_tmpdir)
+remote_rebase=$(_tmpdir)
+main_rebase=$(_tmpdir)
+log_rebase=$(_tmpdir)/gh.log
+_init_repo "$repo_rebase" "$remote_rebase"
+git -C "$repo_rebase" worktree add --quiet "$main_rebase" main
+_commit_file "$main_rebase" base-2.txt base-2 base-2
+git -C "$main_rebase" push --quiet origin main
+git -C "$main_rebase" rebase --exec false HEAD~1 >/dev/null 2>&1 || true
+_assert_eq "rebase reservation fixture: worktree status remains clean" \
+  "" "$(git -C "$main_rebase" status --porcelain)"
+result=$(GH_LOG="$log_rebase" PATH="$bin_dir:$PATH" git -C "$repo_rebase" pr-land 4 2>&1)
+rc=$?
+_assert_eq "rebase reservation: refuses before merge" "1" "$rc"
+_assert_contains "rebase reservation: reports base operation" \
+  "base worktree has rebase in progress: $(_canonical_path "$main_rebase")" "$result"
+if [[ -s "$log_rebase" ]]; then
+  _fail "rebase reservation: does not merge before refusal"
+else
+  _pass "rebase reservation: does not merge before refusal"
+fi
 
 repo_race=$(_tmpdir)
 remote_race=$(_tmpdir)

@@ -187,12 +187,21 @@ gt_git_without_local_env() {
   env "${env_args[@]}" git "$@"
 }
 
-# @brief Print the worktree path that has the given branch checked out.
-# Prints nothing and returns 0 when the branch is not checked out in any
-# worktree; callers test for an empty result.
+# @brief Print the worktree path that owns or reserves the given branch.
+#
+# A rebase temporarily detaches HEAD while retaining the original branch in
+# rebase metadata. Git still reserves that branch, so checking only the
+# `branch` records from `git worktree list --porcelain` creates a false gap
+# before commands that switch or delete it.
+#
+# Prints nothing and returns 0 when no worktree owns the branch.
 gt_worktree_for_branch() {
   local branch="$1"
-  git worktree list --porcelain |
+  local line path state_file state_head
+
+  # Prefer porcelain branch records. They remain available even when the
+  # worktree path itself is temporarily unreadable or corrupt.
+  path=$(git worktree list --porcelain |
     awk -v want="branch refs/heads/$branch" '
       /^worktree / {
         path = substr($0, 10)
@@ -202,5 +211,45 @@ gt_worktree_for_branch() {
         print path
         exit
       }
-    '
+    ')
+  if [[ -n "$path" ]]; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+
+  # A detached rebase has no branch record, so inspect only its reservation
+  # metadata after the resilient porcelain lookup above.
+  while IFS= read -r line; do
+    [[ "$line" == "worktree "* ]] || continue
+    path="${line#worktree }"
+    for state_file in rebase-merge/head-name rebase-apply/head-name; do
+      state_file=$(gt_git_without_local_env -C "$path" rev-parse --git-path "$state_file" 2>/dev/null || true)
+      [[ -f "$state_file" ]] || continue
+      IFS= read -r state_head <"$state_file" || true
+      if [[ "$state_head" == "refs/heads/$branch" ]]; then
+        printf '%s\n' "$path"
+        return 0
+      fi
+    done
+  done < <(git worktree list --porcelain)
+}
+
+# @brief Print the active sequencer operation in a worktree, if any.
+gt_worktree_operation() {
+  local path="$1"
+  local entry label state_path
+
+  while IFS=$'\t' read -r entry label; do
+    state_path=$(gt_git_without_local_env -C "$path" rev-parse --git-path "$entry" 2>/dev/null || true)
+    [[ -e "$state_path" ]] || continue
+    printf '%s\n' "$label"
+    return 0
+  done <<'EOF'
+rebase-merge	rebase
+rebase-apply	rebase
+MERGE_HEAD	merge
+CHERRY_PICK_HEAD	cherry-pick
+REVERT_HEAD	revert
+BISECT_START	bisect
+EOF
 }

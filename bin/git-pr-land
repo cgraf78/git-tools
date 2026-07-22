@@ -148,7 +148,7 @@ _preflight_local_plan() {
   local remote="$1"
   local base="$2"
   local head="$3"
-  local current_worktree base_worktree head_worktree status
+  local current_worktree base_worktree head_worktree operation status
 
   _fetch_remote "$remote"
   _remote_branch_exists "$remote" "$base" ||
@@ -160,10 +160,16 @@ _preflight_local_plan() {
   fi
 
   current_worktree=$(_current_worktree) || gt_die "could not resolve current worktree"
+  operation=$(gt_worktree_operation "$current_worktree")
+  [[ -z "$operation" ]] ||
+    gt_die "current worktree has $operation in progress: $current_worktree"
   base_worktree=$(gt_worktree_for_branch "$base")
   head_worktree=$(gt_worktree_for_branch "$head")
 
   if [[ -n "$base_worktree" ]]; then
+    operation=$(gt_worktree_operation "$base_worktree")
+    [[ -z "$operation" ]] ||
+      gt_die "base worktree has $operation in progress: $base_worktree"
     status=$(_worktree_status "$base_worktree") ||
       gt_die "could not inspect base worktree: $base_worktree"
     [[ -z "$status" ]] || gt_die "base worktree must be clean: $base_worktree"
@@ -260,12 +266,23 @@ fi
 gt_say "merging PR #$_number with $_method"
 _merge_status=0
 _run gh "${_merge_args[@]}" || _merge_status=$?
-if ((_merge_status != 0)); then
-  _after_view=$(gt_pr_view_tsv "$_number") ||
-    gt_die "merge command failed and PR #$_number state could not be verified"
+if [[ "$_dry_run" != 1 ]]; then
+  _after_view=$(gt_pr_view_tsv "$_number") || {
+    if ((_merge_status != 0)); then
+      gt_die "merge command failed and PR #$_number state could not be verified"
+    fi
+    gt_die "merge command succeeded but PR #$_number state could not be verified"
+  }
   IFS=$'\t' read -r _ _after_state _ <<<"$_after_view"
-  [[ "$_after_state" == "MERGED" ]] || gt_die "merge command failed for PR #$_number"
-  gt_say "PR #$_number is merged despite merge command exit $_merge_status"
+  if [[ "$_after_state" != "MERGED" ]]; then
+    if ((_merge_status != 0)); then
+      gt_die "merge command failed for PR #$_number (state: $_after_state)"
+    fi
+    gt_die "PR #$_number is not merged after merge command (state: $_after_state); local cleanup skipped"
+  fi
+  if ((_merge_status != 0)); then
+    gt_say "PR #$_number is merged despite merge command exit $_merge_status"
+  fi
 fi
 
 gt_say "syncing $_base from $_remote"

@@ -347,6 +347,30 @@ else
   _pass "rebase reservation: does not merge before refusal"
 fi
 
+repo_bisect=$(_tmpdir)
+remote_bisect=$(_tmpdir)
+main_bisect=$(_tmpdir)
+log_bisect=$(_tmpdir)/gh.log
+_init_repo "$repo_bisect" "$remote_bisect"
+git -C "$repo_bisect" worktree add --quiet "$main_bisect" main
+_commit_file "$main_bisect" base-2.txt base-2 base-2
+_commit_file "$main_bisect" base-3.txt base-3 base-3
+_commit_file "$main_bisect" base-4.txt base-4 base-4
+git -C "$main_bisect" push --quiet origin main
+git -C "$main_bisect" bisect start HEAD HEAD~3 >/dev/null
+_assert_eq "bisect reservation fixture: worktree status remains clean" \
+  "" "$(git -C "$main_bisect" status --porcelain)"
+result=$(GH_LOG="$log_bisect" PATH="$bin_dir:$PATH" git -C "$repo_bisect" pr-land 4 2>&1)
+rc=$?
+_assert_eq "bisect reservation: refuses before merge" "1" "$rc"
+_assert_contains "bisect reservation: reports base operation" \
+  "base worktree has bisect in progress: $(_canonical_path "$main_bisect")" "$result"
+if [[ -s "$log_bisect" ]]; then
+  _fail "bisect reservation: does not merge before refusal"
+else
+  _pass "bisect reservation: does not merge before refusal"
+fi
+
 repo_race=$(_tmpdir)
 remote_race=$(_tmpdir)
 feature_race=$(_tmpdir)

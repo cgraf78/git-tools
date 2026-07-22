@@ -140,12 +140,14 @@ _delete_landed_head() {
   worktree=$(gt_worktree_reserving_branch "$head")
   [[ -z "$worktree" ]] ||
     gt_die "cannot delete $head; branch is checked out or reserved in $worktree"
+  # Branch deletion also removes branch.<name>.remote; retain the destination
+  # before local cleanup so a non-origin stack cannot drift to another remote.
+  remote=$(_remote_for_branch "$head")
   # Delete locally before crossing the network boundary. A concurrent checkout
   # can no longer make the ordinary local cleanup fail after remote deletion.
   if _local_branch_exists "$head"; then
     _run_local git branch -D "$head"
   fi
-  remote=$(_remote_for_branch "$head")
   if _remote_branch_exists "$remote" "$head"; then
     _run_local git push "$remote" --delete "$head"
   fi

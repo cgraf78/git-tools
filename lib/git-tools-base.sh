@@ -232,6 +232,15 @@ gt_worktree_reserving_branch() {
         return 0
       fi
     done
+
+    state_file=$(gt_git_without_local_env -C "$path" rev-parse --git-path BISECT_START 2>/dev/null || true)
+    if [[ -f "$state_file" ]]; then
+      IFS= read -r state_head <"$state_file" || true
+      if [[ "$state_head" == "$branch" || "$state_head" == "refs/heads/$branch" ]]; then
+        printf '%s\n' "$path"
+        return 0
+      fi
+    fi
   done < <(git worktree list --porcelain)
 }
 

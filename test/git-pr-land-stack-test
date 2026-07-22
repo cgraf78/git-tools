@@ -287,6 +287,37 @@ fi
 _assert_eq "stack push race: preserves concurrent checkout" \
   "feature/a" "$(git -C "$push_race_worktree" branch --show-current)"
 
+remote_repo=$(_tmpdir)
+origin_remote=$(_tmpdir)
+upstream_remote=$(_tmpdir)
+remote_log=$(_tmpdir)/stack.log
+_git_init "$remote_repo"
+git -C "$remote_repo" branch feature/a
+git -C "$remote_repo" branch feature/b
+git -C "$remote_repo" branch feature/c
+git init -q --bare "$origin_remote"
+git init -q --bare "$upstream_remote"
+git -C "$remote_repo" remote add origin "$origin_remote"
+git -C "$remote_repo" remote add upstream "$upstream_remote"
+git -C "$remote_repo" push --quiet origin main feature/a feature/b feature/c
+git -C "$remote_repo" push --quiet upstream main feature/a feature/b feature/c
+git -C "$remote_repo" fetch --quiet origin
+git -C "$remote_repo" fetch --quiet upstream
+git -C "$remote_repo" config branch.feature/a.remote upstream
+git -C "$remote_repo" config branch.feature/b.remote upstream
+PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$remote_log" \
+  git -C "$remote_repo" pr-land-stack 1 >/tmp/pr-land-stack-remote.out 2>&1
+if git -C "$upstream_remote" show-ref --verify --quiet refs/heads/feature/a; then
+  _fail "configured remote cleanup: deletes upstream feature/a"
+else
+  _pass "configured remote cleanup: deletes upstream feature/a"
+fi
+if git -C "$origin_remote" show-ref --verify --quiet refs/heads/feature/a; then
+  _pass "configured remote cleanup: preserves same-named origin branch"
+else
+  _fail "configured remote cleanup: preserves same-named origin branch"
+fi
+
 # Regression: a dry run must NOT delete intermediate stack branches. The bug was
 # that _run_tool printed "would run" but fell through to execute the raw
 # git branch -D / git push --delete in _delete_landed_head. Use a dedicated repo
@@ -313,22 +344,22 @@ _assert_contains "dry run still plans the land" "land 1 --method squash --keep-b
 # Regression: a dry run must NOT delete the REMOTE intermediate branches either
 # (the most destructive path: git push --delete). Wire a real bare remote so
 # _remote_branch_exists is true and _delete_landed_head reaches the push.
-remote_repo=$(_tmpdir)
-git init -q --bare "$remote_repo"
+dry_remote=$(_tmpdir)
+git init -q --bare "$dry_remote"
 dry_remote_repo=$(_tmpdir)
 dry_remote_log=$(_tmpdir)/stack.log
 _git_init "$dry_remote_repo"
 git -C "$dry_remote_repo" branch feature/a
 git -C "$dry_remote_repo" branch feature/b
 git -C "$dry_remote_repo" branch feature/c
-git -C "$dry_remote_repo" remote add origin "$remote_repo"
+git -C "$dry_remote_repo" remote add origin "$dry_remote"
 git -C "$dry_remote_repo" push -q origin feature/a feature/b feature/c
 git -C "$dry_remote_repo" fetch -q origin
 PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$dry_remote_log" git -C "$dry_remote_repo" pr-land-stack 1 --dry-run >/tmp/pr-land-stack-dryrun-remote.out 2>&1
 rc=$?
 _assert_eq "dry run with remote branches completes successfully" "0" "$rc"
 for _dry_branch in feature/a feature/b feature/c; do
-  if git -C "$remote_repo" show-ref --verify --quiet "refs/heads/$_dry_branch"; then
+  if git -C "$dry_remote" show-ref --verify --quiet "refs/heads/$_dry_branch"; then
     _pass "dry run keeps remote $_dry_branch"
   else
     _fail "dry run keeps remote $_dry_branch"

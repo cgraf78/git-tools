@@ -204,3 +204,62 @@ gt_worktree_for_branch() {
       }
     '
 }
+
+# @brief Print the worktree path that owns or reserves the given branch.
+#
+# A rebase temporarily detaches HEAD while retaining the original branch in
+# rebase metadata. Irreversible workflows need this stronger check, while
+# ordinary inventory consumers retain the checked-out-only contract above.
+gt_worktree_reserving_branch() {
+  local branch="$1"
+  local line path state_file state_head
+
+  path=$(gt_worktree_for_branch "$branch")
+  if [[ -n "$path" ]]; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    [[ "$line" == "worktree "* ]] || continue
+    path="${line#worktree }"
+    for state_file in rebase-merge/head-name rebase-apply/head-name; do
+      state_file=$(gt_git_without_local_env -C "$path" rev-parse --git-path "$state_file" 2>/dev/null || true)
+      [[ -f "$state_file" ]] || continue
+      IFS= read -r state_head <"$state_file" || true
+      if [[ "$state_head" == "refs/heads/$branch" ]]; then
+        printf '%s\n' "$path"
+        return 0
+      fi
+    done
+
+    state_file=$(gt_git_without_local_env -C "$path" rev-parse --git-path BISECT_START 2>/dev/null || true)
+    if [[ -f "$state_file" ]]; then
+      IFS= read -r state_head <"$state_file" || true
+      if [[ "$state_head" == "$branch" || "$state_head" == "refs/heads/$branch" ]]; then
+        printf '%s\n' "$path"
+        return 0
+      fi
+    fi
+  done < <(git worktree list --porcelain)
+}
+
+# @brief Print the active sequencer operation in a worktree, if any.
+gt_worktree_operation() {
+  local path="$1"
+  local entry label state_path
+
+  while IFS=$'\t' read -r entry label; do
+    state_path=$(gt_git_without_local_env -C "$path" rev-parse --git-path "$entry" 2>/dev/null || true)
+    [[ -e "$state_path" ]] || continue
+    printf '%s\n' "$label"
+    return 0
+  done <<'EOF'
+rebase-merge	rebase
+rebase-apply	rebase
+MERGE_HEAD	merge
+CHERRY_PICK_HEAD	cherry-pick
+REVERT_HEAD	revert
+BISECT_START	bisect
+EOF
+}

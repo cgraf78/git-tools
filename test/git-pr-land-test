@@ -16,6 +16,10 @@ _tmpdir() {
   printf '%s\n' "$dir"
 }
 
+_canonical_path() {
+  (cd -P -- "$1" && pwd)
+}
+
 _cleanup() {
   local dir
   for dir in "${_temps[@]}"; do
@@ -99,6 +103,7 @@ _write_gh_stub() {
 set -euo pipefail
 
 log="${GH_LOG:?}"
+state_file="${GH_STATE:-$log.state}"
 
 if [[ "$1 $2" == "auth status" ]]; then
   exit 0
@@ -107,13 +112,34 @@ fi
 if [[ "$1 $2" == "pr view" ]]; then
   case "${GH_PR_CASE:-ready}" in
     ready)
-      printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      if [[ -f "$state_file" ]]; then
+        printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      else
+        printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      fi
       ;;
     pending)
       printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
       ;;
     dirty)
       printf '4\tOPEN\tfalse\tDIRTY\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      ;;
+    merged-after-error)
+      if [[ -f "$state_file" ]]; then
+        printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      else
+        printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      fi
+      ;;
+    checkout-head-after-merge)
+      if [[ -f "$state_file" ]]; then
+        printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      else
+        printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      fi
+      ;;
+    queued)
+      printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
       ;;
   esac
   exit 0
@@ -129,6 +155,22 @@ fi
 
 if [[ "$1 $2" == "pr merge" ]]; then
   printf '%s\n' "$*" >>"$log"
+  case "${GH_PR_CASE:-ready}" in
+    merged-after-error)
+      : >"$state_file"
+      exit 1
+      ;;
+    checkout-head-after-merge)
+      git -C "${GH_REPO:?}" worktree add "${GH_WORKTREE:?}" feature >/dev/null 2>&1
+      : >"$state_file"
+      ;;
+    queued)
+      exit 0
+      ;;
+    *)
+      : >"$state_file"
+      ;;
+  esac
   exit 0
 fi
 
@@ -175,8 +217,173 @@ remote_dry=$(_tmpdir)
 log_dry=$(_tmpdir)/gh.log
 _init_repo "$repo_dry" "$remote_dry"
 result=$(GH_LOG="$log_dry" PATH="$bin_dir:$PATH" git -C "$repo_dry" pr-land 4 --dry-run 2>&1)
+rc=$?
 _assert_contains "dry run prints merge command" "would run: gh pr merge 4 --squash --delete-branch" "$result"
+_assert_eq "dry run succeeds" "0" "$rc"
 _assert_eq "dry run keeps branch checked out" "feature" "$(git -C "$repo_dry" branch --show-current)"
+
+repo_dry_linked=$(_tmpdir)
+remote_dry_linked=$(_tmpdir)
+main_dry_linked=$(_tmpdir)
+updater_dry_linked=$(_tmpdir)
+log_dry_linked=$(_tmpdir)/gh.log
+_init_repo "$repo_dry_linked" "$remote_dry_linked"
+git -C "$repo_dry_linked" worktree add --quiet "$main_dry_linked" main
+git clone --quiet "$remote_dry_linked" "$updater_dry_linked"
+git -C "$updater_dry_linked" config user.email test@test.com
+git -C "$updater_dry_linked" config user.name Test
+git -C "$updater_dry_linked" config core.hooksPath /dev/null
+_commit_file "$updater_dry_linked" base-2.txt base-2 base-2
+git -C "$updater_dry_linked" push --quiet origin main
+git -C "$repo_dry_linked" fetch --quiet origin
+dry_linked_base_before=$(git -C "$main_dry_linked" rev-parse HEAD)
+result=$(GH_LOG="$log_dry_linked" PATH="$bin_dir:$PATH" \
+  git -C "$repo_dry_linked" pr-land 4 --dry-run --keep-branch 2>&1)
+rc=$?
+_assert_eq "linked base dry run: succeeds" "0" "$rc"
+_assert_contains "linked base dry run: prints external fast-forward" \
+  "would run: gt_git_without_local_env -C" "$result"
+_assert_eq "linked base dry run: does not advance base" \
+  "$dry_linked_base_before" "$(git -C "$main_dry_linked" rev-parse HEAD)"
+_assert_eq "linked base dry run: leaves base worktree on main" \
+  "main" "$(git -C "$main_dry_linked" branch --show-current)"
+
+repo_linked=$(_tmpdir)
+remote_linked=$(_tmpdir)
+feature_linked=$(_tmpdir)
+log_linked=$(_tmpdir)/gh.log
+_init_repo "$repo_linked" "$remote_linked"
+git -C "$repo_linked" switch --quiet main
+git -C "$repo_linked" worktree add --quiet "$feature_linked" feature
+
+result=$(GH_LOG="$log_linked" PATH="$bin_dir:$PATH" git -C "$feature_linked" pr-land 4 2>&1)
+rc=$?
+_assert_eq "linked feature: refuses unsafe cleanup before merge" "1" "$rc"
+_assert_contains "linked feature: explains base ownership" \
+  "cannot delete feature while main is checked out in $(_canonical_path "$repo_linked")" "$result"
+if [[ -s "$log_linked" ]]; then
+  _fail "linked feature: does not merge before refusal"
+else
+  _pass "linked feature: does not merge before refusal"
+fi
+
+result=$(GH_LOG="$log_linked" PATH="$bin_dir:$PATH" git -C "$feature_linked" pr-land 4 --keep-branch 2>&1)
+rc=$?
+_assert_eq "linked feature keep: lands successfully" "0" "$rc"
+_assert_contains "linked feature keep: reports landed" "landed PR #4" "$result"
+_assert_eq "linked feature keep: leaves base in owning worktree" \
+  "main" "$(git -C "$repo_linked" branch --show-current)"
+_assert_eq "linked feature keep: preserves feature worktree" \
+  "feature" "$(git -C "$feature_linked" branch --show-current)"
+
+repo_head_linked=$(_tmpdir)
+remote_head_linked=$(_tmpdir)
+feature_head_linked=$(_tmpdir)
+log_head_linked=$(_tmpdir)/gh.log
+_init_repo "$repo_head_linked" "$remote_head_linked"
+git -C "$repo_head_linked" switch --quiet main
+git -C "$repo_head_linked" worktree add --quiet "$feature_head_linked" feature
+result=$(GH_LOG="$log_head_linked" PATH="$bin_dir:$PATH" git -C "$repo_head_linked" pr-land 4 2>&1)
+rc=$?
+_assert_eq "linked head: refuses unsafe cleanup before merge" "1" "$rc"
+_assert_contains "linked head: explains branch ownership" \
+  "PR branch is checked out in another worktree: $(_canonical_path "$feature_head_linked")" "$result"
+if [[ -s "$log_head_linked" ]]; then
+  _fail "linked head: does not merge before refusal"
+else
+  _pass "linked head: does not merge before refusal"
+fi
+
+repo_ambiguous=$(_tmpdir)
+remote_ambiguous=$(_tmpdir)
+log_ambiguous=$(_tmpdir)/gh.log
+state_ambiguous=$(_tmpdir)/merged
+_init_repo "$repo_ambiguous" "$remote_ambiguous"
+result=$(GH_PR_CASE=merged-after-error GH_STATE="$state_ambiguous" GH_LOG="$log_ambiguous" \
+  PATH="$bin_dir:$PATH" git -C "$repo_ambiguous" pr-land 4 2>&1)
+rc=$?
+_assert_eq "ambiguous merge: reconciles merged state" "0" "$rc"
+_assert_contains "ambiguous merge: reports verified server state" \
+  "is merged despite merge command exit 1" "$result"
+_assert_contains "ambiguous merge: completes landing" "landed PR #4" "$result"
+
+repo_queued=$(_tmpdir)
+remote_queued=$(_tmpdir)
+log_queued=$(_tmpdir)/gh.log
+_init_repo "$repo_queued" "$remote_queued"
+result=$(GH_PR_CASE=queued GH_LOG="$log_queued" PATH="$bin_dir:$PATH" \
+  git -C "$repo_queued" pr-land 4 2>&1)
+rc=$?
+_assert_eq "queued merge: exits nonzero while PR remains open" "1" "$rc"
+_assert_contains "queued merge: reports unmerged server state" \
+  "is not merged after merge command (state: OPEN); local cleanup skipped" "$result"
+_assert_eq "queued merge: keeps feature checked out" \
+  "feature" "$(git -C "$repo_queued" branch --show-current)"
+if git -C "$repo_queued" show-ref --verify --quiet refs/heads/feature; then
+  _pass "queued merge: preserves local feature branch"
+else
+  _fail "queued merge: preserves local feature branch"
+fi
+
+repo_rebase=$(_tmpdir)
+remote_rebase=$(_tmpdir)
+main_rebase=$(_tmpdir)
+log_rebase=$(_tmpdir)/gh.log
+_init_repo "$repo_rebase" "$remote_rebase"
+git -C "$repo_rebase" worktree add --quiet "$main_rebase" main
+_commit_file "$main_rebase" base-2.txt base-2 base-2
+git -C "$main_rebase" push --quiet origin main
+git -C "$main_rebase" rebase --exec false HEAD~1 >/dev/null 2>&1 || true
+_assert_eq "rebase reservation fixture: worktree status remains clean" \
+  "" "$(git -C "$main_rebase" status --porcelain)"
+result=$(GH_LOG="$log_rebase" PATH="$bin_dir:$PATH" git -C "$repo_rebase" pr-land 4 2>&1)
+rc=$?
+_assert_eq "rebase reservation: refuses before merge" "1" "$rc"
+_assert_contains "rebase reservation: reports base operation" \
+  "base worktree has rebase in progress: $(_canonical_path "$main_rebase")" "$result"
+if [[ -s "$log_rebase" ]]; then
+  _fail "rebase reservation: does not merge before refusal"
+else
+  _pass "rebase reservation: does not merge before refusal"
+fi
+
+repo_bisect=$(_tmpdir)
+remote_bisect=$(_tmpdir)
+main_bisect=$(_tmpdir)
+log_bisect=$(_tmpdir)/gh.log
+_init_repo "$repo_bisect" "$remote_bisect"
+git -C "$repo_bisect" worktree add --quiet "$main_bisect" main
+_commit_file "$main_bisect" base-2.txt base-2 base-2
+_commit_file "$main_bisect" base-3.txt base-3 base-3
+_commit_file "$main_bisect" base-4.txt base-4 base-4
+git -C "$main_bisect" push --quiet origin main
+git -C "$main_bisect" bisect start HEAD HEAD~3 >/dev/null
+_assert_eq "bisect reservation fixture: worktree status remains clean" \
+  "" "$(git -C "$main_bisect" status --porcelain)"
+result=$(GH_LOG="$log_bisect" PATH="$bin_dir:$PATH" git -C "$repo_bisect" pr-land 4 2>&1)
+rc=$?
+_assert_eq "bisect reservation: refuses before merge" "1" "$rc"
+_assert_contains "bisect reservation: reports base operation" \
+  "base worktree has bisect in progress: $(_canonical_path "$main_bisect")" "$result"
+if [[ -s "$log_bisect" ]]; then
+  _fail "bisect reservation: does not merge before refusal"
+else
+  _pass "bisect reservation: does not merge before refusal"
+fi
+
+repo_race=$(_tmpdir)
+remote_race=$(_tmpdir)
+feature_race=$(_tmpdir)
+log_race=$(_tmpdir)/gh.log
+_init_repo "$repo_race" "$remote_race"
+git -C "$repo_race" switch --quiet main
+result=$(GH_PR_CASE=checkout-head-after-merge GH_REPO="$repo_race" \
+  GH_WORKTREE="$feature_race" GH_LOG="$log_race" PATH="$bin_dir:$PATH" \
+  git -C "$repo_race" pr-land 4 2>&1)
+rc=$?
+_assert_eq "cleanup race: exits nonzero after merge" "1" "$rc"
+_assert_contains "cleanup race: reports merged cleanup state" \
+  "PR #4 merged; cleanup incomplete" "$result"
 
 result=$(GH_PR_CASE=pending GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-land 4 2>&1 || true)
 _assert_contains "refuses pending checks" "checks are pending" "$result"

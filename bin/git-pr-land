@@ -21,6 +21,8 @@ _root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
 # END GENERATED LAUNCHER BOOTSTRAP
 # shellcheck disable=SC1091
 . "$_root/lib/git-tools-pr.sh"
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-base.sh"
 
 _usage() {
   cat <<'EOF'
@@ -38,7 +40,7 @@ Options:
 
 Exit status:
   0  PR was landed.
-  1  PR is not ready or merge failed.
+  1  PR is not ready, merge failed, or post-merge cleanup is incomplete.
   2  Usage or local environment error.
 EOF
 }
@@ -130,33 +132,104 @@ _remote_branch_exists() {
   git show-ref --verify --quiet "refs/remotes/$remote/$branch"
 }
 
+_current_worktree() {
+  git rev-parse --show-toplevel
+}
+
+_worktree_status() {
+  gt_git_without_local_env -C "$1" status --porcelain
+}
+
+_fetch_remote() {
+  _run git fetch --quiet --prune --tags "$1"
+}
+
+_preflight_local_plan() {
+  local remote="$1"
+  local base="$2"
+  local head="$3"
+  local current_worktree base_worktree head_worktree operation status
+
+  _fetch_remote "$remote"
+  _remote_branch_exists "$remote" "$base" ||
+    gt_die "base branch does not exist on $remote: $base"
+
+  if _local_branch_exists "$base" &&
+    ! git merge-base --is-ancestor "$base" "$remote/$base" 2>/dev/null; then
+    gt_die "local $base cannot fast-forward to $remote/$base"
+  fi
+
+  current_worktree=$(_current_worktree) || gt_die "could not resolve current worktree"
+  operation=$(gt_worktree_operation "$current_worktree")
+  [[ -z "$operation" ]] ||
+    gt_die "current worktree has $operation in progress: $current_worktree"
+  base_worktree=$(gt_worktree_reserving_branch "$base")
+  head_worktree=$(gt_worktree_reserving_branch "$head")
+
+  if [[ -n "$base_worktree" ]]; then
+    operation=$(gt_worktree_operation "$base_worktree")
+    [[ -z "$operation" ]] ||
+      gt_die "base worktree has $operation in progress: $base_worktree"
+    status=$(_worktree_status "$base_worktree") ||
+      gt_die "could not inspect base worktree: $base_worktree"
+    [[ -z "$status" ]] || gt_die "base worktree must be clean: $base_worktree"
+  fi
+
+  [[ "$_keep_branch" == 1 || -z "$head_worktree" ]] && return 0
+  if [[ "$head_worktree" != "$current_worktree" ]]; then
+    gt_die "PR branch is checked out in another worktree: $head_worktree (use --keep-branch or remove that worktree)"
+  fi
+  if [[ -n "$base_worktree" && "$base_worktree" != "$current_worktree" ]]; then
+    gt_die "cannot delete $head while $base is checked out in $base_worktree (use --keep-branch or remove that worktree)"
+  fi
+}
+
 _sync_base() {
   local remote="$1"
   local base="$2"
+  local current_worktree base_worktree
 
-  _run git fetch --quiet --prune --tags "$remote"
+  _fetch_remote "$remote" || return 1
+  _remote_branch_exists "$remote" "$base" || return 1
+  current_worktree=$(_current_worktree) || return 1
+  base_worktree=$(gt_worktree_reserving_branch "$base")
+
+  if [[ -n "$base_worktree" && "$base_worktree" != "$current_worktree" ]]; then
+    _run gt_git_without_local_env -C "$base_worktree" merge --quiet --ff-only "$remote/$base" ||
+      return 1
+    return 0
+  fi
+
   if _local_branch_exists "$base"; then
-    _run git switch --quiet "$base"
+    _run git switch --quiet "$base" || return 1
   elif _remote_branch_exists "$remote" "$base"; then
-    _run git switch --quiet -c "$base" --track "$remote/$base"
+    _run git switch --quiet -c "$base" --track "$remote/$base" || return 1
   else
-    gt_die "base branch does not exist locally or on $remote: $base"
+    return 1
   fi
 
-  if _remote_branch_exists "$remote" "$base"; then
-    _run git pull --quiet --ff-only "$remote" "$base"
-  fi
+  _run git merge --quiet --ff-only "$remote/$base"
 }
 
 _delete_local_head() {
   local head="$1"
-  local current
+  local current worktree
 
   [[ "$_keep_branch" == 0 ]] || return 0
   _local_branch_exists "$head" || return 0
+  if [[ "$_dry_run" == 1 ]]; then
+    _run git branch -D "$head"
+    return 0
+  fi
   current=$(git symbolic-ref -q --short HEAD 2>/dev/null || true)
-  [[ "$current" != "$head" ]] || gt_die "refusing to delete currently checked-out branch: $head"
+  [[ "$current" != "$head" ]] || return 1
+  worktree=$(gt_worktree_reserving_branch "$head")
+  [[ -z "$worktree" ]] || return 1
   _run git branch -D "$head"
+}
+
+_cleanup_incomplete() {
+  gt_die "PR #$_number merged; cleanup incomplete: $*"
 }
 
 gt_require_repo
@@ -182,16 +255,40 @@ elif [[ "$_checks_state" != "pass" ]]; then
 fi
 
 _remote=$(_remote_for_branch "$_base")
+if [[ "$_dry_run" != 1 ]]; then
+  _preflight_local_plan "$_remote" "$_base" "$_head"
+fi
 _merge_args=(pr merge "$_number" "--$_method")
 if [[ "$_keep_branch" == 0 ]]; then
   _merge_args+=(--delete-branch)
 fi
 
 gt_say "merging PR #$_number with $_method"
-_run gh "${_merge_args[@]}"
+_merge_status=0
+_run gh "${_merge_args[@]}" || _merge_status=$?
+if [[ "$_dry_run" != 1 ]]; then
+  _after_view=$(gt_pr_view_tsv "$_number") || {
+    if ((_merge_status != 0)); then
+      gt_die "merge command failed and PR #$_number state could not be verified"
+    fi
+    gt_die "merge command succeeded but PR #$_number state could not be verified"
+  }
+  IFS=$'\t' read -r _ _after_state _ <<<"$_after_view"
+  if [[ "$_after_state" != "MERGED" ]]; then
+    if ((_merge_status != 0)); then
+      gt_die "merge command failed for PR #$_number (state: $_after_state)"
+    fi
+    gt_die "PR #$_number is not merged after merge command (state: $_after_state); local cleanup skipped"
+  fi
+  if ((_merge_status != 0)); then
+    gt_say "PR #$_number is merged despite merge command exit $_merge_status"
+  fi
+fi
 
 gt_say "syncing $_base from $_remote"
-_sync_base "$_remote" "$_base"
-_delete_local_head "$_head"
+_sync_base "$_remote" "$_base" ||
+  _cleanup_incomplete "could not fast-forward $_base from $_remote"
+_delete_local_head "$_head" ||
+  _cleanup_incomplete "local branch $_head is still checked out in a worktree"
 
 gt_say "landed PR #$_number ($_head -> $_base)"

@@ -144,7 +144,12 @@ git pr-land 123 --keep-branch
 ```
 
 The default merge method is `squash`. The command refuses draft PRs, merge
-conflicts, and non-passing checks.
+conflicts, non-passing checks, local base branches that cannot fast-forward, and
+linked-worktree layouts that would prevent requested cleanup. With
+`--keep-branch`, an already-checked-out base is synchronized in its owning
+worktree. If GitHub reports an error after completing the server-side merge,
+the command rechecks structured PR state and identifies any remaining work as
+incomplete cleanup instead of incorrectly reporting that the merge failed.
 
 ### `git pr-land-stack`
 

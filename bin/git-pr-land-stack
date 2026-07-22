@@ -41,6 +41,7 @@ _snapshot_tool_dir() {
   cp "$_root/bin/git-pr-land" "$_tool_tmp/bin/git-pr-land"
   cp "$_root/bin/git-pr-restack" "$_tool_tmp/bin/git-pr-restack"
   cp "$_root/bin/git-pr-stack" "$_tool_tmp/bin/git-pr-stack"
+  cp "$_root/lib/git-tools-base.sh" "$_tool_tmp/lib/git-tools-base.sh"
   cp "$_root/lib/git-tools-pr.sh" "$_tool_tmp/lib/git-tools-pr.sh"
   _tool_dir="$_tool_tmp/bin"
 }

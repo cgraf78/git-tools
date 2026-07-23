@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Audit local branches against the default branch and optionally drop merged ones.
+# Audit local branches and report exact merged-branch cleanup candidates.
 
 set -euo pipefail
 
@@ -33,17 +33,22 @@ age, ahead/behind counts, whether they are merged into the default branch, and
 the open PR number when GitHub data is available. The default branch itself is
 the reference point and is omitted from the listing.
 
+Squash, rebase, and cherry-pick matches require both patch history and an exact
+net tree delta in pinned branch/default snapshots. Candidate reporting includes
+each branch's exact object ID. Incomplete branch enumeration aborts reporting.
+No local branch is deleted automatically.
+
 Options:
       --porcelain        Print stable tab-separated branch records.
-      --drop-merged      Delete branches already merged into the default branch.
+      --drop-merged      Report exact merged-branch cleanup candidates.
       --yes              Confirm --drop-merged.
   -b, --base <branch>    Use this branch as the default instead of inferring one.
-  -n, --dry-run          Print drop actions without changing anything.
+  -n, --dry-run          Print candidate actions without changing anything.
   -h, --help             Show this help.
 
 Exit status:
   0  Audit or cleanup completed.
-  1  Branch deletion failed.
+  1  Audit or candidate reporting failed.
   2  Usage or local environment error.
 EOF
 }
@@ -99,6 +104,8 @@ done
 # Resolve the default branch to a concrete ref so ahead/behind and merge checks
 # work even when only a remote-tracking copy exists locally.
 _resolve_default() {
+  local ref_status=0
+
   if [[ -n "$_base" ]]; then
     _default="$_base"
   else
@@ -108,33 +115,54 @@ _resolve_default() {
       gt_usage_error "could not determine default branch; pass --base <branch>"
   fi
 
-  if git show-ref --verify --quiet "refs/heads/$_default"; then
-    _default_ref="$_default"
-  elif git show-ref --verify --quiet "refs/remotes/origin/$_default"; then
-    _default_ref="origin/$_default"
-  else
-    gt_usage_error "default branch ref not found: $_default"
+  git check-ref-format --branch "$_default" >/dev/null 2>&1 ||
+    gt_usage_error "invalid base branch name: $_default"
+
+  gt_find_ref_commit "refs/heads/$_default" || ref_status=$?
+  if [[ "$ref_status" == 0 ]]; then
+    _default_oid=$GT_REF_OID
+    return 0
   fi
+  [[ "$ref_status" == 1 ]] ||
+    gt_die "could not inspect default branch ref: refs/heads/$_default"
+
+  ref_status=0
+  gt_find_ref_commit "refs/remotes/origin/$_default" || ref_status=$?
+  case "$ref_status" in
+    0)
+      _default_oid=$GT_REF_OID
+      ;;
+    1) gt_usage_error "default branch ref not found: $_default" ;;
+    *) gt_die "could not inspect default branch ref: refs/remotes/origin/$_default" ;;
+  esac
 }
 
 _branch_records() {
   git for-each-ref \
-    --format='%(refname:short)%09%(committerdate:unix)%09%(committerdate:relative)%09%(upstream:track)' \
+    --format='%(refname)%09%(objectname)%09%(committerdate:unix)%09%(committerdate:relative)%09%(upstream:track)' \
     refs/heads
 }
 
 _list() {
-  local name cdate crel track behind ahead merged gone pr
+  local records ref name oid cdate crel track behind ahead merged gone pr counts
 
-  while IFS=$'\t' read -r name cdate crel track; do
-    [[ -n "$name" ]] || continue
+  records=$(_branch_records) || gt_die "could not enumerate branches"
+
+  while IFS=$'\t' read -r ref oid cdate crel track; do
+    [[ -n "$ref" ]] || continue
+    case "$ref" in
+      refs/heads/*) name=${ref#refs/heads/} ;;
+      *) gt_die "invalid branch inventory record: $ref" ;;
+    esac
     [[ "$name" != "$_default" ]] || continue
 
-    read -r behind ahead < <(git rev-list --left-right --count "$_default_ref...$name" 2>/dev/null || printf '0 0\n')
+    counts=$(git rev-list --left-right --count "$_default_oid...$oid" 2>/dev/null) ||
+      gt_die "could not compare branch to default: $name"
+    read -r behind ahead <<<"$counts"
     merged=false
     # Squash/rebase merges are recognized too, so the merged flag is not stuck
     # on "false" for branches landed via a squash PR.
-    gt_branch_merged "$name" "$_default_ref" && merged=true
+    gt_branch_merged "$oid" "$_default_oid" && merged=true
     gone=false
     [[ "$track" == "[gone]" ]] && gone=true
     pr=$(gt_pr_number_for_branch "$name" || true)
@@ -147,50 +175,34 @@ _list() {
       [[ -z "$pr" ]] || printf ' pr=#%s' "$pr"
       printf ' (%s)\n' "$crel"
     fi
-  done < <(_branch_records)
+  done <<<"$records"
 }
 
 _drop() {
-  local name path current dropped=0 skipped=0
+  local records ref name oid candidates=0
 
   if [[ "$_dry_run" == 0 && "$_yes" == 0 ]]; then
     gt_usage_error "--drop-merged requires --yes or --dry-run"
   fi
 
-  current=$(git symbolic-ref -q --short HEAD || true)
+  records=$(git for-each-ref \
+    --format='%(refname)%09%(objectname)' refs/heads) ||
+    gt_die "could not enumerate branches"
 
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
+  while IFS=$'\t' read -r ref oid; do
+    [[ -n "$ref" ]] || continue
+    case "$ref" in
+      refs/heads/*) name=${ref#refs/heads/} ;;
+      *) gt_die "invalid branch inventory record: $ref" ;;
+    esac
     [[ "$name" != "$_default" ]] || continue
-    gt_branch_merged "$name" "$_default_ref" || continue
+    gt_branch_merged "$oid" "$_default_oid" || continue
 
-    if [[ "$name" == "$current" ]]; then
-      gt_say "skipping $name; current branch"
-      skipped=$((skipped + 1))
-      continue
-    fi
+    gt_say "preserving local cleanup candidate $name at $oid (merged); delete it manually after verifying no checkout is in flight"
+    candidates=$((candidates + 1))
+  done <<<"$records"
 
-    path=$(gt_worktree_for_branch "$name")
-    if [[ -n "$path" ]]; then
-      gt_say "skipping $name; checked out in worktree $path"
-      skipped=$((skipped + 1))
-      continue
-    fi
-
-    if [[ "$_dry_run" == 1 ]]; then
-      gt_say "would delete $name (merged)"
-    else
-      git branch -D "$name" >/dev/null
-      gt_say "deleted $name (merged)"
-    fi
-    dropped=$((dropped + 1))
-  done < <(git for-each-ref --format='%(refname:short)' refs/heads)
-
-  if [[ "$_dry_run" == 1 ]]; then
-    gt_say "done; would delete $dropped branch(es), skipped $skipped"
-  else
-    gt_say "done; deleted $dropped branch(es), skipped $skipped"
-  fi
+  gt_say "done; reported $candidates local cleanup candidate(s); no local branches deleted"
 }
 
 gt_require_repo

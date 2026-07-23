@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Clean up stale local Git branches after PR stacks have landed.
+# Report stale local Git branch cleanup candidates after PRs have landed.
 
 set -euo pipefail
 
@@ -23,20 +23,18 @@ _usage() {
   cat <<'EOF'
 Usage: git cleanup-repo [options]
 
-Fetch/prune the remote, update the default branch, then delete stale local
-branches. By default this removes local branches already merged into the base
-branch, including squash- and rebase-merged branches: their collapsed diff is
-compared against the base by patch-id, so a clean squash merge is recognized as
-merged even though its commits are not ancestors of the base. Use --gone for
-branches whose upstream is gone, or --all to delete every local branch except
-the base branch.
+Fetch the exact remote base, update it by pinned OID, then report stale local
+branch candidates with exact OIDs. Patch IDs identify replay candidates, but
+the branch's exact net tree delta must also be present in a pinned base snapshot.
+Incomplete branch inventories abort before reporting. No local branch or
+worktree is deleted automatically.
 
 Options:
   -b, --base <branch>       Base branch to keep and update.
-  -r, --remote <name>       Remote to fetch/pull from (default: origin).
-      --gone                Also delete branches whose upstream is gone.
-  -a, --all                 Delete all local branches except the base branch.
-      --remove-worktrees    Remove clean linked worktrees for deleted branches.
+  -r, --remote <name>       Remote endpoint to fetch from (default: origin).
+      --gone                Also report branches whose upstream is gone.
+  -a, --all                 Report all local branches except the base branch.
+      --remove-worktrees    Accepted for compatibility; removes nothing.
   -n, --dry-run             Print actions without changing anything.
   -h, --help                Show this help.
 EOF
@@ -63,25 +61,35 @@ _run() {
 
 _git_path_exists() {
   local path
-  path=$(git rev-parse --git-path "$1") || return 1
+  path=$(git rev-parse --git-path "$1") || return 2
   [[ -e "$path" ]]
 }
 
 _ensure_repo_ready() {
+  local bare state state_rc status
+
   git rev-parse --git-dir >/dev/null 2>&1 ||
     _die "not inside a git repository"
-  [[ "$(git rev-parse --is-bare-repository)" == "false" ]] ||
+  bare=$(git rev-parse --is-bare-repository) ||
+    _die "could not inspect repository type"
+  [[ "$bare" == "false" ]] ||
     _die "bare repositories are not supported"
 
-  if _git_path_exists rebase-merge || _git_path_exists rebase-apply ||
-    _git_path_exists MERGE_HEAD || _git_path_exists CHERRY_PICK_HEAD ||
-    _git_path_exists REVERT_HEAD; then
-    _die "repository already has an active rebase, merge, cherry-pick, or revert"
-  fi
+  for state in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+    state_rc=0
+    _git_path_exists "$state" || state_rc=$?
+    case "$state_rc" in
+      0) _die "repository already has an active rebase, merge, cherry-pick, or revert" ;;
+      1) ;;
+      *) _die "could not inspect repository operation state" ;;
+    esac
+  done
 
   # Switching branches and fast-forwarding the base should not trample pending
   # edits. Keep cleanup focused on refs, not worktree conflict resolution.
-  if [[ -n "$(git status --porcelain)" ]]; then
+  status=$(GIT_OPTIONAL_LOCKS=0 git status --porcelain) ||
+    _die "could not inspect worktree status"
+  if [[ -n "$status" ]]; then
     if [[ "$_dry_run" == 1 ]]; then
       _say "worktree is dirty; real cleanup would stop before changing refs"
       return 0
@@ -90,16 +98,26 @@ _ensure_repo_ready() {
   fi
 }
 
-_remote_exists() {
-  git remote get-url "$_remote" >/dev/null 2>&1
+_resolve_remote() {
+  local configured="" configured_count=0 value
+
+  while IFS= read -r value; do
+    configured_count=$((configured_count + 1))
+    configured=$value
+  done < <(git config --get-all "remote.$_remote.url" 2>/dev/null)
+  [[ "$configured_count" == 1 && -n "$configured" ]] ||
+    _die "could not resolve one fetch endpoint for remote: $_remote"
+  # Reuse the raw URL so Git applies insteadOf exactly once per operation.
+  _remote_url=$configured
 }
 
 _local_branch_exists() {
-  git show-ref --verify --quiet "refs/heads/$1"
+  gt_find_ref_commit "refs/heads/$1"
 }
 
-_remote_branch_exists() {
-  git show-ref --verify --quiet "refs/remotes/$_remote/$1"
+_validate_native_oid() {
+  local oid="$1"
+  [[ "${#oid}" == "$_oid_width" && "$oid" != *[!0-9a-f]* ]]
 }
 
 _default_branch() {
@@ -112,60 +130,177 @@ _default_branch() {
     _die "could not determine base branch; pass --base <branch>"
 }
 
-_checkout_base() {
-  if _local_branch_exists "$_base"; then
-    _run git switch --quiet "$_base"
+_cleanup_dry_objects() {
+  local status=$?
+
+  trap - EXIT HUP INT TERM
+  if [[ -n "${_dry_object_root:-}" ]]; then
+    rm -rf -- "$_dry_object_root" || status=2
+  fi
+  exit "$status"
+}
+
+_enable_dry_object_store() {
+  local source_objects existing_alternates="${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}"
+
+  source_objects=${GIT_OBJECT_DIRECTORY:-}
+  if [[ -z "$source_objects" ]]; then
+    source_objects=$(git rev-parse --git-path objects) ||
+      _die "could not resolve local object storage"
+    source_objects=$(cd -P -- "$source_objects" && pwd -P) ||
+      _die "could not resolve absolute local object storage"
+  fi
+  _dry_object_root=""
+  trap _cleanup_dry_objects EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  _dry_object_root=$(umask 077 &&
+    mktemp -d "${TMPDIR:-/tmp}/git-cleanup-repo-dry.XXXXXX") ||
+    _die "could not create dry-run object storage"
+  mkdir -m 700 "$_dry_object_root/objects" ||
+    _die "could not initialize dry-run object storage"
+
+  export GIT_OBJECT_DIRECTORY="$_dry_object_root/objects"
+  if [[ -n "$existing_alternates" ]]; then
+    export GIT_ALTERNATE_OBJECT_DIRECTORIES="$source_objects:$existing_alternates"
+  else
+    export GIT_ALTERNATE_OBJECT_DIRECTORIES="$source_objects"
+  fi
+}
+
+_pin_remote_base() {
+  local record status=0 oid ref extra resolved
+
+  record=$(git ls-remote --exit-code -- "$_remote_url" \
+    "refs/heads/$_base" 2>/dev/null) || status=$?
+  case "$status" in
+    0) ;;
+    2) _die "remote base branch does not exist: $_remote/$_base" ;;
+    *) _die "could not inspect remote base branch: $_remote/$_base" ;;
+  esac
+  [[ -n "$record" && "$record" != *$'\n'* ]] ||
+    _die "remote base lookup returned multiple records: $_remote/$_base"
+  IFS=$'\t' read -r oid ref extra <<<"$record"
+  [[ "$ref" == "refs/heads/$_base" && -z "$extra" ]] ||
+    _die "remote base lookup returned an invalid ref: $_remote/$_base"
+  _validate_native_oid "$oid" ||
+    _die "remote base lookup returned an invalid object ID: $_remote/$_base"
+  _remote_oid=$oid
+
+  if [[ "$_dry_run" == 1 ]]; then
+    _enable_dry_object_store
+  fi
+  git fetch --quiet --no-tags --no-write-fetch-head \
+    --no-auto-gc --no-recurse-submodules \
+    -- "$_remote_url" "refs/heads/$_base" ||
+    _die "could not fetch exact remote base: $_remote/$_base"
+  resolved=$(git rev-parse --verify "$_remote_oid^{commit}" 2>/dev/null) ||
+    _die "exact remote base object was not fetched: $_remote/$_base"
+  [[ "$resolved" == "$_remote_oid" ]] ||
+    _die "fetched remote base did not match its pinned object ID"
+}
+
+_resolve_local_base() {
+  local status=0
+
+  _local_branch_exists "$_base" || status=$?
+  case "$status" in
+    0)
+      _base_local_exists=1
+      _local_base_oid=$GT_REF_OID
+      ;;
+    1)
+      _base_local_exists=0
+      _local_base_oid=""
+      ;;
+    *) _die "could not inspect local base branch: $_base" ;;
+  esac
+}
+
+_preflight_base() {
+  local ancestor_status=0
+
+  if [[ "$_base_local_exists" == 0 ]]; then
+    _planned_base_oid=$_remote_oid
     return 0
   fi
 
-  if _remote_branch_exists "$_base"; then
-    _run git switch --quiet -c "$_base" --track "$_remote/$_base"
-    return 0
-  fi
+  git merge-base --is-ancestor "$_remote_oid" "$_local_base_oid" \
+    2>/dev/null || ancestor_status=$?
+  case "$ancestor_status" in
+    0)
+      _planned_base_oid=$_local_base_oid
+      return 0
+      ;;
+    1) ;;
+    *) _die "could not compare local and remote base branches" ;;
+  esac
 
-  _die "base branch does not exist locally or on $_remote: $_base"
+  ancestor_status=0
+  git merge-base --is-ancestor "$_local_base_oid" "$_remote_oid" \
+    2>/dev/null || ancestor_status=$?
+  case "$ancestor_status" in
+    0) _planned_base_oid=$_remote_oid ;;
+    1) _die "local base cannot be fast-forwarded to $_remote/$_base" ;;
+    *) _die "could not compare local and remote base branches" ;;
+  esac
 }
 
 _update_base() {
-  _run git fetch --quiet --prune --tags "$_remote"
-  _checkout_base
+  _pin_remote_base
+  _resolve_local_base
+  _preflight_base
 
-  if _remote_branch_exists "$_base"; then
-    _run git pull --quiet --ff-only "$_remote" "$_base"
+  if [[ "$_base_local_exists" == 1 ]]; then
+    _run git switch --quiet --no-guess "$_base"
   else
-    _say "base has no $_remote branch; skipping pull"
+    _run git switch --quiet -c "$_base" "$_remote_oid"
+    _run git config --local --replace-all "branch.$_base.remote" "$_remote"
+    _run git config --local --replace-all \
+      "branch.$_base.merge" "refs/heads/$_base"
   fi
-}
+  _run git merge --quiet --ff-only "$_remote_oid"
 
-_branch_upstream_gone() {
-  local track
-  track=$(git for-each-ref --format='%(upstream:track)' "refs/heads/$1")
-  [[ "$track" == "[gone]" ]]
+  if [[ "$_dry_run" == 1 ]]; then
+    _base_oid=$_planned_base_oid
+    return 0
+  fi
+  _local_branch_exists "$_base" ||
+    _die "could not resolve local base branch after update: $_base"
+  [[ "$GT_REF_OID" == "$_planned_base_oid" ]] ||
+    _die "updated local base does not match the preflighted object ID"
+  _base_oid=$GT_REF_OID
 }
 
 # Ancestor-only merge check. Squash/rebase merges are detected separately via
 # the shared `gt_branch_content_merged` so `_delete_reason` can report a distinct
 # reason for each.
 _branch_merged_into_base() {
-  git merge-base --is-ancestor "$1" "$_base" 2>/dev/null
+  git merge-base --is-ancestor "$1" "$_base_oid" 2>/dev/null
 }
 
 _delete_reason() {
-  local branch="$1"
+  local branch_oid="$1" upstream_track="$2" ancestor_status=0
 
   if [[ "$_all" == 1 ]]; then
     printf 'all\n'
     return 0
   fi
-  if _branch_merged_into_base "$branch"; then
-    printf 'merged\n'
-    return 0
-  fi
-  if gt_branch_content_merged "$branch" "$_base"; then
+  _branch_merged_into_base "$branch_oid" || ancestor_status=$?
+  case "$ancestor_status" in
+    0)
+      printf 'merged\n'
+      return 0
+      ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+  if gt_branch_content_merged "$branch_oid" "$_base_oid"; then
     printf 'content-merged\n'
     return 0
   fi
-  if [[ "$_gone" == 1 ]] && _branch_upstream_gone "$branch"; then
+  if [[ "$_gone" == 1 && "$upstream_track" == "[gone]" ]]; then
     printf 'upstream gone\n'
     return 0
   fi
@@ -173,78 +308,33 @@ _delete_reason() {
   return 1
 }
 
-_worktree_dirty_state() {
-  local path="$1"
-  local output
-
-  # This status check is the safety gate before deleting a linked worktree
-  # directory. Treat an unreadable/corrupt worktree as dirty so cleanup never
-  # falls through to `git worktree remove` just because a preflight failed.
-  if ! output=$(
-    gt_git_without_local_env -C "$path" status --porcelain 2>/dev/null
-  ); then
-    printf 'dirty\n'
-    return 0
-  fi
-
-  if [[ -n "$output" ]]; then
-    printf 'dirty\n'
-  else
-    printf 'clean\n'
-  fi
-}
-
-_remove_branch_worktree_if_needed() {
-  local branch="$1"
-  local path state
-
-  path=$(gt_worktree_for_branch "$branch")
-  [[ -n "$path" ]] || return 0
-
-  if [[ "$_remove_worktrees" != 1 ]]; then
-    _say "skipping $branch; checked out in worktree $path"
-    return 1
-  fi
-
-  state=$(_worktree_dirty_state "$path")
-  if [[ "$state" != clean ]]; then
-    _say "skipping $branch; worktree has uncommitted changes: $path"
-    return 1
-  fi
-
-  _run git worktree remove "$path"
-}
-
 _cleanup_branches() {
-  local branch reason
-  local deleted=0 skipped=0
+  local records branch_ref branch branch_oid upstream_track reason
+  local candidates=0 skipped=0
 
-  while IFS= read -r branch; do
-    [[ -n "$branch" ]] || continue
+  records=$(git for-each-ref \
+    --format='%(refname)%09%(objectname)%09%(upstream:track)' refs/heads) ||
+    _die "could not enumerate branches"
+
+  while IFS=$'\t' read -r branch_ref branch_oid upstream_track; do
+    [[ -n "$branch_ref" ]] || continue
+    case "$branch_ref" in
+      refs/heads/*) branch=${branch_ref#refs/heads/} ;;
+      *) _die "invalid branch inventory record: $branch_ref" ;;
+    esac
     [[ "$branch" != "$_base" ]] || continue
 
-    reason=$(_delete_reason "$branch") || {
+    reason=$(_delete_reason "$branch_oid" "$upstream_track") || {
       _say "keeping $branch; not merged and upstream still exists"
       skipped=$((skipped + 1))
       continue
     }
 
-    if ! _remove_branch_worktree_if_needed "$branch"; then
-      skipped=$((skipped + 1))
-      continue
-    fi
+    _say "preserving local cleanup candidate $branch at $branch_oid ($reason); delete it manually after verifying no checkout is in flight"
+    candidates=$((candidates + 1))
+  done <<<"$records"
 
-    _say "deleting $branch ($reason)"
-    _run git branch -D "$branch"
-    deleted=$((deleted + 1))
-  done < <(git for-each-ref --format='%(refname:short)' refs/heads)
-
-  _run git fetch --quiet --prune --tags "$_remote"
-  if [[ "$_dry_run" == 1 ]]; then
-    _say "done; would delete $deleted branch(es), skipped $skipped"
-  else
-    _say "done; deleted $deleted branch(es), skipped $skipped"
-  fi
+  _say "done; reported $candidates local cleanup candidate(s), skipped $skipped; no local branches deleted"
 }
 
 _parse_args() {
@@ -253,7 +343,6 @@ _parse_args() {
   _all=0
   _gone=0
   _dry_run=0
-  _remove_worktrees=0
 
   while (($#)); do
     case "$1" in
@@ -290,7 +379,6 @@ _parse_args() {
         shift
         ;;
       --remove-worktrees)
-        _remove_worktrees=1
         shift
         ;;
       -n | --dry-run)
@@ -314,8 +402,21 @@ _parse_args() {
 
 _parse_args "$@"
 _ensure_repo_ready
-_remote_exists || _die "remote does not exist: $_remote"
+_resolve_remote
+
+# A non-writing hash probe detects the native SHA width without requiring the
+# newer rev-parse --show-object-format option.
+_native_empty_oid=$(git hash-object --stdin </dev/null) ||
+  _die "could not determine repository object format"
+case "${#_native_empty_oid}" in
+  40 | 64) _oid_width=${#_native_empty_oid} ;;
+  *) _die "unsupported repository object format" ;;
+esac
+[[ "$_native_empty_oid" != *[!0-9a-f]* ]] ||
+  _die "unsupported repository object format"
 
 _base=$(_default_branch)
+git check-ref-format --branch "$_base" >/dev/null 2>&1 ||
+  _die "invalid base branch name: $_base"
 _update_base
 _cleanup_branches

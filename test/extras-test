@@ -112,7 +112,7 @@ _description_for() {
       printf '%s\n' 'audit local branches against the default branch'
       ;;
     git-cleanup-repo)
-      printf '%s\n' 'clean stale local branches and worktrees'
+      printf '%s\n' 'report stale local branch cleanup candidates'
       ;;
     git-pr-checks)
       printf '%s\n' 'summarize GitHub pull request checks'
@@ -241,6 +241,19 @@ for command in "${_commands[@]}"; do
     fi
   fi
 done
+
+_assert_contains "zsh branch-audit describes candidate reporting" \
+  "--drop-merged[Report branches already merged into the default branch]" \
+  "$ROOT/completions/git-branch-audit.zsh"
+_assert_contains "fish branch-audit describes candidate reporting" \
+  'drop-merged -d "Report branches already merged into the default branch"' \
+  "$ROOT/completions/git-branch-audit.fish"
+_assert_contains "zsh cleanup describes gone candidates" \
+  "--gone[Also report branches whose upstream is gone]" \
+  "$ROOT/completions/git-cleanup-repo.zsh"
+_assert_contains "fish cleanup describes compatibility worktree option" \
+  'remove-worktrees -d "Accepted for compatibility; removes nothing"' \
+  "$ROOT/completions/git-cleanup-repo.fish"
 
 prefix=$(_tmpdir)
 install_out=$(_tmpdir)/install.out

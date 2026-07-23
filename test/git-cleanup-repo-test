@@ -7,22 +7,23 @@ PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
 
 _failures=0
-_temps=()
+_suite_tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/git-cleanup-repo-test.XXXXXX") ||
+  exit 1
 
 _tmpdir() {
-  local dir
-  dir=$(mktemp -d)
-  _temps+=("$dir")
-  printf '%s\n' "$dir"
+  mktemp -d "$_suite_tmp_root/fixture.XXXXXX"
 }
 
 _cleanup() {
-  local dir
-  for dir in "${_temps[@]}"; do
-    rm -rf "$dir"
-  done
+  local status=$?
+  trap - EXIT HUP INT TERM
+  rm -rf -- "$_suite_tmp_root" || status=1
+  exit "$status"
 }
 trap _cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 _pass() {
   printf 'ok - %s\n' "$1"
@@ -75,6 +76,85 @@ _assert_not_contains() {
   fi
 }
 
+_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+_file_fingerprint() {
+  local path="$1" metadata
+
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    printf 'absent\n'
+    return 0
+  fi
+  metadata=$(stat -c '%f %s %y' "$path" 2>/dev/null ||
+    stat -f '%p %z %m' "$path") || return 1
+  printf '%s ' "$metadata"
+  cksum <"$path"
+}
+
+_file_bytes() {
+  local path="$1"
+
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    printf 'absent\n'
+    return 0
+  fi
+  cksum <"$path"
+}
+
+_refs_snapshot() {
+  local git_dir="$1" path
+
+  while IFS= read -r path; do
+    printf '%s ' "${path#"$git_dir"/}"
+    _file_fingerprint "$path"
+  done < <(find "$git_dir/refs" -type f -print | LC_ALL=C sort)
+  printf 'HEAD '
+  _file_fingerprint "$git_dir/HEAD"
+  printf 'packed-refs '
+  _file_fingerprint "$git_dir/packed-refs"
+  if [[ -d "$git_dir/worktrees" ]]; then
+    while IFS= read -r path; do
+      printf '%s ' "${path#"$git_dir"/}"
+      _file_fingerprint "$path"
+    done < <(find "$git_dir/worktrees" -type f -print | LC_ALL=C sort)
+  fi
+}
+
+_worktree_snapshot() {
+  local repo="$1" path
+
+  while IFS= read -r path; do
+    printf '%s ' "${path#"$repo"/}"
+    _file_fingerprint "$path"
+  done < <(find "$repo" -path "$repo/.git" -prune -o -type f -print |
+    LC_ALL=C sort)
+}
+
+_refs_bytes_snapshot() {
+  local git_dir="$1" path
+
+  while IFS= read -r path; do
+    printf '%s ' "${path#"$git_dir"/}"
+    _file_bytes "$path"
+  done < <(find "$git_dir/refs" -type f -print | LC_ALL=C sort)
+  printf 'HEAD '
+  _file_bytes "$git_dir/HEAD"
+  printf 'packed-refs '
+  _file_bytes "$git_dir/packed-refs"
+}
+
+_worktree_bytes_snapshot() {
+  local repo="$1" path
+
+  while IFS= read -r path; do
+    printf '%s ' "${path#"$repo"/}"
+    _file_bytes "$path"
+  done < <(find "$repo" -path "$repo/.git" -prune -o -type f -print |
+    LC_ALL=C sort)
+}
+
 _git_init() {
   local repo="$1"
   git init -q --initial-branch=main "$repo"
@@ -108,12 +188,76 @@ _clone_remote() {
   printf '%s\n' "$repo"
 }
 
+_write_partial_ref_enumeration_failure_git() {
+  cat >"$1/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == for-each-ref && "$*" == *"%(objectname)"* &&
+  "$*" == *"refs/heads"* ]]; then
+  "$GIT_PARTIAL_REF_REAL" "$@" | sed -n '1p'
+  exit 88
+fi
+exec "$GIT_PARTIAL_REF_REAL" "$@"
+EOF
+  chmod +x "$1/git"
+}
+
+_write_diff_tree_failure_git() {
+  cat >"$1/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "-c" && "${3:-}" == "diff-tree" ]]; then
+  for arg; do
+    if [[ "$arg" == "$GIT_DIFF_TREE_FAIL_TARGET" ]]; then
+      echo "injected diff-tree failure" >&2
+      exit 88
+    fi
+  done
+fi
+exec "$GIT_DIFF_TREE_REAL" "$@"
+EOF
+  chmod +x "$1/git"
+}
+
 _branches() {
   local repo="$1"
-  git -C "$repo" branch --format='%(refname:short)' | sort
+  git -C "$repo" branch --format='%(refname:lstrip=2)' | sort
+}
+
+_object_ids() {
+  git -C "$1" cat-file --batch-all-objects --batch-check='%(objectname)' |
+    LC_ALL=C sort
+}
+
+_tool_artifacts() {
+  local artifact
+  for artifact in \
+    "$1"/git-tools-patch.* \
+    "$1"/git-cleanup-repo-dry.*; do
+    [[ -e "$artifact" ]] || continue
+    printf '%s\n' "$artifact"
+  done
 }
 
 echo "=== git cleanup-repo ==="
+
+# A branch inventory that emits a valid prefix and then fails must abort before
+# any candidate is reported or local state is changed.
+partial_ref_repo=$(_clone_remote)
+git -C "$partial_ref_repo" branch aaa-partial
+partial_ref_bin=$(_tmpdir)
+partial_ref_real=$(PATH=/usr/local/bin:/usr/bin:/bin command -v git)
+_write_partial_ref_enumeration_failure_git "$partial_ref_bin"
+partial_ref_rc=0
+partial_ref_output=$(cd "$partial_ref_repo" &&
+  PATH="$partial_ref_bin:/usr/bin:/bin" \
+    GIT_PARTIAL_REF_REAL="$partial_ref_real" \
+    "$ROOT/bin/git-cleanup-repo" --base main 2>&1) || partial_ref_rc=$?
+_assert_eq "partial branch inventory fails cleanup" "2" "$partial_ref_rc"
+_assert_contains "partial branch inventory is diagnosed" \
+  "could not enumerate branches" "$partial_ref_output"
+_assert_eq "partial inventory preserves branch" "aaa-partial" \
+  "$(git -C "$partial_ref_repo" branch --format='%(refname:short)' --list aaa-partial)"
 
 repo=$(_clone_remote)
 git -C "$repo" switch --quiet -c merged
@@ -133,14 +277,16 @@ git -C "$repo" push -u origin keep >/dev/null 2>&1
 git -C "$repo" switch --quiet main
 
 result=$(git -C "$repo" cleanup-repo 2>&1)
-_assert_contains "reports deleted branches" "deleted 1 branch(es), skipped 2" "$result"
-expected="$(printf 'gone\nkeep\nmain')"
-_assert_eq "deletes only merged branches by default" "$expected" "$(_branches "$repo")"
+_assert_contains "reports exact merged cleanup candidate" \
+  "preserving local cleanup candidate merged at " "$result"
+_assert_contains "reports candidate summary without deletion" \
+  "reported 1 local cleanup candidate(s), skipped 2; no local branches deleted" "$result"
+expected="$(printf 'gone\nkeep\nmain\nmerged')"
+_assert_eq "default cleanup preserves every local branch" "$expected" "$(_branches "$repo")"
 result=$(git -C "$repo" cleanup-repo --gone 2>&1)
-_assert_contains "gone deletes branches with removed upstreams" \
-  "deleting gone (upstream gone)" "$result"
-expected="$(printf 'keep\nmain')"
-_assert_eq "gone leaves unmerged branches with live upstreams" "$expected" "$(_branches "$repo")"
+_assert_contains "gone reports removed-upstream candidates" \
+  "preserving local cleanup candidate gone at " "$result"
+_assert_eq "gone mode preserves every local branch" "$expected" "$(_branches "$repo")"
 
 squash_repo=$(_clone_remote)
 git -C "$squash_repo" switch --quiet -c squashed
@@ -154,9 +300,587 @@ printf '%s\n' two >"$squash_repo/squashed.txt"
 git -C "$squash_repo" add squashed.txt
 git -C "$squash_repo" commit --quiet -m "squashed (#1)" >/dev/null
 result=$(git -C "$squash_repo" cleanup-repo 2>&1)
-_assert_contains "default deletes squash-merged branches" \
-  "deleting squashed (content-merged)" "$result"
-_assert_eq "squash-merged branch removed by default" "main" "$(_branches "$squash_repo")"
+_assert_contains "default reports squash-merged branches" \
+  "preserving local cleanup candidate squashed at " "$result"
+_assert_eq "squash-merged branch remains" \
+  "$(printf 'main\nsquashed')" "$(_branches "$squash_repo")"
+
+# Dry-run classification is read-only and cannot depend on author identity or
+# writable object storage.
+readonly_repo=$(_clone_remote)
+git -C "$readonly_repo" switch --quiet -c readonly-squash
+_commit_file "$readonly_repo" readonly.txt one "readonly step 1"
+_commit_file "$readonly_repo" readonly.txt two "readonly step 2"
+git -C "$readonly_repo" switch --quiet main
+printf '%s\n' two >"$readonly_repo/readonly.txt"
+git -C "$readonly_repo" add readonly.txt
+git -C "$readonly_repo" commit --quiet -m "squash readonly branch"
+
+readonly_object_dir=$(_tmpdir)
+chmod 500 "$readonly_object_dir"
+source_object_dir=$(git -C "$readonly_repo" rev-parse --absolute-git-dir)/objects
+readonly_result=$(
+  GIT_OBJECT_DIRECTORY="$readonly_object_dir" \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES="$source_object_dir" \
+    git -C "$readonly_repo" cleanup-repo --base main --dry-run 2>&1
+)
+chmod 700 "$readonly_object_dir"
+_assert_contains "cleanup dry-run works with read-only object storage" \
+  "cleanup candidate readonly-squash at " "$readonly_result"
+
+objects_before=$(_object_ids "$readonly_repo")
+result=$(git -C "$readonly_repo" cleanup-repo --base main --dry-run 2>&1)
+objects_after=$(_object_ids "$readonly_repo")
+readonly_remote_main_oid=$(git -C "$readonly_repo" ls-remote origin \
+  refs/heads/main | awk '{ print $1 }')
+_assert_contains "cleanup dry-run reports squash candidate" \
+  "cleanup candidate readonly-squash at " "$result"
+_assert_contains "ahead dry run pins exact remote OID" \
+  "git merge --quiet --ff-only $readonly_remote_main_oid" "$result"
+_assert_eq "cleanup dry-run creates no Git objects" "$objects_before" "$objects_after"
+readonly_main_oid=$(git -C "$readonly_repo" rev-parse refs/heads/main)
+git -C "$readonly_repo" cleanup-repo --base main >/dev/null 2>&1
+_assert_eq "ahead real run preserves the preflighted local base" \
+  "$readonly_main_oid" "$(git -C "$readonly_repo" rev-parse refs/heads/main)"
+
+identity_name=$(git -C "$readonly_repo" config user.name)
+identity_email=$(git -C "$readonly_repo" config user.email)
+git -C "$readonly_repo" config --unset user.name
+git -C "$readonly_repo" config --unset user.email
+identity_result=$(git -C "$readonly_repo" cleanup-repo --base main --dry-run 2>&1)
+_assert_contains "cleanup classifies squash merge without commit identity" \
+  "cleanup candidate readonly-squash at " "$identity_result"
+git -C "$readonly_repo" config user.name "$identity_name"
+git -C "$readonly_repo" config user.email "$identity_email"
+
+# Dry-run must not refresh the index stat cache or mutate any repository or
+# worktree metadata. A content-clean file with deliberately stale timestamps
+# makes an ordinary locking `git status` rewrite the index.
+metadata_repo=$(_clone_remote)
+metadata_git_dir=$(git -C "$metadata_repo" rev-parse --absolute-git-dir)
+touch -t 200001010101 "$metadata_repo/README.md"
+printf 'preserved FETCH_HEAD sentinel\n' >"$metadata_git_dir/FETCH_HEAD"
+metadata_index_before=$(_file_fingerprint "$metadata_git_dir/index")
+metadata_refs_before=$(_refs_snapshot "$metadata_git_dir")
+metadata_config_before=$(_file_fingerprint "$metadata_git_dir/config")
+metadata_fetch_before=$(_file_fingerprint "$metadata_git_dir/FETCH_HEAD")
+metadata_objects_before=$(_object_ids "$metadata_repo")
+metadata_worktree_before=$(_worktree_snapshot "$metadata_repo")
+git -C "$metadata_repo" cleanup-repo --base main --dry-run >/dev/null 2>&1
+_assert_eq "dry run preserves index bytes and metadata" \
+  "$metadata_index_before" "$(_file_fingerprint "$metadata_git_dir/index")"
+_assert_eq "dry run preserves every ref" \
+  "$metadata_refs_before" "$(_refs_snapshot "$metadata_git_dir")"
+_assert_eq "dry run preserves config" \
+  "$metadata_config_before" "$(_file_fingerprint "$metadata_git_dir/config")"
+_assert_eq "dry run preserves FETCH_HEAD" \
+  "$metadata_fetch_before" "$(_file_fingerprint "$metadata_git_dir/FETCH_HEAD")"
+_assert_eq "dry run preserves permanent objects" \
+  "$metadata_objects_before" "$(_object_ids "$metadata_repo")"
+_assert_eq "dry run preserves worktree bytes and metadata" \
+  "$metadata_worktree_before" "$(_worktree_snapshot "$metadata_repo")"
+
+# Branch/tag collisions must not redirect the base or change emitted branch
+# names. The base itself is never a cleanup candidate.
+collision_repo=$(_clone_remote)
+git -C "$collision_repo" tag main
+git -C "$collision_repo" switch --quiet -c feature
+_commit_file "$collision_repo" collision.txt feature feature
+git -C "$collision_repo" tag feature
+git -C "$collision_repo" symbolic-ref HEAD refs/heads/main
+git -C "$collision_repo" reset --quiet --hard refs/heads/main
+git -C "$collision_repo" merge --quiet --no-ff refs/heads/feature -m \
+  "merge collision feature" >/dev/null
+collision_result=$(git -C "$collision_repo" cleanup-repo --base main 2>&1)
+_assert_contains "collision cleanup reports genuinely merged feature" \
+  "cleanup candidate feature at " "$collision_result"
+_assert_not_contains "collision cleanup never reports the base branch" \
+  "cleanup candidate main at " "$collision_result"
+_assert_not_contains "collision cleanup never leaks disambiguated ref spelling" \
+  "cleanup candidate heads/" "$collision_result"
+_assert_eq "collision cleanup preserves exact local branches" \
+  "$(printf 'feature\nmain')" "$(_branches "$collision_repo")"
+
+invalid_base_rc=0
+invalid_base_output=$(git -C "$collision_repo" cleanup-repo \
+  --base 'main^{commit}' 2>&1) || invalid_base_rc=$?
+_assert_eq "cleanup rejects revision syntax as a branch name" "2" "$invalid_base_rc"
+_assert_contains "cleanup diagnoses an invalid base branch name" \
+  "invalid base branch name" "$invalid_base_output"
+
+# Remote lookup output must be one native object ID. Reject malformed output
+# before attempting any fetch or changing the current branch.
+remote_oid_repo=$(_clone_remote)
+git -C "$remote_oid_repo" switch --quiet -c oid-runner
+remote_oid_bin=$(_tmpdir)
+remote_oid_log=$(_tmpdir)/fetch-invocations
+cat >"$remote_oid_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == ls-remote ]]; then
+  printf 'a\trefs/heads/main\n'
+  exit 0
+fi
+if [[ "${1:-}" == fetch ]]; then
+  printf '%s\n' "$*" >>"$GIT_REMOTE_OID_LOG"
+fi
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$remote_oid_bin/git"
+remote_oid_rc=0
+remote_oid_output=$(cd "$remote_oid_repo" &&
+  PATH="$remote_oid_bin:/usr/bin:/bin" \
+    GIT_REMOTE_OID_LOG="$remote_oid_log" \
+    "$ROOT/bin/git-cleanup-repo" --base main 2>&1) || remote_oid_rc=$?
+_assert_eq "malformed remote OID fails cleanup" "2" "$remote_oid_rc"
+_assert_contains "malformed remote OID is diagnosed" \
+  "remote base lookup returned an invalid object ID" "$remote_oid_output"
+_assert_eq "malformed remote OID fails before fetch" "" \
+  "$(if [[ -e "$remote_oid_log" ]]; then printf invoked; fi)"
+_assert_eq "malformed remote OID leaves current branch unchanged" oid-runner \
+  "$(git -C "$remote_oid_repo" branch --show-current)"
+
+# An exact-ref fetch failure is also fatal before checkout. Record the complete
+# invocation to prove the source is fully qualified and tags/FETCH_HEAD are off.
+fetch_failure_repo=$(_clone_remote)
+fetch_failure_main=$(git -C "$fetch_failure_repo" rev-parse refs/heads/main)
+fetch_failure_url=$(git -C "$fetch_failure_repo" remote get-url origin)
+git -C "$fetch_failure_repo" switch --quiet -c fetch-runner
+fetch_failure_bin=$(_tmpdir)
+fetch_failure_log=$(_tmpdir)/fetch-invocations
+cat >"$fetch_failure_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == fetch ]]; then
+  printf '%s\n' "$*" >>"$GIT_EXACT_FETCH_LOG"
+  exit 88
+fi
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$fetch_failure_bin/git"
+fetch_failure_rc=0
+fetch_failure_output=$(cd "$fetch_failure_repo" &&
+  PATH="$fetch_failure_bin:/usr/bin:/bin" \
+    GIT_EXACT_FETCH_LOG="$fetch_failure_log" \
+    "$ROOT/bin/git-cleanup-repo" --base main 2>&1) || fetch_failure_rc=$?
+_assert_eq "exact remote fetch failure aborts cleanup" "2" "$fetch_failure_rc"
+_assert_contains "exact remote fetch failure is diagnosed" \
+  "could not fetch exact remote base" "$fetch_failure_output"
+_assert_not_contains "fetch failure diagnostics omit the captured endpoint" \
+  "$fetch_failure_url" "$fetch_failure_output"
+_assert_contains "fetch uses exact head without tags or FETCH_HEAD" \
+  "fetch --quiet --no-tags --no-write-fetch-head --no-auto-gc --no-recurse-submodules -- $fetch_failure_url refs/heads/main" \
+  "$(<"$fetch_failure_log")"
+_assert_eq "fetch failure leaves current branch unchanged" fetch-runner \
+  "$(git -C "$fetch_failure_repo" branch --show-current)"
+_assert_eq "fetch failure leaves local base unchanged" "$fetch_failure_main" \
+  "$(git -C "$fetch_failure_repo" rev-parse refs/heads/main)"
+
+# A dry run with no local base must select the exact remote branch even when a
+# same-named remote tag and a configured fetch mapping point elsewhere.
+remote_collision_repo=$(_clone_remote)
+git -C "$remote_collision_repo" switch --quiet -c remote-merged
+_commit_file "$remote_collision_repo" remote.txt merged "add remote merge"
+git -C "$remote_collision_repo" switch --quiet main
+git -C "$remote_collision_repo" merge --quiet --no-ff remote-merged \
+  -m "merge remote feature"
+git -C "$remote_collision_repo" push origin main >/dev/null 2>&1
+remote_main_oid=$(git -C "$remote_collision_repo" ls-remote origin \
+  refs/heads/main | awk '{ print $1 }')
+git -C "$remote_collision_repo" switch --quiet -c tag-target
+_commit_file "$remote_collision_repo" tag-target.txt tag "tag target"
+git -C "$remote_collision_repo" tag main
+git -C "$remote_collision_repo" push origin \
+  tag-target:refs/heads/release refs/tags/main >/dev/null 2>&1
+tag_target_oid=$(git -C "$remote_collision_repo" rev-parse refs/tags/main)
+git -C "$remote_collision_repo" config --unset-all remote.origin.fetch
+git -C "$remote_collision_repo" config --add remote.origin.fetch \
+  '+refs/heads/release:refs/remotes/origin/main'
+git -C "$remote_collision_repo" fetch --quiet --no-tags origin
+git -C "$remote_collision_repo" switch --quiet -c runner
+git -C "$remote_collision_repo" branch -D main tag-target >/dev/null
+git -C "$remote_collision_repo" tag -d main >/dev/null
+remote_dry_result=$(git -C "$remote_collision_repo" cleanup-repo \
+  --base main --dry-run 2>&1)
+_assert_contains "remote-only dry run uses exact remote base" \
+  "cleanup candidate remote-merged at " "$remote_dry_result"
+_assert_contains "remote-only dry run pins the exact remote branch OID" \
+  "git merge --quiet --ff-only $remote_main_oid" "$remote_dry_result"
+_assert_eq "remote-only dry run does not create a local base" "" \
+  "$(git -C "$remote_collision_repo" branch --list main)"
+git -C "$remote_collision_repo" cleanup-repo --base main >/dev/null 2>&1
+_assert_eq "remote base creation ignores refspec and tag collisions" "$remote_main_oid" \
+  "$(git -C "$remote_collision_repo" rev-parse refs/heads/main)"
+_assert_eq "created base records the selected remote" origin \
+  "$(git -C "$remote_collision_repo" config branch.main.remote)"
+_assert_eq "created base tracks the exact remote head" refs/heads/main \
+  "$(git -C "$remote_collision_repo" config branch.main.merge)"
+_assert_eq "selected-base fetch does not import the colliding tag" "" \
+  "$(git -C "$remote_collision_repo" tag --list main)"
+if [[ "$remote_main_oid" == "$tag_target_oid" ]]; then
+  _fail "remote collision fixture uses distinct objects"
+else
+  _pass "remote collision fixture uses distinct objects"
+fi
+
+# Capture must count configured records without command substitution stripping
+# a trailing empty URL and turning two records into one usable-looking value.
+multiple_url_repo=$(_clone_remote)
+git -C "$multiple_url_repo" config --add remote.origin.url ""
+multiple_url_rc=0
+multiple_url_output=$(git -C "$multiple_url_repo" cleanup-repo \
+  --base main --dry-run 2>&1) || multiple_url_rc=$?
+_assert_eq "multiple configured remote URLs are rejected" "2" "$multiple_url_rc"
+_assert_contains "multiple configured remote URLs are diagnosed" \
+  "could not resolve one fetch endpoint for remote: origin" "$multiple_url_output"
+
+# An option-shaped configured endpoint is still an endpoint, not a Git option.
+option_url_repo=$(_clone_remote)
+option_url_bin=$(_tmpdir)
+option_url_program="$option_url_bin/upload-pack"
+option_url_log=$(_tmpdir)/upload-pack-invocations
+cat >"$option_url_program" <<'EOF'
+#!/usr/bin/env bash
+printf 'invoked\n' >>"$GIT_OPTION_URL_LOG"
+exit 88
+EOF
+chmod +x "$option_url_program"
+git -C "$option_url_repo" config remote.origin.url \
+  "--upload-pack=$option_url_program"
+option_url_rc=0
+option_url_output=$(cd "$option_url_repo" &&
+  GIT_OPTION_URL_LOG="$option_url_log" \
+    "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1) || option_url_rc=$?
+_assert_eq "option-shaped remote URL is rejected as an endpoint" "2" "$option_url_rc"
+_assert_contains "option-shaped remote URL failure is diagnosed" \
+  "could not inspect remote base branch: origin/main" "$option_url_output"
+_assert_eq "option-shaped remote URL never invokes an upload-pack program" "" \
+  "$(if [[ -e "$option_url_log" ]]; then printf invoked; fi)"
+
+# The raw configured endpoint must be reused so each Git operation applies its
+# URL rewrite once and never reaches a chained second endpoint.
+rewrite_first_remote=$(_tmpdir)
+rewrite_first_publisher=$(_tmpdir)
+git init --quiet --bare --initial-branch=main "$rewrite_first_remote"
+_git_init "$rewrite_first_publisher"
+_commit_file "$rewrite_first_publisher" endpoint.txt first "first endpoint"
+git -C "$rewrite_first_publisher" remote add origin "$rewrite_first_remote"
+git -C "$rewrite_first_publisher" push --quiet -u origin main
+rewrite_first_oid=$(git -C "$rewrite_first_publisher" rev-parse refs/heads/main)
+
+rewrite_second_remote=$(_tmpdir)
+rewrite_second_publisher=$(_tmpdir)
+git init --quiet --bare --initial-branch=main "$rewrite_second_remote"
+_git_init "$rewrite_second_publisher"
+_commit_file "$rewrite_second_publisher" endpoint.txt second "second endpoint"
+git -C "$rewrite_second_publisher" remote add origin "$rewrite_second_remote"
+git -C "$rewrite_second_publisher" push --quiet -u origin main
+rewrite_second_oid=$(git -C "$rewrite_second_publisher" rev-parse refs/heads/main)
+
+rewrite_repo=$(_tmpdir)
+_git_init "$rewrite_repo"
+_commit_file "$rewrite_repo" local.txt local "local runner"
+git -C "$rewrite_repo" branch --move runner
+git -C "$rewrite_repo" remote add origin https://rewrite.test/example/repo.git
+git -C "$rewrite_repo" config \
+  "url.file://$rewrite_first_remote.insteadOf" \
+  https://rewrite.test/example/repo.git
+git -C "$rewrite_repo" config \
+  "url.file://$rewrite_second_remote.insteadOf" \
+  "file://$rewrite_first_remote"
+rewrite_rc=0
+rewrite_output=$(git -C "$rewrite_repo" cleanup-repo \
+  --base main --dry-run 2>&1) || rewrite_rc=$?
+_assert_eq "chained rewrite dry run succeeds through first endpoint" "0" "$rewrite_rc"
+_assert_contains "chained rewrite lookup and fetch pin the first endpoint" \
+  "git merge --quiet --ff-only $rewrite_first_oid" "$rewrite_output"
+_assert_not_contains "chained rewrite never reaches the second endpoint" \
+  "$rewrite_second_oid" "$rewrite_output"
+
+# Exact endpoint selection also works when the configured fetch mapping omits
+# the requested branch and no corresponding remote-tracking ref exists.
+excluded_refspec_repo=$(_clone_remote)
+git -C "$excluded_refspec_repo" switch --quiet -c excluded-merged
+_commit_file "$excluded_refspec_repo" excluded.txt merged "add excluded merge"
+git -C "$excluded_refspec_repo" switch --quiet main
+git -C "$excluded_refspec_repo" merge --quiet --no-ff excluded-merged \
+  -m "merge excluded feature"
+git -C "$excluded_refspec_repo" push origin main >/dev/null 2>&1
+excluded_main_oid=$(git -C "$excluded_refspec_repo" ls-remote origin \
+  refs/heads/main | awk '{ print $1 }')
+git -C "$excluded_refspec_repo" config --unset-all remote.origin.fetch
+git -C "$excluded_refspec_repo" config --add remote.origin.fetch \
+  '+refs/heads/release:refs/remotes/origin/release'
+git -C "$excluded_refspec_repo" update-ref -d refs/remotes/origin/main
+git -C "$excluded_refspec_repo" switch --quiet -c excluded-runner
+git -C "$excluded_refspec_repo" branch -D main >/dev/null
+excluded_dry_result=$(git -C "$excluded_refspec_repo" cleanup-repo \
+  --base main --dry-run 2>&1)
+_assert_contains "excluded refspec dry run uses real remote main" \
+  "cleanup candidate excluded-merged at " "$excluded_dry_result"
+git -C "$excluded_refspec_repo" cleanup-repo --base main >/dev/null 2>&1
+_assert_eq "excluded refspec real run creates exact remote main" \
+  "$excluded_main_oid" \
+  "$(git -C "$excluded_refspec_repo" rev-parse refs/heads/main)"
+
+# Configured fetch destinations are untrusted. In particular, pruning a remote
+# whose wildcard destination is refs/heads would delete local-only branches.
+# Exact base fetching must not execute that refspec or prune any destination.
+malicious_refspec_repo=$(_clone_remote)
+git -C "$malicious_refspec_repo" switch --quiet -c local-only
+_commit_file "$malicious_refspec_repo" local-only.txt local "add local-only work"
+git -C "$malicious_refspec_repo" switch --quiet main
+git -C "$malicious_refspec_repo" branch linked-local
+malicious_link_parent=$(_tmpdir)
+malicious_linked="$malicious_link_parent/worktree"
+git -C "$malicious_refspec_repo" worktree add --quiet \
+  "$malicious_linked" linked-local
+printf '%s\n' linked >"$malicious_linked/linked.txt"
+git -C "$malicious_linked" add linked.txt
+git -C "$malicious_linked" commit --quiet -m "add linked local work"
+git -C "$malicious_refspec_repo" config --unset-all remote.origin.fetch
+git -C "$malicious_refspec_repo" config --add remote.origin.fetch \
+  '+refs/heads/*:refs/heads/*'
+malicious_git_dir=$(git -C "$malicious_refspec_repo" rev-parse --absolute-git-dir)
+malicious_refs_before=$(_refs_bytes_snapshot "$malicious_git_dir")
+malicious_config_before=$(_file_fingerprint "$malicious_git_dir/config")
+malicious_main_before=$(_worktree_bytes_snapshot "$malicious_refspec_repo")
+malicious_linked_before=$(_worktree_bytes_snapshot "$malicious_linked")
+malicious_rc=0
+git -C "$malicious_refspec_repo" cleanup-repo --base main \
+  >/dev/null 2>&1 || malicious_rc=$?
+_assert_eq "malicious refspec cleanup succeeds conservatively" "0" "$malicious_rc"
+_assert_eq "malicious refspec preserves every local ref" \
+  "$malicious_refs_before" "$(_refs_bytes_snapshot "$malicious_git_dir")"
+_assert_eq "malicious refspec preserves config" \
+  "$malicious_config_before" "$(_file_fingerprint "$malicious_git_dir/config")"
+_assert_eq "malicious refspec preserves main worktree" \
+  "$malicious_main_before" "$(_worktree_bytes_snapshot "$malicious_refspec_repo")"
+_assert_eq "malicious refspec preserves linked worktree" \
+  "$malicious_linked_before" "$(_worktree_bytes_snapshot "$malicious_linked")"
+
+# A behind local base is preflighted against the pinned remote OID. Dry-run and
+# real execution must describe and merge that identical object.
+behind_base_repo=$(_clone_remote)
+behind_old_oid=$(git -C "$behind_base_repo" rev-parse refs/heads/main)
+git -C "$behind_base_repo" switch --quiet -c behind-merged
+_commit_file "$behind_base_repo" behind.txt merged "add behind merge"
+git -C "$behind_base_repo" switch --quiet main
+git -C "$behind_base_repo" merge --quiet --no-ff behind-merged \
+  -m "merge behind feature"
+git -C "$behind_base_repo" push origin main >/dev/null 2>&1
+behind_remote_oid=$(git -C "$behind_base_repo" ls-remote origin \
+  refs/heads/main | awk '{ print $1 }')
+git -C "$behind_base_repo" reset --quiet --hard "$behind_old_oid"
+git -C "$behind_base_repo" switch --quiet -c behind-runner "$behind_old_oid"
+behind_dry_result=$(git -C "$behind_base_repo" cleanup-repo \
+  --base main --dry-run 2>&1)
+_assert_contains "behind dry run classifies against pinned remote base" \
+  "cleanup candidate behind-merged at " "$behind_dry_result"
+_assert_contains "behind dry run prints pinned ff-only merge" \
+  "git merge --quiet --ff-only $behind_remote_oid" "$behind_dry_result"
+git -C "$behind_base_repo" cleanup-repo --base main >/dev/null 2>&1
+_assert_eq "behind real run merges the dry-run OID" "$behind_remote_oid" \
+  "$(git -C "$behind_base_repo" rev-parse refs/heads/main)"
+
+# When the pinned remote commit is not in local object storage, dry-run fetches
+# it into an isolated object directory and removes that directory on exit.
+isolated_dry_repo=$(_clone_remote)
+isolated_remote=$(git -C "$isolated_dry_repo" remote get-url origin)
+isolated_publisher=$(_tmpdir)
+git clone --quiet "$isolated_remote" "$isolated_publisher"
+git -C "$isolated_publisher" config user.email test@test.com
+git -C "$isolated_publisher" config user.name Test
+git -C "$isolated_publisher" config core.hooksPath /dev/null
+_commit_file "$isolated_publisher" remote-only.txt remote \
+  "advance unseen remote base"
+git -C "$isolated_publisher" push --quiet origin main
+isolated_remote_oid=$(git -C "$isolated_publisher" rev-parse refs/heads/main)
+git -C "$isolated_dry_repo" switch --quiet -c isolated-runner
+isolated_tmp=$(_tmpdir)
+isolated_objects_before=$(_object_ids "$isolated_dry_repo")
+_assert_eq "isolated dry-run TMPDIR starts without artifacts" "" \
+  "$(_tool_artifacts "$isolated_tmp")"
+isolated_dry_output=$(TMPDIR="$isolated_tmp" \
+  git -C "$isolated_dry_repo" cleanup-repo --base main --dry-run 2>&1)
+isolated_objects_after=$(_object_ids "$isolated_dry_repo")
+_assert_contains "isolated dry run pins unseen remote OID" \
+  "git merge --quiet --ff-only $isolated_remote_oid" "$isolated_dry_output"
+_assert_eq "isolated dry run does not import objects" \
+  "$isolated_objects_before" "$isolated_objects_after"
+_assert_eq "isolated dry run removes object-store artifacts" "" \
+  "$(_tool_artifacts "$isolated_tmp")"
+
+# An unseen base in a shallow clone exercises object transfer while proving the
+# isolated dry run leaves every persistent repository surface byte-for-byte
+# unchanged, including the shallow boundary.
+shallow_seed=$(_clone_remote)
+shallow_remote=$(git -C "$shallow_seed" remote get-url origin)
+shallow_client=$(_tmpdir)
+rm -rf "$shallow_client"
+git clone --quiet --depth=1 "file://$shallow_remote" "$shallow_client"
+shallow_publisher=$(_tmpdir)
+git clone --quiet "$shallow_remote" "$shallow_publisher"
+git -C "$shallow_publisher" config user.email test@test.com
+git -C "$shallow_publisher" config user.name Test
+git -C "$shallow_publisher" config core.hooksPath /dev/null
+_commit_file "$shallow_publisher" shallow.txt remote "advance shallow base"
+git -C "$shallow_publisher" push --quiet origin main
+shallow_remote_oid=$(git -C "$shallow_publisher" rev-parse refs/heads/main)
+shallow_git_dir=$(git -C "$shallow_client" rev-parse --absolute-git-dir)
+printf 'preserved shallow FETCH_HEAD sentinel\n' >"$shallow_git_dir/FETCH_HEAD"
+shallow_index_before=$(_file_fingerprint "$shallow_git_dir/index")
+shallow_refs_before=$(_refs_snapshot "$shallow_git_dir")
+shallow_config_before=$(_file_fingerprint "$shallow_git_dir/config")
+shallow_fetch_before=$(_file_fingerprint "$shallow_git_dir/FETCH_HEAD")
+shallow_boundary_before=$(_file_fingerprint "$shallow_git_dir/shallow")
+shallow_objects_before=$(_object_ids "$shallow_client")
+shallow_worktree_before=$(_worktree_snapshot "$shallow_client")
+shallow_rc=0
+shallow_output=$(git -C "$shallow_client" cleanup-repo \
+  --base main --dry-run 2>&1) || shallow_rc=$?
+_assert_eq "shallow unseen-base dry run succeeds" "0" "$shallow_rc"
+_assert_contains "shallow dry run pins unseen remote OID" \
+  "git merge --quiet --ff-only $shallow_remote_oid" "$shallow_output"
+_assert_eq "shallow dry run preserves index" \
+  "$shallow_index_before" "$(_file_fingerprint "$shallow_git_dir/index")"
+_assert_eq "shallow dry run preserves refs and worktree metadata" \
+  "$shallow_refs_before" "$(_refs_snapshot "$shallow_git_dir")"
+_assert_eq "shallow dry run preserves config" \
+  "$shallow_config_before" "$(_file_fingerprint "$shallow_git_dir/config")"
+_assert_eq "shallow dry run preserves FETCH_HEAD" \
+  "$shallow_fetch_before" "$(_file_fingerprint "$shallow_git_dir/FETCH_HEAD")"
+_assert_eq "shallow dry run preserves shallow boundary" \
+  "$shallow_boundary_before" "$(_file_fingerprint "$shallow_git_dir/shallow")"
+_assert_eq "shallow dry run preserves permanent objects" \
+  "$shallow_objects_before" "$(_object_ids "$shallow_client")"
+_assert_eq "shallow dry run preserves worktree" \
+  "$shallow_worktree_before" "$(_worktree_snapshot "$shallow_client")"
+
+# Git 2.29 predates rev-parse --path-format. The isolated-object path must remain
+# usable at the documented baseline.
+legacy_git_bin=$(_tmpdir)
+legacy_git_real=$(PATH=/usr/local/bin:/usr/bin:/bin command -v git)
+cat >"$legacy_git_bin/git" <<'EOF'
+#!/usr/bin/env bash
+for argument in "$@"; do
+  case "$argument" in
+    --path-format | --path-format=*) exit 88 ;;
+  esac
+done
+exec "$GIT_LEGACY_REAL" "$@"
+EOF
+chmod +x "$legacy_git_bin/git"
+legacy_git_rc=0
+legacy_git_output=$(cd "$isolated_dry_repo" &&
+  PATH="$legacy_git_bin:/usr/bin:/bin" GIT_LEGACY_REAL="$legacy_git_real" \
+    "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1) ||
+  legacy_git_rc=$?
+_assert_eq "Git 2.29-compatible dry run avoids rev-parse path-format" \
+  "0" "$legacy_git_rc"
+_assert_contains "Git 2.29-compatible dry run still pins unseen remote OID" \
+  "git merge --quiet --ff-only $isolated_remote_oid" "$legacy_git_output"
+
+# Fetch can run configured automatic maintenance even when its object writes are
+# isolated. A dry run must suppress that secondary mutation path so maintenance
+# cannot prune persistent repository metadata.
+maintenance_worktree=$(_tmpdir)
+rm -rf "$maintenance_worktree"
+git -C "$isolated_dry_repo" worktree add --quiet \
+  -b maintenance-stale "$maintenance_worktree" refs/heads/main
+maintenance_metadata=$(git -C "$maintenance_worktree" rev-parse --absolute-git-dir)
+rm -rf "$maintenance_worktree"
+touch -t 200001010101 "$maintenance_metadata/gitdir" "$maintenance_metadata"
+_commit_file "$isolated_publisher" maintenance.txt remote \
+  "advance base before maintenance dry run"
+git -C "$isolated_publisher" push --quiet origin main
+git -C "$isolated_dry_repo" config maintenance.worktree-prune.enabled true
+git -C "$isolated_dry_repo" config maintenance.worktree-prune.auto 1
+git -C "$isolated_dry_repo" config maintenance.autoDetach false
+git -C "$isolated_dry_repo" config gc.worktreePruneExpire now
+maintenance_dry_rc=0
+TMPDIR="$isolated_tmp" git -C "$isolated_dry_repo" cleanup-repo \
+  --base main --dry-run >/dev/null 2>&1 || maintenance_dry_rc=$?
+_assert_eq "configured maintenance dry run succeeds" "0" "$maintenance_dry_rc"
+_assert_eq "dry run preserves stale linked-worktree metadata" "present" \
+  "$(if [[ -d "$maintenance_metadata" ]]; then printf present; else printf absent; fi)"
+
+# Configured submodule recursion is another persistent fetch side effect. When
+# both the superproject and one of its submodules advance remotely, dry-run must
+# not import the unseen submodule object into the submodule's real object store.
+submodule_remote=$(_tmpdir)
+submodule_publisher=$(_tmpdir)
+git init --quiet --bare --initial-branch=main "$submodule_remote"
+_git_init "$submodule_publisher"
+_commit_file "$submodule_publisher" data.txt v1 "submodule v1"
+git -C "$submodule_publisher" remote add origin "$submodule_remote"
+git -C "$submodule_publisher" push --quiet -u origin main
+
+super_remote=$(_tmpdir)
+super_publisher=$(_tmpdir)
+git init --quiet --bare --initial-branch=main "$super_remote"
+_git_init "$super_publisher"
+git -c protocol.file.allow=always -C "$super_publisher" submodule add \
+  --quiet "$submodule_remote" sub
+git -C "$super_publisher" commit --quiet -m "superproject v1"
+git -C "$super_publisher" remote add origin "$super_remote"
+git -C "$super_publisher" push --quiet -u origin main
+
+submodule_client=$(_tmpdir)
+rm -rf "$submodule_client"
+git -c protocol.file.allow=always clone --quiet --recurse-submodules \
+  "$super_remote" "$submodule_client"
+_commit_file "$submodule_publisher" data.txt v2 "submodule v2"
+git -C "$submodule_publisher" push --quiet origin main
+git -c protocol.file.allow=always -C "$super_publisher/sub" fetch --quiet origin
+git -C "$super_publisher/sub" checkout --quiet refs/remotes/origin/main
+git -C "$super_publisher" add sub
+git -C "$super_publisher" commit --quiet -m "superproject v2"
+git -C "$super_publisher" push --quiet origin main
+unseen_submodule_oid=$(git -C "$submodule_publisher" rev-parse refs/heads/main)
+submodule_before=absent
+git -C "$submodule_client/sub" cat-file \
+  -e "$unseen_submodule_oid^{commit}" 2>/dev/null && submodule_before=present
+_assert_eq "submodule commit starts unseen" "absent" "$submodule_before"
+git -C "$submodule_client" config fetch.recurseSubmodules on-demand
+submodule_dry_rc=0
+GIT_ALLOW_PROTOCOL=file TMPDIR="$isolated_tmp" \
+  git -C "$submodule_client" cleanup-repo --base main --dry-run \
+  >/dev/null 2>&1 || submodule_dry_rc=$?
+submodule_after=absent
+git -C "$submodule_client/sub" cat-file \
+  -e "$unseen_submodule_oid^{commit}" 2>/dev/null && submodule_after=present
+_assert_eq "configured recursive-fetch dry run succeeds" "0" "$submodule_dry_rc"
+_assert_eq "dry run does not import unseen submodule objects" \
+  "absent" "$submodule_after"
+
+# A dry run cannot classify against an invented result when the real ff-only
+# pull would reject divergent local and remote base histories.
+diverged_base_repo=$(_clone_remote)
+git -C "$diverged_base_repo" switch --quiet -c remote-update \
+  refs/remotes/origin/main
+_commit_file "$diverged_base_repo" remote-base.txt remote "advance remote base"
+git -C "$diverged_base_repo" push origin remote-update:main >/dev/null 2>&1
+git -C "$diverged_base_repo" switch --quiet main
+_commit_file "$diverged_base_repo" local-base.txt local "diverge local base"
+git -C "$diverged_base_repo" switch --quiet -c diverged-runner
+diverged_base_rc=0
+diverged_base_output=$(git -C "$diverged_base_repo" cleanup-repo \
+  --base main --dry-run 2>&1) || diverged_base_rc=$?
+_assert_eq "divergent dry-run base fails closed" "2" "$diverged_base_rc"
+_assert_contains "divergent dry-run base is diagnosed" \
+  "local base cannot be fast-forwarded to origin/main" "$diverged_base_output"
+diverged_main_oid=$(git -C "$diverged_base_repo" rev-parse refs/heads/main)
+diverged_real_rc=0
+diverged_real_output=$(git -C "$diverged_base_repo" cleanup-repo \
+  --base main 2>&1) || diverged_real_rc=$?
+_assert_eq "divergent real base fails closed" "2" "$diverged_real_rc"
+_assert_contains "divergent real base is diagnosed before checkout" \
+  "local base cannot be fast-forwarded to origin/main" "$diverged_real_output"
+_assert_eq "divergent failure leaves current branch unchanged" \
+  diverged-runner \
+  "$(git -C "$diverged_base_repo" branch --show-current)"
+_assert_eq "divergent failure leaves local base unchanged" \
+  "$diverged_main_oid" \
+  "$(git -C "$diverged_base_repo" rev-parse refs/heads/main)"
 
 rebase_repo=$(_clone_remote)
 git -C "$rebase_repo" switch --quiet -c rebased
@@ -174,9 +898,10 @@ _commit_file "$rebase_repo" mainline.txt main "unrelated mainline commit"
 # present, which the per-commit check detects.
 git -C "$rebase_repo" cherry-pick rebased~1 rebased >/dev/null 2>&1
 result=$(git -C "$rebase_repo" cleanup-repo 2>&1)
-_assert_contains "default deletes multi-commit rebase-merged branches" \
-  "deleting rebased (content-merged)" "$result"
-_assert_eq "rebase-merged branch removed by default" "main" "$(_branches "$rebase_repo")"
+_assert_contains "default reports multi-commit rebase-merged branches" \
+  "preserving local cleanup candidate rebased at " "$result"
+_assert_eq "rebase-merged branch remains" \
+  "$(printf 'main\nrebased')" "$(_branches "$rebase_repo")"
 
 unmerged_repo=$(_clone_remote)
 git -C "$unmerged_repo" switch --quiet -c partial
@@ -226,16 +951,452 @@ _assert_contains "keeps a squash-merged branch with an extra unmerged commit" \
 _assert_eq "squash-merged branch with extra work survives" \
   "$(printf 'main\nsquashed-extra')" "$(_branches "$squash_partial_repo")"
 
-dry_repo=$(_clone_remote)
-git -C "$dry_repo" switch --quiet -c dry
-_commit_file "$dry_repo" dry.txt dry "add dry"
-git -C "$dry_repo" switch --quiet main
-git -C "$dry_repo" merge --no-ff dry -m "merge dry" >/dev/null
-result=$(git -C "$dry_repo" cleanup-repo --dry-run 2>&1)
-_assert_contains "dry run reports branch deletion" "deleting dry (merged)" "$result"
-_assert_contains "dry run reports would-delete summary" "would delete 1 branch(es)" "$result"
-expected="$(printf 'dry\nmain')"
-_assert_eq "dry run keeps branches" "$expected" "$(_branches "$dry_repo")"
+# Patch IDs deliberately ignore whitespace, but cleanup classification must use
+# the exact net tree and reject byte-distinct content.
+whitespace_repo=$(_clone_remote)
+git -C "$whitespace_repo" switch --quiet -c whitespace-distinct
+printf 'alpha beta\n' >"$whitespace_repo/whitespace.txt"
+git -C "$whitespace_repo" add whitespace.txt
+git -C "$whitespace_repo" commit --quiet -m "add branch whitespace"
+git -C "$whitespace_repo" switch --quiet main
+printf 'alpha    beta\n' >"$whitespace_repo/whitespace.txt"
+git -C "$whitespace_repo" add whitespace.txt
+git -C "$whitespace_repo" commit --quiet -m "add main whitespace"
+result=$(git -C "$whitespace_repo" cleanup-repo 2>&1)
+_assert_contains "keeps patch-equivalent byte-distinct content" \
+  "keeping whitespace-distinct; not merged" "$result"
+_assert_eq "byte-distinct branch survives default cleanup" \
+  "$(printf 'main\nwhitespace-distinct')" "$(_branches "$whitespace_repo")"
+
+# Failure to produce either exact delta is not proof of a merge.
+whitespace_branch_oid=$(git -C "$whitespace_repo" rev-parse whitespace-distinct)
+whitespace_base_oid=$(git -C "$whitespace_repo" rev-parse main)
+diff_failure_bin=$(_tmpdir)
+_write_diff_tree_failure_git "$diff_failure_bin"
+for failure_side in base branch; do
+  case "$failure_side" in
+    branch) diff_failure_target=$whitespace_branch_oid ;;
+    base) diff_failure_target=$whitespace_base_oid ;;
+  esac
+  diff_failure_output=$(cd "$whitespace_repo" &&
+    PATH="$diff_failure_bin:/usr/bin:/bin" \
+      GIT_DIFF_TREE_FAIL_TARGET="$diff_failure_target" \
+      GIT_DIFF_TREE_REAL=/usr/bin/git \
+      "$ROOT/bin/git-cleanup-repo" 2>&1)
+  _assert_contains "keeps branch after $failure_side delta producer failure" \
+    "keeping whitespace-distinct; not merged" "$diff_failure_output"
+  _assert_eq "$failure_side delta producer failure preserves branch" \
+    "$whitespace_branch_oid" \
+    "$(git -C "$whitespace_repo" rev-parse refs/heads/whitespace-distinct)"
+done
+
+# Exact comparison covers tree modes and later same-path edits, not only bytes.
+tree_repo=$(_clone_remote)
+git -C "$tree_repo" switch --quiet -c mode-distinct
+printf 'same bytes\n' >"$tree_repo/mode.txt"
+chmod +x "$tree_repo/mode.txt"
+git -C "$tree_repo" add mode.txt
+git -C "$tree_repo" commit --quiet -m "add executable"
+git -C "$tree_repo" switch --quiet main
+printf 'same bytes\n' >"$tree_repo/mode.txt"
+git -C "$tree_repo" add mode.txt
+git -C "$tree_repo" commit --quiet -m "add regular file"
+result=$(git -C "$tree_repo" cleanup-repo 2>&1)
+_assert_contains "keeps mode-distinct tree entry" \
+  "keeping mode-distinct; not merged" "$result"
+
+later_repo=$(_clone_remote)
+git -C "$later_repo" switch --quiet -c landed-then-edited
+_commit_file "$later_repo" shared.txt landed "add landed content"
+git -C "$later_repo" switch --quiet main
+printf '%s\n' landed >"$later_repo/shared.txt"
+git -C "$later_repo" add shared.txt
+git -C "$later_repo" commit --quiet -m "squash landed content"
+printf '%s\n' later >"$later_repo/shared.txt"
+git -C "$later_repo" add shared.txt
+git -C "$later_repo" commit --quiet -m "edit landed path later"
+result=$(git -C "$later_repo" cleanup-repo 2>&1)
+_assert_contains "keeps landed branch after later same-path edit" \
+  "keeping landed-then-edited; not merged" "$result"
+
+# Exact squash merges still match with modes, symlinks, binary data, unusual
+# path syntax, and a file without a final newline.
+exact_repo=$(_clone_remote)
+exact_weird=':(literal)name.txt'
+_commit_file "$exact_repo" delete-me.txt obsolete "add file for exact deletion"
+git -C "$exact_repo" switch --quiet -c exact-tree
+git -C "$exact_repo" rm --quiet delete-me.txt
+printf '#!/bin/sh\nprintf exact\n' >"$exact_repo/executable"
+chmod +x "$exact_repo/executable"
+ln -s executable "$exact_repo/exact-link"
+printf '\000exact bytes\377' >"$exact_repo/exact.dat"
+printf 'exact no final newline' >"$exact_repo/exact-eof.txt"
+printf '%s\n' pathspec >"$exact_repo/$exact_weird"
+git -C "$exact_repo" add --all
+git -C "$exact_repo" commit --quiet -m "add exact branch tree"
+_commit_file "$exact_repo" exact-step2.txt second "add exact second step"
+git -C "$exact_repo" switch --quiet main
+git -C "$exact_repo" rm --quiet delete-me.txt
+printf '#!/bin/sh\nprintf exact\n' >"$exact_repo/executable"
+chmod +x "$exact_repo/executable"
+ln -s executable "$exact_repo/exact-link"
+printf '\000exact bytes\377' >"$exact_repo/exact.dat"
+printf 'exact no final newline' >"$exact_repo/exact-eof.txt"
+printf '%s\n' pathspec >"$exact_repo/$exact_weird"
+printf '%s\n' second >"$exact_repo/exact-step2.txt"
+git -C "$exact_repo" add --all
+git -C "$exact_repo" commit --quiet -m "squash exact branch tree"
+result=$(git -C "$exact_repo" cleanup-repo 2>&1)
+_assert_contains "reports exact rich-tree squash merge" \
+  "preserving local cleanup candidate exact-tree at " "$result"
+_assert_eq "exact rich-tree branch remains" \
+  "$(printf 'exact-tree\nmain')" "$(_branches "$exact_repo")"
+
+# Gitlinks participate in the same exact raw-tree proof. An identical target
+# is accepted, while a different commit at the same path is not.
+gitlink_repo=$(_clone_remote)
+gitlink_tree=$(printf '' | git -C "$gitlink_repo" mktree)
+gitlink_target=$(printf 'gitlink target\n' |
+  git -C "$gitlink_repo" commit-tree "$gitlink_tree")
+git -C "$gitlink_repo" switch --quiet -c exact-gitlink
+git -C "$gitlink_repo" update-index --add \
+  --cacheinfo "160000,$gitlink_target,vendor-link"
+git -C "$gitlink_repo" commit --quiet -m "add exact gitlink"
+git -C "$gitlink_repo" switch --quiet main
+git -C "$gitlink_repo" update-index --add \
+  --cacheinfo "160000,$gitlink_target,vendor-link"
+git -C "$gitlink_repo" commit --quiet -m "squash exact gitlink"
+mkdir "$gitlink_repo/vendor-link"
+gitlink_output=$(git -C "$gitlink_repo" cleanup-repo 2>&1)
+_assert_contains "reports exact gitlink squash merge" \
+  "cleanup candidate exact-gitlink at " "$gitlink_output"
+
+gitlink_distinct_repo=$(_clone_remote)
+gitlink_distinct_tree=$(printf '' | git -C "$gitlink_distinct_repo" mktree)
+gitlink_branch_target=$(printf 'branch gitlink target\n' |
+  git -C "$gitlink_distinct_repo" commit-tree "$gitlink_distinct_tree")
+gitlink_base_target=$(printf 'base gitlink target\n' |
+  git -C "$gitlink_distinct_repo" commit-tree "$gitlink_distinct_tree")
+git -C "$gitlink_distinct_repo" switch --quiet -c distinct-gitlink
+git -C "$gitlink_distinct_repo" update-index --add \
+  --cacheinfo "160000,$gitlink_branch_target,vendor-link"
+git -C "$gitlink_distinct_repo" commit --quiet -m "add branch gitlink"
+git -C "$gitlink_distinct_repo" switch --quiet main
+git -C "$gitlink_distinct_repo" update-index --add \
+  --cacheinfo "160000,$gitlink_base_target,vendor-link"
+git -C "$gitlink_distinct_repo" commit --quiet -m "add distinct base gitlink"
+mkdir "$gitlink_distinct_repo/vendor-link"
+gitlink_distinct_output=$(git -C "$gitlink_distinct_repo" cleanup-repo 2>&1)
+_assert_contains "keeps same-path distinct gitlink target" \
+  "keeping distinct-gitlink; not merged" "$gitlink_distinct_output"
+
+# Every streamed squash-proof producer is mandatory. A failed diff, log, or
+# patch-id command must not fall through to a false merged result.
+for proof_failure in diff log patch-id; do
+  proof_bin=$(_tmpdir)
+  proof_tmp=$(_tmpdir)
+  cat >"$proof_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "$GIT_SQUASH_PROOF_FAILURE" ]]; then
+  exit 88
+fi
+exec /usr/bin/git "$@"
+EOF
+  chmod +x "$proof_bin/git"
+  proof_output=$(cd "$readonly_repo" &&
+    PATH="$proof_bin:/usr/bin:/bin" \
+      TMPDIR="$proof_tmp" \
+      GIT_SQUASH_PROOF_FAILURE="$proof_failure" \
+      "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1)
+  _assert_contains "$proof_failure failure is not accepted as a squash proof" \
+    "keeping readonly-squash; not merged" "$proof_output"
+  _assert_eq "$proof_failure failure preserves the squash branch" \
+    "$(printf 'main\nreadonly-squash')" "$(_branches "$readonly_repo")"
+  _assert_eq "$proof_failure failure removes private workspace" "" \
+    "$(_tool_artifacts "$proof_tmp")"
+done
+
+# Successful producers with malformed trailing data are operational failures,
+# not a valid non-match that may fall through to the cherry proof.
+malformed_bin=$(_tmpdir)
+cat >"$malformed_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == patch-id ]]; then
+  input=$(cat)
+  if [[ "$GIT_MALFORMED_PROOF_MODE" == foreign-width ]]; then
+    printf '%064d %064d\n' 1 2
+    exit 0
+  fi
+  if [[ "$input" == commit\ * ]]; then
+    valid=$(printf '%s\n' "$input" | /usr/bin/git "$@") || exit $?
+    patch_id=${valid%% *}
+    source_id=${valid#* }
+    case "$GIT_MALFORMED_PROOF_MODE" in
+      one-char) printf 'a %s\n' "$source_id" ;;
+      mixed-width) printf '%s %s000000000000000000000000\n' "$patch_id" "$source_id" ;;
+      extra) printf '%s extra\n' "$valid" ;;
+      unterminated) printf '%s' "$valid" ;;
+      *) exit 89 ;;
+    esac
+    exit 0
+  fi
+  printf '%s\n' "$input" | /usr/bin/git "$@"
+  exit $?
+fi
+if [[ "${1:-}" == cherry ]]; then
+  printf '%s\n' cherry >>"$GIT_MALFORMED_PROOF_LOG"
+fi
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$malformed_bin/git"
+for malformed_mode in one-char mixed-width extra unterminated foreign-width; do
+  malformed_log=$(_tmpdir)/git-invocations
+  malformed_output=$(cd "$readonly_repo" &&
+    PATH="$malformed_bin:/usr/bin:/bin" \
+      GIT_MALFORMED_PROOF_LOG="$malformed_log" \
+      GIT_MALFORMED_PROOF_MODE="$malformed_mode" \
+      "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1)
+  _assert_contains "$malformed_mode patch-id record is not accepted as merged" \
+    "keeping readonly-squash; not merged" "$malformed_output"
+  _assert_eq "$malformed_mode patch-id fails before cherry fallback" "" \
+    "$(if [[ -e "$malformed_log" ]]; then printf invoked; fi)"
+done
+
+# Squash proof uses a private, invocation-scoped workspace and removes it on a
+# successful classification, even under a permissive caller umask.
+stream_tmp=$(_tmpdir)
+_assert_eq "successful proof TMPDIR starts without artifacts" "" \
+  "$(_tool_artifacts "$stream_tmp")"
+stream_output=$(cd "$readonly_repo" &&
+  (
+    umask 000
+    TMPDIR="$stream_tmp" "$ROOT/bin/git-cleanup-repo" \
+      --base main --dry-run 2>&1
+  ))
+_assert_contains "streamed squash proof still reports exact merge" \
+  "cleanup candidate readonly-squash at " "$stream_output"
+_assert_eq "successful squash proof removes private workspace" "" \
+  "$(_tool_artifacts "$stream_tmp")"
+
+# Workspace creation is mandatory. Failure must classify conservatively.
+mktemp_failure_bin=$(_tmpdir)
+mktemp_failure_real=$(PATH=/usr/local/bin:/usr/bin:/bin command -v mktemp)
+cat >"$mktemp_failure_bin/mktemp" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *git-tools-patch.*) exit 88 ;;
+esac
+exec "$GIT_PATCH_REAL_MKTEMP" "$@"
+EOF
+chmod +x "$mktemp_failure_bin/mktemp"
+mktemp_failure_output=$(cd "$readonly_repo" &&
+  PATH="$mktemp_failure_bin:/usr/bin:/bin" \
+    GIT_PATCH_REAL_MKTEMP="$mktemp_failure_real" \
+    "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1)
+_assert_contains "mktemp failure is not accepted as a squash proof" \
+  "keeping readonly-squash; not merged" "$mktemp_failure_output"
+
+# Cleanup failure is also unknown. Leave the injected workspace in place long
+# enough to verify restrictive directory and file modes under umask 000.
+cleanup_tmp=$(_tmpdir)
+cleanup_failure_bin=$(_tmpdir)
+cleanup_real_rm=$(PATH=/usr/local/bin:/usr/bin:/bin command -v rm)
+cat >"$cleanup_failure_bin/rm" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *git-tools-patch.*) exit 88 ;;
+esac
+exec "$GIT_PATCH_REAL_RM" "$@"
+EOF
+chmod +x "$cleanup_failure_bin/rm"
+cleanup_failure_output=$(cd "$readonly_repo" &&
+  (
+    umask 000
+    TMPDIR="$cleanup_tmp" \
+      PATH="$cleanup_failure_bin:/usr/bin:/bin" \
+      GIT_PATCH_REAL_RM="$cleanup_real_rm" \
+      "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1
+  ))
+_assert_contains "workspace cleanup failure is not accepted as merged" \
+  "keeping readonly-squash; not merged" "$cleanup_failure_output"
+cleanup_artifacts=$(_tool_artifacts "$cleanup_tmp")
+cleanup_artifact_count=$(printf '%s\n' "$cleanup_artifacts" |
+  awk 'NF { count++ } END { print count + 0 }')
+_assert_eq "cleanup failure leaves one inspectable workspace" "1" \
+  "$cleanup_artifact_count"
+if [[ -n "$cleanup_artifacts" ]]; then
+  _assert_eq "squash workspace directory is private" "700" \
+    "$(_mode "$cleanup_artifacts")"
+  _assert_eq "branch patch-id file is private" "600" \
+    "$(_mode "$cleanup_artifacts/branch.patch-ids")"
+  _assert_eq "base patch-id file is private" "600" \
+    "$(_mode "$cleanup_artifacts/base.patch-ids")"
+  "$cleanup_real_rm" -f "$cleanup_artifacts/branch.patch-ids" \
+    "$cleanup_artifacts/base.patch-ids"
+  rmdir "$cleanup_artifacts"
+fi
+
+# The streaming helper is subshell-scoped: it must not alter caller traps,
+# options, or globals when this sourced library API is used directly.
+caller_state_output=$(cd "$readonly_repo" && bash -c '
+  source "$1/lib/git-tools-base.sh"
+  trap "exit 77" TERM
+  trap_before=$(trap -p TERM)
+  set +o pipefail
+  caller_sentinel=unchanged
+  branch=$(git rev-parse refs/heads/readonly-squash)
+  base=$(git rev-parse refs/heads/main)
+  gt_branch_content_merged "$branch" "$base" || exit 1
+  [[ "$(trap -p TERM)" == "$trap_before" ]] || exit 2
+  [[ "$caller_sentinel" == unchanged ]] || exit 3
+  set -o | grep -q "^pipefail[[:space:]]*off$" || exit 4
+  printf preserved
+' _ "$ROOT" 2>&1)
+_assert_eq "squash helper preserves caller shell state" preserved \
+  "$caller_state_output"
+
+# Cleanup paths must not inherit caller attributes through Bash's dynamic
+# scoping. In particular, an integer path must never become the unrelated file
+# named "0", and readonly names must not prevent proof setup.
+caller_collision_output=$(cd "$readonly_repo" && bash -c '
+  source "$1/lib/git-tools-base.sh"
+  touch 0
+  declare -i branch_file=7
+  readonly tmpdir=caller
+  branch=$(git rev-parse refs/heads/readonly-squash)
+  base=$(git rev-parse refs/heads/main)
+  gt_branch_content_merged "$branch" "$base" || exit 1
+  [[ -e 0 ]] || exit 2
+  [[ "$branch_file" == 7 && "$tmpdir" == caller ]] || exit 3
+  rm -f 0
+  printf isolated
+' _ "$ROOT" 2>&1)
+_assert_eq "squash cleanup paths ignore caller variable attributes" isolated \
+  "$caller_collision_output"
+
+# A handled signal after workspace creation but before the captured EXIT trap is
+# installed must still fail the proof conservatively and remove that workspace.
+signal_setup_tmp=$(_tmpdir)
+signal_setup_marker=$(_tmpdir)/signal-fired
+signal_setup_killer=$(_tmpdir)/signal-parent
+cat >"$signal_setup_killer" <<'EOF'
+#!/bin/bash
+kill -TERM "$PPID"
+EOF
+chmod +x "$signal_setup_killer"
+signal_setup_output=$(cd "$readonly_repo" &&
+  GIT_PATCH_SIGNAL_KILLER="$signal_setup_killer" \
+    GIT_PATCH_SIGNAL_MARKER="$signal_setup_marker" \
+    TMPDIR="$signal_setup_tmp" bash -c '
+    source "$1/lib/git-tools-base.sh"
+    set -T
+    trap '\''
+      case "$BASH_COMMAND" in
+        _gt_squash_branch_file=*)
+          trap - DEBUG
+          : >"$GIT_PATCH_SIGNAL_MARKER"
+          "$GIT_PATCH_SIGNAL_KILLER"
+          ;;
+      esac
+    '\'' DEBUG
+    branch=$(git rev-parse refs/heads/readonly-squash)
+    base=$(git rev-parse refs/heads/main)
+    if gt_branch_content_merged "$branch" "$base"; then
+      exit 1
+    fi
+    trap - DEBUG
+    [[ -e "$GIT_PATCH_SIGNAL_MARKER" ]] || exit 2
+    printf interrupted
+  ' _ "$ROOT" 2>&1)
+_assert_eq "setup-time TERM fails squash proof conservatively" interrupted \
+  "$signal_setup_output"
+_assert_eq "setup-time TERM removes squash workspace" "" \
+  "$(_tool_artifacts "$signal_setup_tmp")"
+
+# Every producer in the exact-tree proof must complete successfully.
+for proof_failure in sort comm; do
+  proof_bin=$(_tmpdir)
+  cat >"$proof_bin/$proof_failure" <<'EOF'
+#!/usr/bin/env bash
+exit 88
+EOF
+  chmod +x "$proof_bin/$proof_failure"
+  proof_output=$(cd "$exact_repo" &&
+    PATH="$proof_bin:/usr/bin:/bin" "$ROOT/bin/git-cleanup-repo" 2>&1)
+  _assert_contains "$proof_failure failure is not accepted as merged" \
+    "keeping exact-tree; not merged" "$proof_output"
+  _assert_eq "$proof_failure failure preserves branch" \
+    "$(printf 'exact-tree\nmain')" "$(_branches "$exact_repo")"
+done
+
+# An operational ancestry failure is unknown, not evidence that content proof
+# should run. Keep this fault separate from the cherry producer fault.
+ancestor_bin=$(_tmpdir)
+cat >"$ancestor_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == merge-base && "${2:-}" == --is-ancestor &&
+  "${3:-}" == "$GIT_ANCESTOR_FAIL_TARGET" ]]; then
+  exit 88
+fi
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$ancestor_bin/git"
+exact_branch_oid=$(git -C "$exact_repo" rev-parse refs/heads/exact-tree)
+ancestor_output=$(cd "$exact_repo" &&
+  PATH="$ancestor_bin:/usr/bin:/bin" \
+    GIT_ANCESTOR_FAIL_TARGET="$exact_branch_oid" \
+    "$ROOT/bin/git-cleanup-repo" 2>&1)
+_assert_contains "ancestry failure is not accepted as merged" \
+  "keeping exact-tree; not merged" "$ancestor_output"
+_assert_eq "ancestry failure preserves branch" \
+  "$(printf 'exact-tree\nmain')" "$(_branches "$exact_repo")"
+
+# The cherry path must be reached with ancestry fully operational, then reject
+# a completed-looking prefix followed by failure.
+cherry_bin=$(_tmpdir)
+cherry_log=$(_tmpdir)/git-invocations
+cat >"$cherry_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == merge-base && "${2:-}" == --is-ancestor ]]; then
+  printf '%s\n' ancestry >>"$GIT_CHERRY_PROOF_LOG"
+fi
+if [[ "${1:-}" == cherry ]]; then
+  printf '%s\n' cherry >>"$GIT_CHERRY_PROOF_LOG"
+  printf '%s\n' '- partial-proof'
+  exit 88
+fi
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$cherry_bin/git"
+cherry_output=$(cd "$rebase_repo" &&
+  PATH="$cherry_bin:/usr/bin:/bin" \
+    GIT_CHERRY_PROOF_LOG="$cherry_log" \
+    "$ROOT/bin/git-cleanup-repo" 2>&1)
+_assert_contains "cherry failure is not accepted as merged" \
+  "keeping rebased; not merged" "$cherry_output"
+_assert_contains "cherry fault test exercises ancestry" ancestry \
+  "$(<"$cherry_log")"
+_assert_contains "cherry fault test reaches git cherry" cherry \
+  "$(<"$cherry_log")"
+_assert_eq "cherry failure preserves branch" \
+  "$(printf 'main\nrebased')" "$(_branches "$rebase_repo")"
+
+# The per-commit replay path also treats an operational grep error as unknown.
+grep_failure_bin=$(_tmpdir)
+cat >"$grep_failure_bin/grep" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -q && "${2:-}" == '^+' ]]; then
+  exit 88
+fi
+exec /usr/bin/grep "$@"
+EOF
+chmod +x "$grep_failure_bin/grep"
+grep_failure_output=$(cd "$rebase_repo" &&
+  PATH="$grep_failure_bin:/usr/bin:/bin" "$ROOT/bin/git-cleanup-repo" 2>&1)
+_assert_contains "grep failure is not accepted as merged" \
+  "keeping rebased; not merged" "$grep_failure_output"
+_assert_eq "grep failure preserves branch" \
+  "$(printf 'main\nrebased')" "$(_branches "$rebase_repo")"
 
 all_repo=$(_clone_remote)
 git -C "$all_repo" switch --quiet -c unmerged
@@ -243,8 +1404,10 @@ _commit_file "$all_repo" unmerged.txt unmerged "add unmerged"
 git -C "$all_repo" push -u origin unmerged >/dev/null 2>&1
 git -C "$all_repo" switch --quiet main
 result=$(git -C "$all_repo" cleanup-repo --all 2>&1)
-_assert_contains "all deletes unmerged local branches" "deleting unmerged (all)" "$result"
-_assert_eq "all leaves only main" "main" "$(_branches "$all_repo")"
+_assert_contains "all reports unmerged local candidates" \
+  "preserving local cleanup candidate unmerged at " "$result"
+_assert_eq "all preserves local branches" \
+  "$(printf 'main\nunmerged')" "$(_branches "$all_repo")"
 
 worktree_repo=$(_clone_remote)
 git -C "$worktree_repo" switch --quiet -c work
@@ -254,13 +1417,17 @@ worktree_dir=$(_tmpdir)
 rm -rf "$worktree_dir"
 git -C "$worktree_repo" worktree add "$worktree_dir" work >/dev/null 2>&1
 result=$(git -C "$worktree_repo" cleanup-repo --all 2>&1)
-_assert_contains "keeps checked-out branches without worktree removal" \
-  "skipping work; checked out in worktree" "$result"
+_assert_contains "reports checked-out branches without worktree mutation" \
+  "preserving local cleanup candidate work at " "$result"
 expected="$(printf 'main\nwork')"
 _assert_eq "branch remains while worktree is kept" "$expected" "$(_branches "$worktree_repo")"
 result=$(git -C "$worktree_repo" cleanup-repo --all --remove-worktrees 2>&1)
-_assert_contains "removes clean linked worktrees" "deleting work (all)" "$result"
-_assert_eq "worktree cleanup leaves only main" "main" "$(_branches "$worktree_repo")"
+_assert_contains "remove-worktrees remains non-destructive" \
+  "preserving local cleanup candidate work at " "$result"
+_assert_eq "remove-worktrees preserves worktree branch" "$expected" \
+  "$(_branches "$worktree_repo")"
+_assert_eq "remove-worktrees preserves linked checkout" "work" \
+  "$(git -C "$worktree_dir" branch --show-current)"
 
 dirty_worktree_repo=$(_clone_remote)
 git -C "$dirty_worktree_repo" switch --quiet -c dirty-work
@@ -275,8 +1442,8 @@ result=$(
   GIT_DIR="$dirty_worktree_git_dir" GIT_WORK_TREE="$dirty_worktree_repo" \
     git cleanup-repo --all --remove-worktrees 2>&1
 )
-_assert_contains "skips dirty linked worktrees before removal" \
-  "skipping dirty-work; worktree has uncommitted changes" "$result"
+_assert_contains "reports dirty linked worktrees without inspecting or removing them" \
+  "preserving local cleanup candidate dirty-work at " "$result"
 _assert_not_contains "does not let git worktree remove reject dirty worktrees" \
   "fatal:" "$result"
 _assert_eq "dirty worktree branch remains" \
@@ -295,8 +1462,8 @@ result=$(
   GIT_DIR="$corrupt_worktree_git_dir" GIT_WORK_TREE="$corrupt_worktree_repo" \
     git cleanup-repo --all --remove-worktrees 2>&1
 )
-_assert_contains "skips linked worktrees when status cannot run" \
-  "skipping corrupt-work; worktree has uncommitted changes" "$result"
+_assert_contains "reports corrupt linked worktrees without inspecting or removing them" \
+  "preserving local cleanup candidate corrupt-work at " "$result"
 _assert_not_contains "does not remove corrupt worktrees after failed status" \
   "fatal:" "$result"
 _assert_eq "corrupt worktree branch remains" \

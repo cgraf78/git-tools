@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+helper="$ROOT/test/lib/test-temp.sh"
+failures=0
+old_umask=$(umask)
+umask 077
+sandbox=$(mktemp -d "${TMPDIR:-/tmp}/git-tools-temp-test.XXXXXX") || {
+  umask "$old_umask"
+  exit 1
+}
+chmod 700 "$sandbox" || {
+  rm -rf -- "$sandbox"
+  umask "$old_umask"
+  exit 1
+}
+umask "$old_umask"
+
+cleanup_sandbox() {
+  rm -rf -- "$sandbox"
+}
+
+signal_cleanup_sandbox() {
+  local status="$1"
+
+  trap - EXIT HUP INT TERM
+  cleanup_sandbox || true
+  exit "$status"
+}
+
+trap cleanup_sandbox EXIT
+trap 'signal_cleanup_sandbox 129' HUP
+trap 'signal_cleanup_sandbox 130' INT
+trap 'signal_cleanup_sandbox 143' TERM
+
+pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  failures=$((failures + 1))
+}
+
+mode_of() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+printf '%s\n' artifact >"$sandbox/artifact"
+mkdir "$sandbox/neighbor"
+normal_root_file=$sandbox/normal-root
+normal_modes=$sandbox/normal-modes
+TMPDIR="$sandbox" TEST_ROOT_FILE="$normal_root_file" \
+  TEST_MODES_FILE="$normal_modes" TEST_ARTIFACT="$sandbox/artifact" \
+  TEST_HELPER="$helper" /bin/bash -c '
+    umask 000
+    . "$TEST_HELPER"
+    gt_test_temp_init
+    printf "%s\n" "$GT_TEST_TEMP_ROOT" >"$TEST_ROOT_FILE"
+    child=$(gt_test_temp_dir)
+    root_mode=$(stat -c "%a" "$GT_TEST_TEMP_ROOT" 2>/dev/null || stat -f "%Lp" "$GT_TEST_TEMP_ROOT")
+    child_mode=$(stat -c "%a" "$child" 2>/dev/null || stat -f "%Lp" "$child")
+    printf "%s %s\n" "$root_mode" "$child_mode" >"$TEST_MODES_FILE"
+    ln -s "$TEST_ARTIFACT" "$child/artifact-link"
+  '
+normal_root=$(cat "$normal_root_file" 2>/dev/null || true)
+if [[ -n "$normal_root" && ! -e "$normal_root" ]]; then
+  pass "normal exit removes the owned suite root"
+else
+  fail "normal exit removes the owned suite root"
+fi
+if [[ "$(cat "$normal_modes" 2>/dev/null)" == "700 700" ]]; then
+  pass "suite root and children stay private under umask 000"
+else
+  fail "suite root and children stay private under umask 000"
+fi
+if [[ -f "$sandbox/artifact" && -d "$sandbox/neighbor" ]]; then
+  pass "cleanup does not follow symlinks or remove neighboring artifacts"
+else
+  fail "cleanup does not follow symlinks or remove neighboring artifacts"
+fi
+
+for signal_record in HUP:129 INT:130 TERM:143; do
+  signal=${signal_record%%:*}
+  expected=${signal_record#*:}
+  root_file=$sandbox/root-$signal
+  ready_file=$sandbox/ready-$signal
+  pid_file=$sandbox/pid-$signal
+  (
+    wait_count=0
+    while [[ ! -e "$ready_file" && "$wait_count" -lt 100 ]]; do
+      sleep 0.02
+      wait_count=$((wait_count + 1))
+    done
+    signal_pid=$(cat "$pid_file" 2>/dev/null || true)
+    [[ -z "$signal_pid" ]] || kill -s "$signal" "$signal_pid" 2>/dev/null || true
+  ) &
+  killer_pid=$!
+  child_rc=0
+  TMPDIR="$sandbox" TEST_ROOT_FILE="$root_file" TEST_READY_FILE="$ready_file" \
+    TEST_PID_FILE="$pid_file" TEST_HELPER="$helper" /bin/bash -c '
+      . "$TEST_HELPER"
+      gt_test_temp_init
+      printf "%s\n" "$$" >"$TEST_PID_FILE"
+      printf "%s\n" "$GT_TEST_TEMP_ROOT" >"$TEST_ROOT_FILE"
+      gt_test_temp_dir >/dev/null
+      : >"$TEST_READY_FILE"
+      while :; do sleep 1; done
+    ' || child_rc=$?
+  wait "$killer_pid" || true
+  signal_root=$(cat "$root_file" 2>/dev/null || true)
+  if [[ "$child_rc" == "$expected" && -n "$signal_root" && ! -e "$signal_root" ]]; then
+    pass "$signal exits $expected and removes the exact owned root"
+  else
+    fail "$signal exits $expected and removes the exact owned root"
+  fi
+done
+
+if [[ "$(mode_of "$sandbox")" == 700 ]]; then
+  pass "test sandbox remains private"
+else
+  fail "test sandbox remains private"
+fi
+
+if ((failures > 0)); then
+  printf '%s failure(s)\n' "$failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

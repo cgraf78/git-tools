@@ -7,22 +7,10 @@ PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
 
 _failures=0
-_temps=()
-
-_tmpdir() {
-  local dir
-  dir=$(mktemp -d)
-  _temps+=("$dir")
-  printf '%s\n' "$dir"
-}
-
-_cleanup() {
-  local dir
-  for dir in "${_temps[@]}"; do
-    rm -rf "$dir"
-  done
-}
-trap _cleanup EXIT
+# shellcheck source=test/lib/test-temp.sh
+. "$ROOT/test/lib/test-temp.sh"
+gt_test_temp_init || exit 1
+_tmpdir() { gt_test_temp_dir; }
 
 _pass() {
   printf 'ok - %s\n' "$1"
@@ -68,8 +56,13 @@ if [[ "$1 $2" == "auth status" ]]; then
   exit 0
 fi
 
+if [[ "$1 $2" == "repo view" ]]; then
+  printf 'example/repo\thttps://github.test/example/repo\n'
+  exit 0
+fi
+
 if [[ "$1 $2" == "pr view" ]]; then
-  printf '7\tOPEN\tfalse\tCLEAN\tfeature/state\tmain\thttps://example/pr/7\tState PR\n'
+  printf '7\tOPEN\tfalse\tCLEAN\tfeature/state\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/7\tState PR\n'
   exit 0
 fi
 
@@ -130,7 +123,7 @@ _assert_contains "human reports PR" "pr: #7 main -> feature/state checks=pass" "
 
 result=$(PATH="$bin_dir:$PATH" git -C "$repo" repo-state --json 2>&1)
 _assert_contains "json includes dirty boolean" '"dirty":true' "$result"
-_assert_contains "json includes PR URL" '"pr_url":"https://example/pr/7"' "$result"
+_assert_contains "json includes PR URL" '"pr_url":"https://github.test/example/repo/pull/7"' "$result"
 
 unauthenticated_gh=$(_tmpdir)
 _write_unauthenticated_gh_stub "$unauthenticated_gh"

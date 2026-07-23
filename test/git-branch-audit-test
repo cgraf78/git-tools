@@ -7,23 +7,10 @@ PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
 
 _failures=0
-_suite_tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/git-branch-audit-test.XXXXXX") ||
-  exit 1
-
-_tmpdir() {
-  mktemp -d "$_suite_tmp_root/fixture.XXXXXX"
-}
-
-_cleanup() {
-  local status=$?
-  trap - EXIT HUP INT TERM
-  rm -rf -- "$_suite_tmp_root" || status=1
-  exit "$status"
-}
-trap _cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+# shellcheck source=test/lib/test-temp.sh
+. "$ROOT/test/lib/test-temp.sh"
+gt_test_temp_init || exit 1
+_tmpdir() { gt_test_temp_dir; }
 
 _pass() {
   printf 'ok - %s\n' "$1"
@@ -111,8 +98,12 @@ _write_gh_stub() {
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "$1 $2" == "auth status" ]]; then exit 0; fi
+if [[ "$1 $2" == "repo view" ]]; then
+  printf 'example/repo\thttps://github.test/example/repo\n'
+  exit 0
+fi
 if [[ "$1 $2" == "pr list" ]]; then
-  printf '101\tOPEN\tfalse\tCLEAN\tahead\tmain\thttps://example/pr/101\tAhead PR\n'
+  printf '101\tOPEN\tfalse\tCLEAN\tahead\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/101\tAhead PR\n'
   exit 0
 fi
 printf 'unexpected gh call: %s\n' "$*" >&2

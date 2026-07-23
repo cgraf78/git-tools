@@ -54,6 +54,163 @@ gt_find_ref_commit() {
   [[ -n "$GT_REF_OID" ]] || return 2
 }
 
+# @brief Resolve an exact remote ref with status-preserving ls-remote semantics.
+# Sets GT_REMOTE_REF_OID on success; returns 1 when absent and 2 for transport,
+# protocol, or malformed-output failures.
+gt_find_remote_ref() {
+  local remote="$1" ref="$2" output status=0 oid found_ref extra
+
+  GT_REMOTE_REF_OID=""
+  output=$(git ls-remote --exit-code --refs "$remote" "$ref" 2>/dev/null) || status=$?
+  case "$status" in
+    0) ;;
+    2) return 1 ;;
+    *) return 2 ;;
+  esac
+  IFS=$'\t' read -r oid found_ref extra <<<"$output"
+  [[ -n "$oid" && "$found_ref" == "$ref" && -z "$extra" ]] || return 2
+  [[ "$output" != *$'\n'* ]] || return 2
+  # Consumed by callers in the PR command scripts after this sourced helper
+  # returns; ShellCheck cannot follow that cross-file global result.
+  # shellcheck disable=SC2034
+  GT_REMOTE_REF_OID=$oid
+}
+
+# @brief Create an unpredictable one-shot URL alias for an exact transport.
+_gt_make_exact_url_alias() {
+  local nonce_dir nonce
+
+  nonce_dir=$(mktemp -d "${TMPDIR:-/tmp}/git-tools-url.XXXXXX") || return 1
+  nonce=${nonce_dir##*/}
+  rmdir "$nonce_dir" || return 1
+  GT_EXACT_URL_ALIAS="https://git-tools.invalid/$nonce"
+}
+
+# @brief Reject transport strings that cannot be embedded safely in git -c URL
+# keys. HTTP credentials are never accepted; SSH usernames remain valid.
+gt_exact_url_is_safe() {
+  local url="$1" rest authority host path="" owner repo userinfo=""
+
+  [[ -n "$url" && "$url" != -* ]] || return 1
+  case "$url" in
+    *$'\n'* | *$'\r'* | *$'\t'* | *' '* | *'='* | *'?'* | *'#'*) return 1 ;;
+  esac
+  case "$url" in
+    http://* | https://*)
+      rest=${url#*://}
+      authority=${rest%%/*}
+      [[ "$authority" != "$rest" && "$authority" != *@* ]] || return 1
+      host=$authority
+      path=${rest#*/}
+      ;;
+    ssh://*)
+      rest=${url#ssh://}
+      authority=${rest%%/*}
+      [[ "$authority" != "$rest" ]] || return 1
+      host=${authority##*@}
+      path=${rest#*/}
+      if [[ "$authority" == *@* ]]; then
+        userinfo=${authority%@*}
+        [[ "$userinfo" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+      fi
+      ;;
+    *@*:*)
+      authority=${url%%:*}
+      userinfo=${authority%@*}
+      host=${authority##*@}
+      path=${url#*:}
+      [[ "$userinfo" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+      ;;
+    /* | ./* | ../* | file://*) return 0 ;;
+    *) return 1 ;;
+  esac
+  [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+  [[ "$host" != *..* ]] || return 1
+  path=${path#/}
+  path=${path%/}
+  path=${path%.git}
+  owner=${path%%/*}
+  repo=${path#*/}
+  [[ -n "$owner" && -n "$repo" && "$repo" != */* ]] || return 1
+  [[ "$owner" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+  [[ "$repo" =~ ^[A-Za-z0-9._-]+$ && "$repo" != . && "$repo" != .. ]]
+}
+
+# @brief Inspect one already-expanded URL without allowing another URL rewrite.
+gt_find_remote_ref_exact_url() {
+  local url="$1" ref="$2" alias output status=0 oid found_ref extra
+
+  GT_REMOTE_REF_OID=""
+  gt_exact_url_is_safe "$url" || return 2
+  _gt_make_exact_url_alias || return 2
+  alias=$GT_EXACT_URL_ALIAS
+  output=$(git \
+    -c "url.$url.insteadOf=$alias" \
+    -c "url.$url.pushInsteadOf=$alias" \
+    ls-remote --exit-code --refs "$alias" "$ref" 2>/dev/null) || status=$?
+  case "$status" in
+    0) ;;
+    2) return 1 ;;
+    *) return 2 ;;
+  esac
+  IFS=$'\t' read -r oid found_ref extra <<<"$output"
+  [[ -n "$oid" && "$found_ref" == "$ref" && -z "$extra" ]] || return 2
+  [[ "$output" != *$'\n'* ]] || return 2
+  # shellcheck disable=SC2034 # consumed by PR command scripts
+  GT_REMOTE_REF_OID=$oid
+}
+
+# @brief Push to one already-expanded URL without allowing another URL rewrite.
+gt_push_exact_url() {
+  local url="$1" alias
+  shift
+  gt_exact_url_is_safe "$url" || return 1
+  _gt_make_exact_url_alias || return 1
+  alias=$GT_EXACT_URL_ALIAS
+  git \
+    -c "url.$url.insteadOf=$alias" \
+    -c "url.$url.pushInsteadOf=$alias" \
+    push "$alias" "$@"
+}
+
+# @brief Fetch one named ref from an already-expanded URL without allowing
+# another URL rewrite. Sets GT_FETCHED_REF_OID to the fetched commit OID.
+gt_fetch_ref_exact_url() {
+  local url="$1" ref="$2" alias oid
+
+  GT_FETCHED_REF_OID=""
+  gt_exact_url_is_safe "$url" || return 1
+  _gt_make_exact_url_alias || return 1
+  alias=$GT_EXACT_URL_ALIAS
+  git \
+    -c "url.$url.insteadOf=$alias" \
+    -c "url.$url.pushInsteadOf=$alias" \
+    fetch --quiet --no-tags "$alias" "$ref" || return 1
+  oid=$(git rev-parse --verify "FETCH_HEAD^{commit}" 2>/dev/null) || return 1
+  [[ -n "$oid" ]] || return 1
+  # shellcheck disable=SC2034 # consumed by PR command scripts
+  GT_FETCHED_REF_OID=$oid
+}
+
+# @brief Snapshot and fetch one exact remote ref, requiring both operations to
+# resolve the same immutable commit. Sets GT_EXACT_REF_OID; returns 1 when the
+# ref is absent and 2 for transport, malformed output, or concurrent movement.
+gt_snapshot_and_fetch_ref_exact_url() {
+  local url="$1" ref="$2" snapshot status=0
+
+  GT_EXACT_REF_OID=""
+  gt_find_remote_ref_exact_url "$url" "$ref" || status=$?
+  case "$status" in
+    0) snapshot=$GT_REMOTE_REF_OID ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+  gt_fetch_ref_exact_url "$url" "$ref" || return 2
+  [[ "$GT_FETCHED_REF_OID" == "$snapshot" ]] || return 2
+  # shellcheck disable=SC2034 # consumed by PR command scripts
+  GT_EXACT_REF_OID=$snapshot
+}
+
 # @brief Print the merge base of HEAD and the given ref.
 gt_merge_base() {
   local base
@@ -341,33 +498,105 @@ gt_branch_merged() {
 # the requested path. Clear exactly the variables Git documents as local before
 # crossing to another worktree or repository.
 gt_git_without_local_env() {
-  local name
+  local name local_vars
   local -a env_args=()
 
+  local_vars=$(git rev-parse --local-env-vars) || return 1
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     env_args+=("-u" "$name")
-  done < <(git rev-parse --local-env-vars)
+  done <<<"$local_vars"
 
   env "${env_args[@]}" git "$@"
 }
 
-# @brief Print the worktree path that has the given branch checked out.
-# Prints nothing and returns 0 when the branch is not checked out in any
-# worktree; callers test for an empty result.
-gt_worktree_for_branch() {
+# @brief Set GT_WORKTREE_PATH to the current worktree without losing newlines.
+# The sentinel keeps command substitution from stripping the path's terminal
+# newlines; removing Git's single record delimiter then recovers the exact path.
+gt_find_current_worktree() {
+  local output sentinel=$'\034'
+
+  GT_WORKTREE_PATH=""
+  output=$(git rev-parse --show-toplevel && printf '%s' "$sentinel") || return 1
+  [[ "$output" == *"$sentinel" ]] || return 1
+  output=${output%"$sentinel"}
+  [[ "$output" == *$'\n' ]] || return 1
+  GT_WORKTREE_PATH=${output%$'\n'}
+}
+
+# @brief Materialize Git's NUL-delimited worktree inventory and check its
+# producer status. Reading process substitution directly hides producer
+# failures from the consuming loop.
+_gt_materialize_worktree_list() {
+  local candidate field list_fd="" complete=0 trailing=0
+
+  _GT_WORKTREE_FIELDS=()
+  # Bash 3.2 has no automatic {var} descriptor allocation. Pick an unused
+  # descriptor without overwriting one owned by a caller.
+  for candidate in 9 8 7 6 5 4 3; do
+    if ! { true <&"$candidate"; } 2>/dev/null; then
+      list_fd=$candidate
+      break
+    fi
+  done
+  [[ -n "$list_fd" ]] || return 1
+  # Positional parameters are function-scoped and cannot inherit a caller's
+  # export attribute, so the producer cannot read the nonce from its environment.
+  # The nonhex suffix is emitted only after od succeeds, preserving its status.
+  set -- "$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null && printf x)"
+  set -- "${1//[[:space:]]/}"
+  [[ ${#1} -eq 33 && "$1" == *x && "${1%x}" != *[!0-9a-f]* ]] || return 1
+  set -- $'\036git-tools-worktree-list-complete-'"${1%x}"
+  # The unpredictable completion record carries the producer status through
+  # the pipe. Bash 3.2 does not reliably retain process-substitution children
+  # for `wait`.
+  if ! eval "exec $list_fd< <(git worktree list --porcelain -z && printf '%s\\0' \"\$1\")"; then
+    return 1
+  fi
+  while IFS= read -r -d '' field <&"$list_fd"; do
+    if [[ "$field" == "$1" && "$complete" == 0 ]]; then
+      complete=1
+    elif ((complete)); then
+      trailing=1
+    else
+      _GT_WORKTREE_FIELDS+=("$field")
+    fi
+  done
+  if [[ -n "$field" || "$complete" != 1 || "$trailing" != 0 ]]; then
+    eval "exec $list_fd<&-"
+    _GT_WORKTREE_FIELDS=()
+    return 1
+  fi
+  eval "exec $list_fd<&-"
+}
+
+# @brief Set GT_WORKTREE_PATH to the worktree that has a branch checked out.
+# The global result avoids command substitution, which cannot preserve trailing
+# newlines. An empty result means the branch is not checked out.
+gt_find_worktree_for_branch() {
   local branch="$1"
-  git worktree list --porcelain |
-    awk -v want="branch refs/heads/$branch" '
-      /^worktree / {
-        path = substr($0, 10)
-        next
-      }
-      $0 == want {
-        print path
-        exit
-      }
-    '
+  local field path=""
+
+  GT_WORKTREE_PATH=""
+  _gt_materialize_worktree_list || return 1
+
+  for field in "${_GT_WORKTREE_FIELDS[@]}"; do
+    case "$field" in
+      "worktree "*) path=${field#worktree } ;;
+      "branch refs/heads/$branch")
+        GT_WORKTREE_PATH=$path
+        return 0
+        ;;
+      '') path="" ;;
+    esac
+  done
+}
+
+# @brief Print the worktree path that has the given branch checked out.
+# Prefer gt_find_worktree_for_branch when the path will be consumed by shell.
+gt_worktree_for_branch() {
+  gt_find_worktree_for_branch "$1" || return 1
+  [[ -z "$GT_WORKTREE_PATH" ]] || printf '%s\n' "$GT_WORKTREE_PATH"
 }
 
 # @brief Print the worktree path that owns or reserves the given branch.
@@ -375,38 +604,56 @@ gt_worktree_for_branch() {
 # A rebase temporarily detaches HEAD while retaining the original branch in
 # rebase metadata. Irreversible workflows need this stronger check, while
 # ordinary inventory consumers retain the checked-out-only contract above.
-gt_worktree_reserving_branch() {
+gt_find_worktree_reserving_branch() {
   local branch="$1"
-  local line path state_file state_head
+  local field path state_file state_head
+  local -a paths=()
 
-  path=$(gt_worktree_for_branch "$branch")
-  if [[ -n "$path" ]]; then
-    printf '%s\n' "$path"
-    return 0
-  fi
+  GT_WORKTREE_PATH=""
+  _gt_materialize_worktree_list || return 1
 
-  while IFS= read -r line; do
-    [[ "$line" == "worktree "* ]] || continue
-    path="${line#worktree }"
+  for field in "${_GT_WORKTREE_FIELDS[@]}"; do
+    case "$field" in
+      "worktree "*)
+        path=${field#worktree }
+        paths+=("$path")
+        ;;
+      "branch refs/heads/$branch")
+        GT_WORKTREE_PATH=$path
+        return 0
+        ;;
+    esac
+  done
+
+  for path in "${paths[@]}"; do
     for state_file in rebase-merge/head-name rebase-apply/head-name; do
-      state_file=$(gt_git_without_local_env -C "$path" rev-parse --git-path "$state_file" 2>/dev/null || true)
+      state_file=$(gt_git_without_local_env -C "$path" rev-parse --git-path "$state_file" 2>/dev/null) ||
+        return 1
       [[ -f "$state_file" ]] || continue
-      IFS= read -r state_head <"$state_file" || true
+      IFS= read -r state_head <"$state_file" || return 1
       if [[ "$state_head" == "refs/heads/$branch" ]]; then
-        printf '%s\n' "$path"
+        GT_WORKTREE_PATH=$path
         return 0
       fi
     done
 
-    state_file=$(gt_git_without_local_env -C "$path" rev-parse --git-path BISECT_START 2>/dev/null || true)
+    state_file=$(gt_git_without_local_env -C "$path" rev-parse --git-path BISECT_START 2>/dev/null) ||
+      return 1
     if [[ -f "$state_file" ]]; then
-      IFS= read -r state_head <"$state_file" || true
+      IFS= read -r state_head <"$state_file" || return 1
       if [[ "$state_head" == "$branch" || "$state_head" == "refs/heads/$branch" ]]; then
-        printf '%s\n' "$path"
+        GT_WORKTREE_PATH=$path
         return 0
       fi
     fi
-  done < <(git worktree list --porcelain)
+  done
+}
+
+# @brief Print the worktree path that owns or reserves the given branch.
+# Prefer gt_find_worktree_reserving_branch when the path is consumed by shell.
+gt_worktree_reserving_branch() {
+  gt_find_worktree_reserving_branch "$1" || return 1
+  [[ -z "$GT_WORKTREE_PATH" ]] || printf '%s\n' "$GT_WORKTREE_PATH"
 }
 
 # @brief Print the active sequencer operation in a worktree, if any.
@@ -415,7 +662,8 @@ gt_worktree_operation() {
   local entry label state_path
 
   while IFS=$'\t' read -r entry label; do
-    state_path=$(gt_git_without_local_env -C "$path" rev-parse --git-path "$entry" 2>/dev/null || true)
+    state_path=$(gt_git_without_local_env -C "$path" rev-parse --git-path "$entry" 2>/dev/null) ||
+      return 1
     [[ -e "$state_path" ]] || continue
     printf '%s\n' "$label"
     return 0

@@ -7,26 +7,14 @@ PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
 
 _failures=0
-_temps=()
-
-_tmpdir() {
-  local dir
-  dir=$(mktemp -d)
-  _temps+=("$dir")
-  printf '%s\n' "$dir"
-}
+# shellcheck source=test/lib/test-temp.sh
+. "$ROOT/test/lib/test-temp.sh"
+gt_test_temp_init || exit 1
+_tmpdir() { gt_test_temp_dir; }
 
 _canonical_path() {
   (cd -P -- "$1" && pwd)
 }
-
-_cleanup() {
-  local dir
-  for dir in "${_temps[@]}"; do
-    rm -rf "$dir"
-  done
-}
-trap _cleanup EXIT
 
 _pass() {
   printf 'ok - %s\n' "$1"
@@ -77,6 +65,18 @@ _commit_file() {
   git -C "$repo" commit -m "$message" >/dev/null
 }
 
+_pr_land() {
+  local repo="$1"
+  local head_oid
+  shift
+  head_oid=${GH_PR_HEAD_OID:-}
+  if [[ -z "$head_oid" ]]; then
+    head_oid=$(git -C "$repo" rev-parse refs/remotes/origin/feature)
+  fi
+  (cd "$repo" && GH_TEST_REPO="$repo" GH_PR_HEAD_OID="$head_oid" \
+    "$ROOT/bin/git-pr-land" "$@")
+}
+
 _init_repo() {
   local repo="$1"
   local remote="$2"
@@ -87,7 +87,9 @@ _init_repo() {
   git -C "$repo" config user.name "Test"
   git -C "$repo" config core.hooksPath /dev/null
   _commit_file "$repo" README.md base base
-  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" config "url.$remote.insteadOf" \
+    https://github.test/example/repo.git
+  git -C "$repo" remote add origin https://github.test/example/repo.git
   git -C "$repo" push -u origin main >/dev/null 2>&1
   git -C "$repo" switch --quiet -c feature
   _commit_file "$repo" feature.txt feature feature
@@ -104,8 +106,44 @@ set -euo pipefail
 
 log="${GH_LOG:?}"
 state_file="${GH_STATE:-$log.state}"
+GH_PR_HEAD_OID=${GH_PR_HEAD_OID:-$(git rev-parse \
+  refs/remotes/origin/feature 2>/dev/null || git rev-parse refs/heads/feature)}
 
 if [[ "$1 $2" == "auth status" ]]; then
+  exit 0
+fi
+
+if [[ "$1 $2" == "repo view" ]]; then
+  printf 'example/repo\thttps://github.test/example/repo\n'
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr list" ]]; then
+  case "${GH_DELETE_INVENTORY:-empty}" in
+    empty)
+      ;;
+    dependent)
+      printf '5\tOPEN\tfalse\tCLEAN\tdependent\t2222222222222222222222222222222222222222\tfeature\texample/repo\tfalse\thttps://github.test/example/repo/pull/5\tNew dependent PR\n'
+      ;;
+    shared-head)
+      printf '5\tOPEN\tfalse\tCLEAN\tfeature\t2222222222222222222222222222222222222222\trelease\texample/repo\tfalse\thttps://github.test/example/repo/pull/5\tShared head PR\n'
+      ;;
+    unrelated)
+      printf '5\tOPEN\tfalse\tCLEAN\tsibling\t2222222222222222222222222222222222222222\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/5\tUnrelated sibling PR\n'
+      ;;
+    failure)
+      printf 'partial inventory\n'
+      exit 88
+      ;;
+    overflow)
+      index=1
+      while ((index <= 201)); do
+        printf '%s\tOPEN\tfalse\tCLEAN\tconsumer/%s\t2222222222222222222222222222222222222222\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/%s\tInventory PR\n' \
+          "$index" "$index" "$index"
+        index=$((index + 1))
+      done
+      ;;
+  esac
   exit 0
 fi
 
@@ -113,33 +151,80 @@ if [[ "$1 $2" == "pr view" ]]; then
   case "${GH_PR_CASE:-ready}" in
     ready)
       if [[ -f "$state_file" ]]; then
-        printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+        printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
       else
-        printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+        printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
       fi
       ;;
     pending)
-      printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
       ;;
     dirty)
-      printf '4\tOPEN\tfalse\tDIRTY\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      printf '4\tOPEN\tfalse\tDIRTY\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
       ;;
     merged-after-error)
       if [[ -f "$state_file" ]]; then
-        printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+        printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
       else
-        printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+        printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
       fi
       ;;
-    checkout-head-after-merge)
+    checkout-head-after-merge | advance-head-after-merge | advance-remote-after-merge | create-remote-after-merge)
       if [[ -f "$state_file" ]]; then
-        printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+        printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
       else
-        printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+        printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
       fi
       ;;
     queued)
-      printf '4\tOPEN\tfalse\tCLEAN\tfeature\tmain\thttps://example/pr/4\tFeature PR\n'
+      printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
+      ;;
+    fork)
+      if [[ -f "$state_file" ]]; then
+        printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\t%s\tmain\tforker/repo\ttrue\thttps://github.test/example/repo/pull/4\tFork PR\n' "$GH_PR_HEAD_OID"
+      else
+        printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\tforker/repo\ttrue\thttps://github.test/example/repo/pull/4\tFork PR\n' "$GH_PR_HEAD_OID"
+      fi
+      ;;
+    foreign-target)
+      printf '4\tOPEN\tfalse\tCLEAN\tforeign-head\t%s\tmain\tforeign/repo\tfalse\thttps://github.test/foreign/repo/pull/4\tForeign PR\n' "$GH_PR_HEAD_OID"
+      ;;
+    number-url-mismatch)
+      printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/5\tMismatched number\n' "$GH_PR_HEAD_OID"
+      ;;
+    explicit-target-rebound)
+      printf '5\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/5\tRebound PR\n' "$GH_PR_HEAD_OID"
+      ;;
+    branch-target-rebound)
+      printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tWrong branch PR\n' "$GH_PR_HEAD_OID"
+      ;;
+    post-action-rebound)
+      if [[ -f "$state_file" ]]; then
+        printf '5\tMERGED\tfalse\tUNKNOWN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/5\tRebound PR\n' "$GH_PR_HEAD_OID"
+      else
+        printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
+      fi
+      ;;
+    wrong-same-repo-head)
+      printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\tforeign/repo\tfalse\thttps://github.test/example/repo/pull/4\tWrong head repository\n' "$GH_PR_HEAD_OID"
+      ;;
+    wrong-cross-repo-head)
+      printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\ttrue\thttps://github.test/example/repo/pull/4\tWrong cross repository state\n' "$GH_PR_HEAD_OID"
+      ;;
+    malformed-draft)
+      printf '4\tOPEN\tmaybe\tCLEAN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tMalformed draft\n' "$GH_PR_HEAD_OID"
+      ;;
+    malformed-cross)
+      printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\tmaybe\thttps://github.test/example/repo/pull/4\tMalformed cross state\n' "$GH_PR_HEAD_OID"
+      ;;
+    malformed-head)
+      printf '4\tOPEN\tfalse\tCLEAN\tbad..head\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tMalformed head\n' "$GH_PR_HEAD_OID"
+      ;;
+    malformed-base)
+      printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tbad..base\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tMalformed base\n' "$GH_PR_HEAD_OID"
+      ;;
+    same-head-base)
+      printf '4\tOPEN\tfalse\tCLEAN\tmain\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tSame head and base\n' "$GH_PR_HEAD_OID"
       ;;
   esac
   exit 0
@@ -154,6 +239,10 @@ if [[ "$1 $2" == "pr checks" ]]; then
 fi
 
 if [[ "$1 $2" == "pr merge" ]]; then
+  if [[ -n "${GH_ROUTE_LOG:-}" ]]; then
+    printf 'repo=%s host=%s %s\n' \
+      "${GH_REPO:-}" "${GH_HOST:-}" "$*" >>"$GH_ROUTE_LOG"
+  fi
   printf '%s\n' "$*" >>"$log"
   case "${GH_PR_CASE:-ready}" in
     merged-after-error)
@@ -161,7 +250,28 @@ if [[ "$1 $2" == "pr merge" ]]; then
       exit 1
       ;;
     checkout-head-after-merge)
-      git -C "${GH_REPO:?}" worktree add "${GH_WORKTREE:?}" feature >/dev/null 2>&1
+      git -C "${GH_TEST_REPO:?}" worktree add "${GH_WORKTREE:?}" feature >/dev/null 2>&1
+      : >"$state_file"
+      ;;
+    advance-head-after-merge)
+      old=$(git -C "${GH_TEST_REPO:?}" rev-parse refs/heads/feature)
+      tree=$(git -C "$GH_TEST_REPO" rev-parse "$old^{tree}")
+      new=$(printf '%s\n' concurrent | git -C "$GH_TEST_REPO" commit-tree "$tree" -p "$old")
+      git -C "$GH_TEST_REPO" update-ref refs/heads/feature "$new" "$old"
+      printf '%s\n' "$new" >"${GH_ADVANCED_OID:?}"
+      : >"$state_file"
+      ;;
+    advance-remote-after-merge)
+      old=$(git -C "${GH_TEST_REPO:?}" rev-parse refs/remotes/origin/feature)
+      tree=$(git -C "$GH_TEST_REPO" rev-parse "$old^{tree}")
+      new=$(printf '%s\n' concurrent-remote | git -C "$GH_TEST_REPO" commit-tree "$tree" -p "$old")
+      git -C "$GH_TEST_REPO" push --quiet origin "$new:refs/heads/feature"
+      printf '%s\n' "$new" >"${GH_ADVANCED_OID:?}"
+      : >"$state_file"
+      ;;
+    create-remote-after-merge)
+      git -C "${GH_TEST_REPO:?}" push --quiet origin \
+        "refs/heads/feature:refs/heads/feature"
       : >"$state_file"
       ;;
     queued)
@@ -178,6 +288,92 @@ printf 'unexpected gh call: %s\n' "$*" >&2
 exit 99
 EOF
   chmod +x "$bin"
+  cat >"$dir/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Tests use local bare repositories behind GitHub-shaped configured URLs. Keep
+# the configured push URL visible to identity validation while real Git applies
+# its ordinary insteadOf rule to ls-remote and push operations.
+if [[ "${1:-} ${2:-} ${3:-} ${4:-}" == "remote get-url --push --all" ]] &&
+  [[ "${GIT_TEST_REAL_EFFECTIVE_PUSH_URL:-0}" != 1 ]]; then
+  remote=${5:-}
+  url=$(/usr/bin/git config --get-all "remote.$remote.pushurl" 2>/dev/null || true)
+  [[ -n "$url" ]] || url=$(/usr/bin/git config --get-all "remote.$remote.url")
+  printf '%s\n' "$url"
+  exit 0
+fi
+if [[ "${1:-} ${2:-} ${3:-}" == "remote get-url --all" ]]; then
+  /usr/bin/git config --get-all "remote.${4:-}.url"
+  exit $?
+fi
+if [[ "${1:-}" == -c && "${2:-}" == url.*.insteadOf=* &&
+  "${3:-}" == -c && "${4:-}" == url.*.pushInsteadOf=* ]]; then
+  pin=${2#url.}
+  target=${pin%%.insteadOf=*}
+  alias=${pin#*.insteadOf=}
+  shift 4
+  rewritten=()
+  for argument in "$@"; do
+    [[ "$argument" != "$alias" ]] || argument=$target
+    rewritten+=("$argument")
+  done
+  set -- "${rewritten[@]}"
+fi
+exec /usr/bin/git "$@"
+EOF
+  chmod +x "$dir/git"
+}
+
+_write_worktree_list_failure_git() {
+  cat >"$1/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == worktree && "${2:-}" == list ]]; then
+  exit 88
+fi
+if [[ "${1:-} ${2:-} ${3:-}" == "remote get-url --all" ]]; then
+  /usr/bin/git config --get-all "remote.${4:-}.url"
+  exit $?
+fi
+if [[ "${1:-}" == -c && "${2:-}" == url.*.insteadOf=* &&
+  "${3:-}" == -c && "${4:-}" == url.*.pushInsteadOf=* ]]; then
+  pin=${2#url.}
+  target=${pin%%.insteadOf=*}
+  alias=${pin#*.insteadOf=}
+  shift 4
+  rewritten=()
+  for argument in "$@"; do
+    [[ "$argument" != "$alias" ]] || argument=$target
+    rewritten+=("$argument")
+  done
+  set -- "${rewritten[@]}"
+fi
+exec /usr/bin/git "$@"
+EOF
+  chmod +x "$1/git"
+}
+
+_write_git_remote_ssh() {
+  cat >"$1" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+for argument in "$@"; do
+  [[ "$argument" != -G ]] || exit 1
+done
+command=""
+for argument in "$@"; do
+  command=$argument
+done
+case "$command" in
+  "git-upload-pack "*) exec /usr/bin/git-upload-pack "${GIT_TEST_SSH_REPO:?}" ;;
+  "git-receive-pack "*) exec /usr/bin/git-receive-pack "${GIT_TEST_SSH_REPO:?}" ;;
+esac
+printf 'unexpected ssh invocation: %s\n' "$*" >&2
+exit 99
+EOF
+  chmod +x "$1"
 }
 
 echo "=== git pr-land ==="
@@ -188,24 +384,484 @@ bin_dir=$(_tmpdir)
 log=$(_tmpdir)/gh.log
 _init_repo "$repo" "$remote"
 _write_gh_stub "$bin_dir"
+head_oid=$(git -C "$repo" rev-parse refs/remotes/origin/feature)
 
-result=$(GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-land 4 2>&1)
+result=$(GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 2>&1)
 _assert_contains "merges ready PR" "merging PR #4 with squash" "$result"
-_assert_eq "uses squash delete-branch merge" "pr merge 4 --squash --delete-branch" "$(cat "$log")"
+_assert_eq "uses squash merge without unleased server deletion" \
+  "pr merge 4 --squash --match-head-commit $head_oid --repo github.test/example/repo" \
+  "$(cat "$log")"
 _assert_eq "syncs base branch" "main" "$(git -C "$repo" branch --show-current)"
 if git -C "$repo" show-ref --verify --quiet refs/heads/feature; then
-  _fail "deletes local feature branch"
+  _pass "preserves local feature branch for manual cleanup"
 else
-  _pass "deletes local feature branch"
+  _fail "preserves local feature branch for manual cleanup"
 fi
+_assert_contains "reports manual local cleanup" \
+  "preserving local PR head feature at " \
+  "$result"
+if git -C "$remote" show-ref --verify --quiet refs/heads/feature; then
+  _pass "preserves remote feature branch for manual cleanup"
+else
+  _fail "preserves remote feature branch for manual cleanup"
+fi
+_assert_contains "reports manual remote cleanup candidate" \
+  "preserving remote PR head feature at $head_oid; delete it manually" \
+  "$result"
+
+_assert_final_inventory_preserves_branch() {
+  local inventory_case="$1" expected_message="$2"
+  local case_repo case_remote case_log case_output
+
+  case_repo=$(_tmpdir)
+  case_remote=$(_tmpdir)
+  case_log=$(_tmpdir)/gh.log
+  _init_repo "$case_repo" "$case_remote"
+  case_output=$(GH_DELETE_INVENTORY="$inventory_case" GH_LOG="$case_log" \
+    PATH="$bin_dir:$PATH" _pr_land "$case_repo" 4 2>&1)
+  _assert_contains "final inventory preserves branch: $inventory_case" \
+    "$expected_message" "$case_output"
+  if git -C "$case_remote" show-ref --verify --quiet refs/heads/feature; then
+    _pass "final inventory keeps remote branch: $inventory_case"
+  else
+    _fail "final inventory keeps remote branch: $inventory_case"
+  fi
+}
+
+_assert_final_inventory_preserves_branch dependent \
+  "delete it manually after verifying no pull request consumes it"
+_assert_final_inventory_preserves_branch shared-head \
+  "delete it manually after verifying no pull request consumes it"
+_assert_final_inventory_preserves_branch failure \
+  "delete it manually after verifying no pull request consumes it"
+_assert_final_inventory_preserves_branch overflow \
+  "delete it manually after verifying no pull request consumes it"
+
+unrelated_repo=$(_tmpdir)
+unrelated_remote=$(_tmpdir)
+unrelated_log=$(_tmpdir)/gh.log
+_init_repo "$unrelated_repo" "$unrelated_remote"
+GH_DELETE_INVENTORY=unrelated GH_LOG="$unrelated_log" PATH="$bin_dir:$PATH" \
+  _pr_land "$unrelated_repo" 4 >/dev/null 2>&1
+if git -C "$unrelated_remote" show-ref --verify --quiet refs/heads/feature; then
+  _pass "unrelated new PR cannot trigger automatic branch cleanup"
+else
+  _fail "unrelated new PR cannot trigger automatic branch cleanup"
+fi
+
+ambient_repo=$(_tmpdir)
+ambient_origin=$(_tmpdir)
+ambient_bin=$(_tmpdir)
+ambient_log=$(_tmpdir)/gh.log
+ambient_route_log=$(_tmpdir)/route.log
+_init_repo "$ambient_repo" "$ambient_origin"
+_write_gh_stub "$ambient_bin"
+ambient_head_oid=$(git -C "$ambient_repo" rev-parse refs/remotes/origin/feature)
+ambient_output=$(GH_REPO=github.test/foreign/repo GH_HOST=foreign.test \
+  GH_LOG="$ambient_log" GH_ROUTE_LOG="$ambient_route_log" \
+  PATH="$ambient_bin:$PATH" _pr_land "$ambient_repo" 4 2>&1)
+_assert_contains "ambient routing cannot redirect numeric landing" \
+  "landed PR #4" "$ambient_output"
+_assert_contains "merge mutation is pinned to the checkout repository" \
+  "repo=github.test/example/repo host=github.test pr merge 4 --squash --match-head-commit $ambient_head_oid" \
+  "$(<"$ambient_route_log")"
+
+# Base tracking configuration is not trusted for an irreversible merge. Resolve
+# the unique fetch remote mapped to the checkout repository instead.
+base_route_repo=$(_tmpdir)
+base_route_origin=$(_tmpdir)
+base_route_other=$(_tmpdir)
+base_route_bin=$(_tmpdir)
+base_route_log=$(_tmpdir)/gh.log
+_init_repo "$base_route_repo" "$base_route_origin"
+git init -q --bare --initial-branch=main "$base_route_other"
+git -C "$base_route_repo" config "url.$base_route_other.insteadOf" \
+  https://github.test/other/repo.git
+git -C "$base_route_repo" remote add other https://github.test/other/repo.git
+git -C "$base_route_repo" config branch.main.remote other
+_write_gh_stub "$base_route_bin"
+base_route_output=$(GH_LOG="$base_route_log" PATH="$base_route_bin:$PATH" \
+  _pr_land "$base_route_repo" 4 2>&1)
+_assert_contains "landing ignores a mismatched base tracking remote" \
+  "syncing main from origin" "$base_route_output"
+_assert_contains "landing with mismatched tracking still completes" \
+  "landed PR #4" "$base_route_output"
+
+# Base preflight and synchronization must fetch refs/heads/main from the exact
+# validated repository URL. A named remote refspec maps a decoy branch onto the
+# usual tracking name, while colliding tags try to capture every historical
+# short spelling used by the implementation.
+exact_base_repo=$(_tmpdir)
+exact_base_remote=$(_tmpdir)
+exact_base_updater=$(_tmpdir)
+exact_base_log=$(_tmpdir)/gh.log
+_init_repo "$exact_base_repo" "$exact_base_remote"
+git -C "$exact_base_repo" push -q origin \
+  refs/heads/main:refs/heads/decoy
+git clone -q "$exact_base_remote" "$exact_base_updater"
+git -C "$exact_base_updater" config user.email test@test.com
+git -C "$exact_base_updater" config user.name Test
+git -C "$exact_base_updater" config core.hooksPath /dev/null
+_commit_file "$exact_base_updater" base-advance.txt advanced "advance base"
+git -C "$exact_base_updater" push -q origin main
+exact_remote_main=$(git -C "$exact_base_remote" rev-parse refs/heads/main)
+git -C "$exact_base_repo" config --unset-all remote.origin.fetch
+git -C "$exact_base_repo" config --add remote.origin.fetch \
+  '+refs/heads/decoy:refs/remotes/origin/main'
+git -C "$exact_base_repo" tag main refs/heads/feature
+git -C "$exact_base_repo" tag origin/main refs/heads/feature
+git -C "$exact_base_repo" tag upstream/main refs/heads/feature
+exact_base_output=$(GH_LOG="$exact_base_log" PATH="$bin_dir:$PATH" \
+  _pr_land "$exact_base_repo" 4 2>&1)
+_assert_contains "exact base fetch lands despite refspec and tag collisions" \
+  "landed PR #4" "$exact_base_output"
+_assert_eq "post-merge sync uses the exact remote main OID" \
+  "$exact_remote_main" \
+  "$(git -C "$exact_base_repo" rev-parse refs/heads/main)"
+
+foreign_repo=$(_tmpdir)
+foreign_origin=$(_tmpdir)
+foreign_bin=$(_tmpdir)
+foreign_log=$(_tmpdir)/gh.log
+_init_repo "$foreign_repo" "$foreign_origin"
+_write_gh_stub "$foreign_bin"
+foreign_rc=0
+foreign_output=$(GH_LOG="$foreign_log" GH_PR_CASE=foreign-target \
+  GT_CURRENT_REPO_IDENTITY=github.test/foreign/repo \
+  PATH="$foreign_bin:$PATH" _pr_land "$foreign_repo" \
+  https://github.test/foreign/repo/pull/4 2>&1) || foreign_rc=$?
+_assert_contains "foreign same-number PR URL is rejected" \
+  "target pull request belongs to a different repository" "$foreign_output"
+if [[ "$foreign_rc" != 0 && ! -e "$foreign_log" ]]; then
+  _pass "foreign PR URL causes no GitHub mutation"
+else
+  _fail "foreign PR URL causes no GitHub mutation"
+fi
+
+_assert_rejected_record_before_merge() {
+  local case_name="$1"
+  local target="${2:-4}"
+  local case_repo case_origin case_bin case_log case_rc=0
+
+  case_repo=$(_tmpdir)
+  case_origin=$(_tmpdir)
+  case_bin=$(_tmpdir)
+  case_log=$(_tmpdir)/gh.log
+  _init_repo "$case_repo" "$case_origin"
+  _write_gh_stub "$case_bin"
+  GH_LOG="$case_log" GH_PR_CASE="$case_name" PATH="$case_bin:$PATH" \
+    _pr_land "$case_repo" "$target" >/dev/null 2>&1 || case_rc=$?
+  if [[ "$case_rc" != 0 && ! -e "$case_log" ]]; then
+    _pass "rejects malformed PR before merge: $case_name"
+  else
+    _fail "rejects malformed PR before merge: $case_name"
+  fi
+  _assert_eq "malformed PR preserves remote main: $case_name" \
+    "$(git -C "$case_repo" rev-parse refs/remotes/origin/main)" \
+    "$(git -C "$case_origin" rev-parse refs/heads/main)"
+}
+
+for malformed_case in number-url-mismatch explicit-target-rebound \
+  wrong-same-repo-head wrong-cross-repo-head malformed-draft malformed-cross \
+  malformed-head malformed-base same-head-base; do
+  _assert_rejected_record_before_merge "$malformed_case"
+done
+
+_assert_rejected_record_before_merge branch-target-rebound feature/expected
+_assert_rejected_record_before_merge branch-target-rebound example:feature
+
+expected_repo=$(_tmpdir)
+expected_origin=$(_tmpdir)
+expected_bin=$(_tmpdir)
+expected_log=$(_tmpdir)/gh.log
+_init_repo "$expected_repo" "$expected_origin"
+_write_gh_stub "$expected_bin"
+expected_head_oid=$(git -C "$expected_repo" rev-parse refs/remotes/origin/feature)
+expected_rc=0
+GH_LOG="$expected_log" PATH="$expected_bin:$PATH" \
+  _pr_land "$expected_repo" 4 \
+  --expect-topology "$(printf '4\tfeature\t%s\trelease\texample/repo\tfalse\thttps://github.test/example/repo/pull/4' "$expected_head_oid")" \
+  >/dev/null 2>&1 || expected_rc=$?
+_assert_eq "stale expected landing topology exits nonzero" "1" "$expected_rc"
+if [[ ! -e "$expected_log" ]]; then
+  _pass "stale expected landing topology causes no merge"
+else
+  _fail "stale expected landing topology causes no merge"
+fi
+
+post_repo=$(_tmpdir)
+post_origin=$(_tmpdir)
+post_bin=$(_tmpdir)
+post_log=$(_tmpdir)/gh.log
+post_state=$(_tmpdir)/state
+_init_repo "$post_repo" "$post_origin"
+post_feature_before=$(git -C "$post_origin" rev-parse refs/heads/feature)
+_write_gh_stub "$post_bin"
+post_rc=0
+GH_LOG="$post_log" GH_STATE="$post_state" \
+  GH_PR_CASE=post-action-rebound PATH="$post_bin:$PATH" \
+  _pr_land "$post_repo" 4 >/dev/null 2>&1 || post_rc=$?
+_assert_eq "post-action rebound stops landing" "1" "$post_rc"
+_assert_eq "post-action rebound performs only the intended merge" \
+  "pr merge 4 --squash --match-head-commit $post_feature_before --repo github.test/example/repo" \
+  "$(cat "$post_log")"
+_assert_eq "post-action rebound preserves remote cleanup target" \
+  "$post_feature_before" \
+  "$(git -C "$post_origin" rev-parse refs/heads/feature 2>/dev/null || printf missing)"
+
+# A fork PR's head name is not proof that the base repository's same-named ref
+# is the PR head. With no configured remote mapping to the fork repository,
+# preserve remote state and report the conservative skip.
+fork_repo=$(_tmpdir)
+fork_origin=$(_tmpdir)
+fork_bin=$(_tmpdir)
+fork_log=$(_tmpdir)/gh.log
+_init_repo "$fork_repo" "$fork_origin"
+_write_gh_stub "$fork_bin"
+fork_origin_before=$(git -C "$fork_origin" rev-parse refs/heads/feature)
+fork_output=$(GH_LOG="$fork_log" GH_PR_CASE=fork \
+  PATH="$fork_bin:$PATH" _pr_land "$fork_repo" 4 2>&1)
+fork_rc=$?
+_assert_eq "fork head: landing completes conservatively" "0" "$fork_rc"
+_assert_contains "fork head: reports unmapped remote preservation" \
+  "preserving remote PR head feature; no configured remote maps to forker/repo" \
+  "$fork_output"
+_assert_eq "fork head: preserves same-named base-repository branch" \
+  "$fork_origin_before" \
+  "$(git -C "$fork_origin" rev-parse refs/heads/feature)"
+
+# When a configured remote maps exactly to the fork repository, clean up that
+# push target with a lease while still preserving the base repository collision.
+mapped_fork_repo=$(_tmpdir)
+mapped_fork_origin=$(_tmpdir)
+mapped_fork_remote=$(_tmpdir)
+mapped_fork_bin=$(_tmpdir)
+mapped_fork_log=$(_tmpdir)/gh.log
+_init_repo "$mapped_fork_repo" "$mapped_fork_origin"
+git init -q --bare --initial-branch=main "$mapped_fork_remote"
+git -C "$mapped_fork_repo" config "url.$mapped_fork_remote.insteadOf" \
+  https://github.test/forker/repo.git
+git -C "$mapped_fork_repo" remote add fork \
+  https://github.test/forker/repo.git
+git -C "$mapped_fork_repo" push --quiet fork feature
+git -C "$mapped_fork_repo" config branch.feature.remote fork
+_write_gh_stub "$mapped_fork_bin"
+mapped_origin_before=$(git -C "$mapped_fork_origin" rev-parse refs/heads/feature)
+mapped_fork_output=$(GH_LOG="$mapped_fork_log" GH_PR_CASE=fork \
+  PATH="$mapped_fork_bin:$PATH" _pr_land "$mapped_fork_repo" 4 2>&1)
+mapped_fork_rc=$?
+_assert_eq "mapped fork head: landing completes" "0" "$mapped_fork_rc"
+_assert_contains "mapped fork head: reports completion" \
+  "landed PR #4" "$mapped_fork_output"
+_assert_eq "mapped fork head: preserves base-repository collision" \
+  "$mapped_origin_before" \
+  "$(git -C "$mapped_fork_origin" rev-parse refs/heads/feature)"
+if git -C "$mapped_fork_remote" show-ref --verify --quiet refs/heads/feature; then
+  _pass "mapped fork head: preserves exact fork remote branch"
+else
+  _fail "mapped fork head: preserves exact fork remote branch"
+fi
+
+# Git URL rewrite rules apply after the configured remote URL is read. Never
+# trust an effective push target whose normalized repository identity differs
+# from the structured PR head repository.
+redirect_repo=$(_tmpdir)
+redirect_origin=$(_tmpdir)
+redirect_unrelated=$(_tmpdir)
+redirect_bin=$(_tmpdir)
+redirect_log=$(_tmpdir)/gh.log
+_init_repo "$redirect_repo" "$redirect_origin"
+git init -q --bare --initial-branch=main "$redirect_unrelated"
+git -C "$redirect_repo" push --quiet "$redirect_unrelated" \
+  refs/heads/feature:refs/heads/feature
+redirect_before=$(git -C "$redirect_unrelated" rev-parse refs/heads/feature)
+git -C "$redirect_repo" config \
+  "url.$redirect_unrelated.pushInsteadOf" \
+  https://github.test/example/repo.git
+_write_gh_stub "$redirect_bin"
+redirect_output=$(GH_LOG="$redirect_log" PATH="$redirect_bin:$PATH" \
+  GIT_TEST_REAL_EFFECTIVE_PUSH_URL=1 \
+  _pr_land "$redirect_repo" 4 2>&1)
+_assert_contains "pushInsteadOf mismatch: reports conservative preservation" \
+  "preserving remote PR head feature; no configured remote maps to example/repo" \
+  "$redirect_output"
+_assert_eq "pushInsteadOf mismatch: preserves unrelated same-named branch" \
+  "$redirect_before" \
+  "$(git -C "$redirect_unrelated" rev-parse refs/heads/feature)"
+
+# Passing a once-expanded URL back to Git without an exact self-pin applies a
+# second pushInsteadOf rewrite and can target another repository.
+chain_repo=$(_tmpdir)
+chain_expected=$(_tmpdir)
+chain_unrelated=$(_tmpdir)
+chain_bin=$(_tmpdir)
+chain_log=$(_tmpdir)/gh.log
+chain_ssh=$(_tmpdir)/ssh
+_init_repo "$chain_repo" "$chain_expected"
+git init -q --bare --initial-branch=main "$chain_unrelated"
+git -C "$chain_repo" push --quiet "$chain_unrelated" \
+  refs/heads/feature:refs/heads/feature
+chain_unrelated_before=$(git -C "$chain_unrelated" rev-parse refs/heads/feature)
+chain_url=https://github.test/example/repo.git
+chain_effective=ssh://git@github.test/example/repo.git
+git -C "$chain_repo" remote set-url origin "$chain_url"
+git -C "$chain_repo" config "url.$chain_effective.pushInsteadOf" "$chain_url"
+_write_gh_stub "$chain_bin"
+rm -f "$chain_bin/git"
+_write_git_remote_ssh "$chain_ssh"
+chain_parameters="'url.file://$chain_unrelated.insteadOf'='$chain_effective' "
+chain_parameters+="'url.file://$chain_unrelated.pushInsteadOf'='$chain_effective'"
+git -C "$chain_repo" remote add chain-probe "$chain_effective"
+chain_bad_probe=$(GIT_CONFIG_PARAMETERS="$chain_parameters" /usr/bin/git \
+  -C "$chain_repo" remote get-url --push chain-probe)
+_assert_eq "chained pushInsteadOf fixture supplies an inherited rewrite" \
+  "file://$chain_unrelated" "$chain_bad_probe"
+
+pin_repo=$(_tmpdir)
+pin_expected=$(_tmpdir)
+pin_unrelated=$(_tmpdir)
+git init -q "$pin_repo"
+git init -q --bare --initial-branch=main "$pin_expected"
+git init -q --bare --initial-branch=main "$pin_unrelated"
+git -C "$chain_repo" push --quiet "$pin_expected" \
+  refs/heads/feature:refs/heads/feature
+git -C "$chain_repo" push --quiet "$pin_unrelated" \
+  refs/heads/feature:refs/heads/feature
+pin_oid=$(git -C "$pin_expected" rev-parse refs/heads/feature)
+pin_parameters="'url.file://$pin_unrelated.insteadOf'='$chain_effective' "
+pin_parameters+="'url.file://$pin_unrelated.pushInsteadOf'='$chain_effective'"
+(cd "$pin_repo" && GIT_CONFIG_PARAMETERS="$pin_parameters" \
+  GIT_SSH_COMMAND="$chain_ssh" GIT_TEST_SSH_REPO="$pin_expected" \
+  ROOT="$ROOT" PIN_URL="$chain_effective" PIN_OID="$pin_oid" \
+  /bin/bash -c '. "$ROOT/lib/git-tools-base.sh"; gt_push_exact_url "$PIN_URL" "--force-with-lease=refs/heads/feature:$PIN_OID" ":refs/heads/feature"') \
+  >/dev/null 2>&1 || true
+_assert_eq "exact URL push preserves an inherited rewrite target" "$pin_oid" \
+  "$(git -C "$pin_unrelated" rev-parse --verify refs/heads/feature \
+    2>/dev/null || printf missing)"
+if git -C "$pin_expected" show-ref --verify --quiet refs/heads/feature; then
+  _fail "exact URL push reaches the validated target"
+else
+  _pass "exact URL push reaches the validated target"
+fi
+chain_rc=0
+chain_output=$(cd "$chain_repo" &&
+  GH_LOG="$chain_log" PATH="$chain_bin:$ROOT/bin:$PATH" \
+    GIT_SSH_COMMAND="$chain_ssh" \
+    GIT_TEST_SSH_REPO="$chain_expected" \
+    /usr/bin/git \
+    -c "url.file://$chain_unrelated.insteadOf=$chain_effective" \
+    -c "url.file://$chain_unrelated.pushInsteadOf=$chain_effective" \
+    pr-land 4 2>&1) || chain_rc=$?
+_assert_eq "chained pushInsteadOf: rejects a redirected base remote" "1" "$chain_rc"
+_assert_contains "chained pushInsteadOf: reports repository mismatch" \
+  "could not resolve one exact fetch remote for the base repository" "$chain_output"
+_assert_eq "chained pushInsteadOf: preserves the second rewrite target" \
+  "$chain_unrelated_before" \
+  "$(git -C "$chain_unrelated" rev-parse --verify refs/heads/feature \
+    2>/dev/null || printf missing)"
+if git -C "$chain_expected" show-ref --verify --quiet refs/heads/feature; then
+  _pass "chained pushInsteadOf: preserves the expected target"
+else
+  _fail "chained pushInsteadOf: preserves the expected target"
+fi
+
+# `git push <remote>` writes to every configured push URL. Multiple targets are
+# therefore never eligible for automatic cleanup, even when names normalize to
+# the expected repository identity.
+multi_repo=$(_tmpdir)
+multi_origin=$(_tmpdir)
+multi_bin=$(_tmpdir)
+multi_log=$(_tmpdir)/gh.log
+_init_repo "$multi_repo" "$multi_origin"
+multi_before=$(git -C "$multi_origin" rev-parse refs/heads/feature)
+git -C "$multi_repo" config --add remote.origin.pushurl \
+  https://github.test/example/repo.git
+git -C "$multi_repo" config --add remote.origin.pushurl \
+  ssh://git@github.test/example/repo.git
+_write_gh_stub "$multi_bin"
+multi_output=$(GH_LOG="$multi_log" PATH="$multi_bin:$PATH" \
+  _pr_land "$multi_repo" 4 2>&1)
+_assert_contains "multiple push URLs: reports conservative preservation" \
+  "preserving remote PR head feature; no configured remote maps to example/repo" \
+  "$multi_output"
+_assert_eq "multiple push URLs: preserves the remote branch" "$multi_before" \
+  "$(git -C "$multi_origin" rev-parse refs/heads/feature)"
+
+# A checkout can resolve a branch before it exposes either a changed worktree
+# inventory or HEAD.lock. Stalling that checkout in a smudge filter proves the
+# landing command never removes the local ref out from under it.
+checkout_repo=$(_tmpdir)
+checkout_origin=$(_tmpdir)
+checkout_bin=$(_tmpdir)
+checkout_log=$(_tmpdir)/gh.log
+checkout_worktree=$(_tmpdir)
+checkout_state=$(_tmpdir)
+_init_repo "$checkout_repo" "$checkout_origin"
+git -C "$checkout_repo" switch --quiet feature
+printf 'feature.txt filter=stall\n' >"$checkout_repo/.gitattributes"
+git -C "$checkout_repo" add .gitattributes
+git -C "$checkout_repo" commit -q -m "configure checkout filter"
+git -C "$checkout_repo" push --quiet origin feature
+git -C "$checkout_repo" switch --quiet -c runner main
+git -C "$checkout_repo" worktree add --quiet -b observer \
+  "$checkout_worktree" main
+cat >"$checkout_state/smudge" <<'EOF'
+#!/usr/bin/env bash
+set -e
+buffer=$(mktemp)
+cat >"$buffer"
+: >"$STALL_STARTED"
+while [[ ! -e "$STALL_RELEASE" ]]; do sleep 0.01; done
+cat "$buffer"
+rm -f -- "$buffer"
+EOF
+chmod +x "$checkout_state/smudge"
+git -C "$checkout_repo" config filter.stall.smudge "$checkout_state/smudge"
+git -C "$checkout_repo" config filter.stall.clean cat
+git -C "$checkout_repo" config filter.stall.required true
+(
+  set +e
+  STALL_STARTED="$checkout_state/started" \
+    STALL_RELEASE="$checkout_state/release" \
+    git -C "$checkout_worktree" switch feature \
+    >"$checkout_state/switch.out" 2>&1
+  printf '%s\n' "$?" >"$checkout_state/switch.rc"
+) &
+checkout_pid=$!
+checkout_wait=0
+while ((checkout_wait < 500)); do
+  [[ -e "$checkout_state/started" ]] && break
+  sleep 0.01
+  checkout_wait=$((checkout_wait + 1))
+done
+if [[ ! -e "$checkout_state/started" ]]; then
+  _fail "in-flight checkout reaches deterministic stall"
+  : >"$checkout_state/release"
+else
+  _pass "in-flight checkout reaches deterministic stall"
+fi
+_write_gh_stub "$checkout_bin"
+checkout_output=$(GH_LOG="$checkout_log" PATH="$checkout_bin:$PATH" \
+  _pr_land "$checkout_repo" 4 2>&1)
+: >"$checkout_state/release"
+wait "$checkout_pid"
+_assert_eq "in-flight checkout completes" "0" "$(cat "$checkout_state/switch.rc")"
+_assert_eq "in-flight checkout retains a resolvable HEAD" \
+  "$(git -C "$checkout_repo" rev-parse refs/heads/feature)" \
+  "$(git -C "$checkout_worktree" rev-parse HEAD)"
+_assert_contains "in-flight checkout reports local preservation" \
+  "preserving local PR head feature" "$checkout_output"
 
 repo_keep=$(_tmpdir)
 remote_keep=$(_tmpdir)
 log_keep=$(_tmpdir)/gh.log
 _init_repo "$repo_keep" "$remote_keep"
-result=$(GH_LOG="$log_keep" PATH="$bin_dir:$PATH" git -C "$repo_keep" pr-land 4 --method merge --keep-branch 2>&1)
+keep_head_oid=$(git -C "$repo_keep" rev-parse refs/remotes/origin/feature)
+result=$(GH_LOG="$log_keep" PATH="$bin_dir:$PATH" _pr_land "$repo_keep" 4 --method merge --keep-branch 2>&1)
 _assert_contains "supports merge method" "merging PR #4 with merge" "$result"
-_assert_eq "keep branch omits delete flag" "pr merge 4 --merge" "$(cat "$log_keep")"
+_assert_eq "keep branch omits delete flag" \
+  "pr merge 4 --merge --match-head-commit $keep_head_oid --repo github.test/example/repo" \
+  "$(cat "$log_keep")"
 if git -C "$repo_keep" show-ref --verify --quiet refs/heads/feature; then
   _pass "keep branch preserves local branch"
 else
@@ -216,9 +872,9 @@ repo_dry=$(_tmpdir)
 remote_dry=$(_tmpdir)
 log_dry=$(_tmpdir)/gh.log
 _init_repo "$repo_dry" "$remote_dry"
-result=$(GH_LOG="$log_dry" PATH="$bin_dir:$PATH" git -C "$repo_dry" pr-land 4 --dry-run 2>&1)
+result=$(GH_LOG="$log_dry" PATH="$bin_dir:$PATH" _pr_land "$repo_dry" 4 --dry-run 2>&1)
 rc=$?
-_assert_contains "dry run prints merge command" "would run: gh pr merge 4 --squash --delete-branch" "$result"
+_assert_contains "dry run prints merge command" "would run: gh pr merge 4 --squash" "$result"
 _assert_eq "dry run succeeds" "0" "$rc"
 _assert_eq "dry run keeps branch checked out" "feature" "$(git -C "$repo_dry" branch --show-current)"
 
@@ -238,7 +894,7 @@ git -C "$updater_dry_linked" push --quiet origin main
 git -C "$repo_dry_linked" fetch --quiet origin
 dry_linked_base_before=$(git -C "$main_dry_linked" rev-parse HEAD)
 result=$(GH_LOG="$log_dry_linked" PATH="$bin_dir:$PATH" \
-  git -C "$repo_dry_linked" pr-land 4 --dry-run --keep-branch 2>&1)
+  _pr_land "$repo_dry_linked" 4 --dry-run --keep-branch 2>&1)
 rc=$?
 _assert_eq "linked base dry run: succeeds" "0" "$rc"
 _assert_contains "linked base dry run: prints external fast-forward" \
@@ -248,50 +904,27 @@ _assert_eq "linked base dry run: does not advance base" \
 _assert_eq "linked base dry run: leaves base worktree on main" \
   "main" "$(git -C "$main_dry_linked" branch --show-current)"
 
-repo_linked=$(_tmpdir)
-remote_linked=$(_tmpdir)
-feature_linked=$(_tmpdir)
-log_linked=$(_tmpdir)/gh.log
-_init_repo "$repo_linked" "$remote_linked"
-git -C "$repo_linked" switch --quiet main
-git -C "$repo_linked" worktree add --quiet "$feature_linked" feature
-
-result=$(GH_LOG="$log_linked" PATH="$bin_dir:$PATH" git -C "$feature_linked" pr-land 4 2>&1)
-rc=$?
-_assert_eq "linked feature: refuses unsafe cleanup before merge" "1" "$rc"
-_assert_contains "linked feature: explains base ownership" \
-  "cannot delete feature while main is checked out in $(_canonical_path "$repo_linked")" "$result"
-if [[ -s "$log_linked" ]]; then
-  _fail "linked feature: does not merge before refusal"
+repo_enumeration=$(_tmpdir)
+remote_enumeration=$(_tmpdir)
+main_enumeration=$(_tmpdir)
+enumeration_bin=$(_tmpdir)
+log_enumeration=$(_tmpdir)/gh.log
+_init_repo "$repo_enumeration" "$remote_enumeration"
+git -C "$repo_enumeration" worktree add --quiet "$main_enumeration" main
+printf 'dirty\n' >"$main_enumeration/untracked"
+_write_worktree_list_failure_git "$enumeration_bin"
+rc=0
+result=$(cd "$repo_enumeration" &&
+  GH_LOG="$log_enumeration" \
+    PATH="$enumeration_bin:$bin_dir:$ROOT/bin:/usr/bin:/bin" \
+    "$ROOT/bin/git-pr-land" 4 2>&1) || rc=$?
+_assert_eq "worktree enumeration failure: refuses before merge" "1" "$rc"
+_assert_contains "worktree enumeration failure: reports preflight failure" \
+  "could not inspect worktrees" "$result"
+if [[ -s "$log_enumeration" ]]; then
+  _fail "worktree enumeration failure: does not merge"
 else
-  _pass "linked feature: does not merge before refusal"
-fi
-
-result=$(GH_LOG="$log_linked" PATH="$bin_dir:$PATH" git -C "$feature_linked" pr-land 4 --keep-branch 2>&1)
-rc=$?
-_assert_eq "linked feature keep: lands successfully" "0" "$rc"
-_assert_contains "linked feature keep: reports landed" "landed PR #4" "$result"
-_assert_eq "linked feature keep: leaves base in owning worktree" \
-  "main" "$(git -C "$repo_linked" branch --show-current)"
-_assert_eq "linked feature keep: preserves feature worktree" \
-  "feature" "$(git -C "$feature_linked" branch --show-current)"
-
-repo_head_linked=$(_tmpdir)
-remote_head_linked=$(_tmpdir)
-feature_head_linked=$(_tmpdir)
-log_head_linked=$(_tmpdir)/gh.log
-_init_repo "$repo_head_linked" "$remote_head_linked"
-git -C "$repo_head_linked" switch --quiet main
-git -C "$repo_head_linked" worktree add --quiet "$feature_head_linked" feature
-result=$(GH_LOG="$log_head_linked" PATH="$bin_dir:$PATH" git -C "$repo_head_linked" pr-land 4 2>&1)
-rc=$?
-_assert_eq "linked head: refuses unsafe cleanup before merge" "1" "$rc"
-_assert_contains "linked head: explains branch ownership" \
-  "PR branch is checked out in another worktree: $(_canonical_path "$feature_head_linked")" "$result"
-if [[ -s "$log_head_linked" ]]; then
-  _fail "linked head: does not merge before refusal"
-else
-  _pass "linked head: does not merge before refusal"
+  _pass "worktree enumeration failure: does not merge"
 fi
 
 repo_ambiguous=$(_tmpdir)
@@ -300,7 +933,7 @@ log_ambiguous=$(_tmpdir)/gh.log
 state_ambiguous=$(_tmpdir)/merged
 _init_repo "$repo_ambiguous" "$remote_ambiguous"
 result=$(GH_PR_CASE=merged-after-error GH_STATE="$state_ambiguous" GH_LOG="$log_ambiguous" \
-  PATH="$bin_dir:$PATH" git -C "$repo_ambiguous" pr-land 4 2>&1)
+  PATH="$bin_dir:$PATH" _pr_land "$repo_ambiguous" 4 2>&1)
 rc=$?
 _assert_eq "ambiguous merge: reconciles merged state" "0" "$rc"
 _assert_contains "ambiguous merge: reports verified server state" \
@@ -312,7 +945,7 @@ remote_queued=$(_tmpdir)
 log_queued=$(_tmpdir)/gh.log
 _init_repo "$repo_queued" "$remote_queued"
 result=$(GH_PR_CASE=queued GH_LOG="$log_queued" PATH="$bin_dir:$PATH" \
-  git -C "$repo_queued" pr-land 4 2>&1)
+  _pr_land "$repo_queued" 4 2>&1)
 rc=$?
 _assert_eq "queued merge: exits nonzero while PR remains open" "1" "$rc"
 _assert_contains "queued merge: reports unmerged server state" \
@@ -336,7 +969,7 @@ git -C "$main_rebase" push --quiet origin main
 git -C "$main_rebase" rebase --exec false HEAD~1 >/dev/null 2>&1 || true
 _assert_eq "rebase reservation fixture: worktree status remains clean" \
   "" "$(git -C "$main_rebase" status --porcelain)"
-result=$(GH_LOG="$log_rebase" PATH="$bin_dir:$PATH" git -C "$repo_rebase" pr-land 4 2>&1)
+result=$(GH_LOG="$log_rebase" PATH="$bin_dir:$PATH" _pr_land "$repo_rebase" 4 2>&1)
 rc=$?
 _assert_eq "rebase reservation: refuses before merge" "1" "$rc"
 _assert_contains "rebase reservation: reports base operation" \
@@ -360,7 +993,7 @@ git -C "$main_bisect" push --quiet origin main
 git -C "$main_bisect" bisect start HEAD HEAD~3 >/dev/null
 _assert_eq "bisect reservation fixture: worktree status remains clean" \
   "" "$(git -C "$main_bisect" status --porcelain)"
-result=$(GH_LOG="$log_bisect" PATH="$bin_dir:$PATH" git -C "$repo_bisect" pr-land 4 2>&1)
+result=$(GH_LOG="$log_bisect" PATH="$bin_dir:$PATH" _pr_land "$repo_bisect" 4 2>&1)
 rc=$?
 _assert_eq "bisect reservation: refuses before merge" "1" "$rc"
 _assert_contains "bisect reservation: reports base operation" \
@@ -371,30 +1004,338 @@ else
   _pass "bisect reservation: does not merge before refusal"
 fi
 
+# Preserve a terminal newline in the path of the current worktree. This path
+# is used both for ownership comparison and operation-state checks.
+newline_parent=$(_tmpdir)
+repo_newline="$newline_parent/current"$'\n'
+remote_newline=$(_tmpdir)
+log_newline=$(_tmpdir)/gh.log
+_init_repo "$repo_newline" "$remote_newline"
+result=$(GH_LOG="$log_newline" PATH="$bin_dir:$ROOT/bin:/usr/bin:/bin" \
+  _pr_land "$repo_newline" 4 2>&1)
+rc=$?
+_assert_eq "terminal-newline current worktree lands successfully" "0" "$rc"
+_assert_contains "terminal-newline current worktree reports landed" \
+  "landed PR #4" "$result"
+
+for current_operation in rebase bisect; do
+  operation_parent=$(_tmpdir)
+  operation_repo="$operation_parent/current-$current_operation"$'\n'
+  operation_remote=$(_tmpdir)
+  operation_log=$(_tmpdir)/gh.log
+  _init_repo "$operation_repo" "$operation_remote"
+  if [[ "$current_operation" == rebase ]]; then
+    git -C "$operation_repo" rebase --exec false HEAD~1 >/dev/null 2>&1 || true
+  else
+    _commit_file "$operation_repo" bisect-2.txt two two
+    _commit_file "$operation_repo" bisect-3.txt three three
+    git -C "$operation_repo" bisect start HEAD HEAD~2 >/dev/null
+  fi
+  _assert_eq "terminal-newline $current_operation fixture remains clean" "" \
+    "$(git -C "$operation_repo" status --porcelain)"
+  result=$(GH_LOG="$operation_log" PATH="$bin_dir:$ROOT/bin:/usr/bin:/bin" \
+    _pr_land "$operation_repo" 4 --keep-branch 2>&1)
+  rc=$?
+  _assert_eq "terminal-newline current $current_operation refuses before merge" "1" "$rc"
+  _assert_contains "terminal-newline current $current_operation reports operation" \
+    "current worktree has $current_operation in progress: ${operation_repo%$'\n'}" "$result"
+  if [[ -s "$operation_log" ]]; then
+    _fail "terminal-newline current $current_operation does not merge before refusal"
+  else
+    _pass "terminal-newline current $current_operation does not merge before refusal"
+  fi
+done
+
 repo_race=$(_tmpdir)
 remote_race=$(_tmpdir)
 feature_race=$(_tmpdir)
 log_race=$(_tmpdir)/gh.log
 _init_repo "$repo_race" "$remote_race"
 git -C "$repo_race" switch --quiet main
-result=$(GH_PR_CASE=checkout-head-after-merge GH_REPO="$repo_race" \
+result=$(GH_PR_CASE=checkout-head-after-merge GH_TEST_REPO="$repo_race" \
   GH_WORKTREE="$feature_race" GH_LOG="$log_race" PATH="$bin_dir:$PATH" \
-  git -C "$repo_race" pr-land 4 2>&1)
+  _pr_land "$repo_race" 4 2>&1)
 rc=$?
-_assert_eq "cleanup race: exits nonzero after merge" "1" "$rc"
-_assert_contains "cleanup race: reports merged cleanup state" \
-  "PR #4 merged; cleanup incomplete" "$result"
+_assert_eq "checkout race: landing remains successful" "0" "$rc"
+_assert_contains "checkout race: reports local preservation" \
+  "preserving local PR head feature at " "$result"
+_assert_eq "checkout race: linked worktree retains feature" "feature" \
+  "$(git -C "$feature_race" branch --show-current)"
 
-result=$(GH_PR_CASE=pending GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-land 4 2>&1 || true)
+repo_advance=$(_tmpdir)
+remote_advance=$(_tmpdir)
+log_advance=$(_tmpdir)/gh.log
+state_advance=$(_tmpdir)/merged
+oid_advance=$(_tmpdir)/advanced-oid
+_init_repo "$repo_advance" "$remote_advance"
+feature_before=$(git -C "$repo_advance" rev-parse feature)
+git -C "$repo_advance" switch --quiet main
+result=$(GH_PR_CASE=advance-head-after-merge GH_STATE="$state_advance" \
+  GH_TEST_REPO="$repo_advance" GH_ADVANCED_OID="$oid_advance" \
+  GH_LOG="$log_advance" PATH="$bin_dir:$PATH" \
+  _pr_land "$repo_advance" 4 2>&1)
+rc=$?
+feature_after=$(cat "$oid_advance")
+_assert_eq "advanced local head: landing remains successful" "0" "$rc"
+_assert_contains "advanced local head: reports live cleanup candidate" \
+  "preserving local PR head feature at $feature_after" "$result"
+_assert_eq "advanced local head: preserves concurrent commit" "$feature_after" \
+  "$(git -C "$repo_advance" rev-parse refs/heads/feature)"
+if [[ "$feature_after" != "$feature_before" ]]; then
+  _pass "advanced local head: fixture changes the branch OID"
+else
+  _fail "advanced local head: fixture changes the branch OID"
+fi
+
+repo_remote_advance=$(_tmpdir)
+remote_remote_advance=$(_tmpdir)
+log_remote_advance=$(_tmpdir)/gh.log
+state_remote_advance=$(_tmpdir)/merged
+oid_remote_advance=$(_tmpdir)/advanced-oid
+_init_repo "$repo_remote_advance" "$remote_remote_advance"
+git -C "$repo_remote_advance" switch --quiet main
+result=$(GH_PR_CASE=advance-remote-after-merge GH_STATE="$state_remote_advance" \
+  GH_TEST_REPO="$repo_remote_advance" GH_ADVANCED_OID="$oid_remote_advance" \
+  GH_LOG="$log_remote_advance" PATH="$bin_dir:$PATH" \
+  _pr_land "$repo_remote_advance" 4 2>&1)
+rc=$?
+remote_feature_after=$(cat "$oid_remote_advance")
+_assert_eq "advanced remote head: landing remains successful" "0" "$rc"
+_assert_contains "advanced remote head: reports manual cleanup" \
+  "delete it manually after verifying no pull request consumes it" "$result"
+_assert_eq "advanced remote head: preserves concurrent commit" "$remote_feature_after" \
+  "$(git -C "$remote_remote_advance" rev-parse refs/heads/feature)"
+_assert_eq "advanced remote head: preserves local branch" \
+  "feature" \
+  "$(git -C "$repo_remote_advance" branch --format='%(refname:short)' --list feature)"
+
+# A PR whose structured head OID is absent from the live remote must fail before
+# merge. There is no exact commit to pin or a safe cleanup snapshot to take.
+repo_remote_create=$(_tmpdir)
+remote_remote_create=$(_tmpdir)
+log_remote_create=$(_tmpdir)/gh.log
+state_remote_create=$(_tmpdir)/merged
+_init_repo "$repo_remote_create" "$remote_remote_create"
+remote_create_oid=$(git -C "$repo_remote_create" rev-parse refs/heads/feature)
+git -C "$repo_remote_create" push --quiet origin --delete feature
+git -C "$repo_remote_create" fetch --quiet --prune origin
+git -C "$repo_remote_create" switch --quiet main
+remote_create_rc=0
+remote_create_output=$(GH_PR_HEAD_OID="$remote_create_oid" \
+  GH_PR_CASE=create-remote-after-merge \
+  GH_STATE="$state_remote_create" GH_TEST_REPO="$repo_remote_create" \
+  GH_LOG="$log_remote_create" PATH="$bin_dir:$PATH" \
+  _pr_land "$repo_remote_create" 4 2>&1) || remote_create_rc=$?
+_assert_eq "absent remote head: exits nonzero before merge" "1" "$remote_create_rc"
+_assert_contains "absent remote head: reports exact-head failure" \
+  "remote PR head does not exist" "$remote_create_output"
+if git -C "$remote_remote_create" show-ref --verify --quiet \
+  refs/heads/feature; then
+  _fail "absent remote head: does not merge or create a branch"
+else
+  _pass "absent remote head: does not merge or create a branch"
+fi
+
+# Remote cleanup is based on authoritative remote state. An operational
+# ls-remote failure must stop before the irreversible GitHub merge.
+repo_remote_lookup_failure=$(_tmpdir)
+remote_remote_lookup_failure=$(_tmpdir)
+log_remote_lookup_failure=$(_tmpdir)/gh.log
+remote_lookup_failure_bin=$(_tmpdir)
+_init_repo "$repo_remote_lookup_failure" "$remote_remote_lookup_failure"
+cat >"$remote_lookup_failure_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"refs/heads/feature"* &&
+  ("${1:-}" == ls-remote || "${5:-}" == ls-remote) ]]; then
+  exit 88
+fi
+exec "$GIT_TEST_PROXY" "$@"
+EOF
+chmod +x "$remote_lookup_failure_bin/git"
+remote_lookup_failure_rc=0
+remote_lookup_failure_output=$(cd "$repo_remote_lookup_failure" &&
+  GH_LOG="$log_remote_lookup_failure" \
+    GIT_TEST_PROXY="$bin_dir/git" \
+    PATH="$remote_lookup_failure_bin:$bin_dir:$ROOT/bin:/usr/bin:/bin" \
+    "$ROOT/bin/git-pr-land" 4 2>&1) || remote_lookup_failure_rc=$?
+_assert_eq "remote lookup failure: refuses before merge" \
+  "1" "$remote_lookup_failure_rc"
+_assert_contains "remote lookup failure: reports snapshot error" \
+  "could not snapshot remote branch origin/feature" "$remote_lookup_failure_output"
+if [[ -s "$log_remote_lookup_failure" ]]; then
+  _fail "remote lookup failure: does not merge"
+else
+  _pass "remote lookup failure: does not merge"
+fi
+
+repo_status_failure=$(_tmpdir)
+remote_status_failure=$(_tmpdir)
+log_status_failure=$(_tmpdir)/gh.log
+status_failure_bin=$(_tmpdir)
+_init_repo "$repo_status_failure" "$remote_status_failure"
+cat >"$status_failure_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == status && "${2:-}" == --porcelain ]]; then
+  exit 88
+fi
+exec "$GIT_TEST_PROXY" "$@"
+EOF
+chmod +x "$status_failure_bin/git"
+result=$(cd "$repo_status_failure" && GH_LOG="$log_status_failure" \
+  GIT_TEST_PROXY="$bin_dir/git" \
+  PATH="$status_failure_bin:$bin_dir:$ROOT/bin:/usr/bin:/bin" \
+  "$ROOT/bin/git-pr-land" 4 2>&1)
+rc=$?
+_assert_eq "status failure: refuses before merge" "1" "$rc"
+_assert_contains "status failure: reports inspection error" \
+  "could not inspect worktree status" "$result"
+if [[ -s "$log_status_failure" ]]; then
+  _fail "status failure: does not merge"
+else
+  _pass "status failure: does not merge"
+fi
+
+repo_operation_failure=$(_tmpdir)
+remote_operation_failure=$(_tmpdir)
+main_operation_failure=$(_tmpdir)
+log_operation_failure=$(_tmpdir)/gh.log
+operation_failure_bin=$(_tmpdir)
+_init_repo "$repo_operation_failure" "$remote_operation_failure"
+git -C "$repo_operation_failure" worktree add --quiet "$main_operation_failure" main
+_commit_file "$main_operation_failure" base-2.txt base-2 base-2
+git -C "$main_operation_failure" push --quiet origin main
+git -C "$main_operation_failure" rebase --exec false HEAD~1 >/dev/null 2>&1 || true
+cat >"$operation_failure_bin/git" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  [[ "$arg" != rebase-merge ]] || exit 88
+done
+if [[ "${1:-} ${2:-} ${3:-}" == "remote get-url --all" ]]; then
+  /usr/bin/git config --get-all "remote.${4:-}.url"
+  exit $?
+fi
+exec "$GIT_TEST_PROXY" "$@"
+EOF
+chmod +x "$operation_failure_bin/git"
+result=$(cd "$repo_operation_failure" && GH_LOG="$log_operation_failure" \
+  GIT_TEST_PROXY="$bin_dir/git" \
+  PATH="$operation_failure_bin:$bin_dir:$ROOT/bin:/usr/bin:/bin" \
+  "$ROOT/bin/git-pr-land" 4 2>&1)
+rc=$?
+_assert_eq "operation probe failure: refuses before merge" "1" "$rc"
+_assert_contains "operation probe failure: reports inspection error" \
+  "could not inspect current worktree operation" "$result"
+if [[ -s "$log_operation_failure" ]]; then
+  _fail "operation probe failure: does not merge"
+else
+  _pass "operation probe failure: does not merge"
+fi
+
+# Worktree inventory is a safety boundary for landing. Descriptor exhaustion,
+# producer failure, and an unterminated NUL record must all fail without
+# clobbering descriptors owned by the caller.
+fd_open_rc=0
+PATH=/usr/bin:/bin bash -c '
+  . "'"$ROOT"'/lib/git-tools-base.sh"
+  eval() { return 88; }
+  (exit 0) &
+  _gt_materialize_worktree_list
+' >/dev/null 2>&1 || fd_open_rc=$?
+_assert_eq "failed worktree descriptor open fails inventory" "1" "$fd_open_rc"
+
+fd_preserve_rc=0
+(cd "$repo" && PATH=/usr/bin:/bin ROOT="$ROOT" bash -c '
+  . "$ROOT/lib/git-tools-base.sh"
+  exec 9</dev/null
+  count=0
+  while ((count < 50)); do
+    _gt_materialize_worktree_list || exit 91
+    count=$((count + 1))
+  done
+  true <&9
+') || fd_preserve_rc=$?
+_assert_eq "repeated worktree inventories preserve caller descriptors" \
+  "0" "$fd_preserve_rc"
+
+nonwaitable_process_rc=0
+(cd "$repo" && PATH=/usr/bin:/bin ROOT="$ROOT" bash -c '
+  . "$ROOT/lib/git-tools-base.sh"
+  wait() { return 127; }
+  _gt_materialize_worktree_list || exit 91
+  ((${#_GT_WORKTREE_FIELDS[@]} > 0)) || exit 92
+') >/dev/null 2>&1 || nonwaitable_process_rc=$?
+_assert_eq "worktree inventory does not require a waitable process substitution" \
+  "0" "$nonwaitable_process_rc"
+
+fd_exhaust_rc=0
+(cd "$repo" && PATH=/usr/bin:/bin ROOT="$ROOT" bash -c '
+  . "$ROOT/lib/git-tools-base.sh"
+  for fd in 3 4 5 6 7 8 9; do eval "exec $fd</dev/null"; done
+  ! _gt_materialize_worktree_list || exit 91
+  for fd in 3 4 5 6 7 8 9; do eval "true <&$fd" || exit 92; done
+') || fd_exhaust_rc=$?
+_assert_eq "worktree inventory exhaustion preserves caller descriptors" \
+  "0" "$fd_exhaust_rc"
+
+inventory_bin=$(_tmpdir)
+cat >"$inventory_bin/git" <<'EOF'
+#!/usr/bin/env bash
+case "${GT_INVENTORY_CASE:-}" in
+  partial)
+    printf 'worktree /partial\0'
+    exit 88
+    ;;
+  spoofed-completion)
+    printf '\036git-tools-worktree-list-complete\0'
+    exit 88
+    ;;
+  leaked-completion)
+    printf '%s\0' "${_gt_worktree_completion:-missing}"
+    exit 88
+    ;;
+  unterminated)
+    printf 'worktree /unterminated'
+    exit 0
+    ;;
+esac
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$inventory_bin/git"
+for inventory_case in partial spoofed-completion leaked-completion unterminated; do
+  inventory_rc=0
+  (cd "$repo" && GT_INVENTORY_CASE="$inventory_case" \
+    PATH="$inventory_bin:/usr/bin:/bin" ROOT="$ROOT" bash -c '
+      export _gt_worktree_completion=caller-value
+      . "$ROOT/lib/git-tools-base.sh"
+      _gt_materialize_worktree_list
+    ') >/dev/null 2>&1 || inventory_rc=$?
+  _assert_eq "$inventory_case worktree inventory fails closed" "1" "$inventory_rc"
+done
+
+failing_od_bin=$(_tmpdir)
+cat >"$failing_od_bin/od" <<'EOF'
+#!/usr/bin/env bash
+printf '00 11 22 33 44 55 66 77 88 99 aa bb cc dd ee ff\n'
+exit 88
+EOF
+chmod +x "$failing_od_bin/od"
+failing_od_rc=0
+(cd "$repo" && PATH="$failing_od_bin:/usr/bin:/bin" ROOT="$ROOT" bash -c '
+  . "$ROOT/lib/git-tools-base.sh"
+  _gt_materialize_worktree_list
+') >/dev/null 2>&1 || failing_od_rc=$?
+_assert_eq "failed nonce generation fails worktree inventory" "1" "$failing_od_rc"
+
+result=$(GH_PR_CASE=pending GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 2>&1 || true)
 _assert_contains "refuses pending checks" "checks are pending" "$result"
 
-result=$(GH_PR_CASE=pending GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-land 4 --dry-run 2>&1 || true)
+result=$(GH_PR_CASE=pending GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 --dry-run 2>&1 || true)
 _assert_contains "dry run still refuses unready PRs" "checks are pending" "$result"
 
-result=$(GH_PR_CASE=dirty GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-land 4 2>&1 || true)
+result=$(GH_PR_CASE=dirty GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 2>&1 || true)
 _assert_contains "refuses dirty merge state" "merge state is DIRTY" "$result"
 
-result=$(GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-land 4 --method bad 2>&1 || true)
+result=$(GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 --method bad 2>&1 || true)
 _assert_contains "validates merge method" "merge method must be squash, merge, or rebase" "$result"
 
 if ((_failures > 0)); then

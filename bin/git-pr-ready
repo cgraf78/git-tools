@@ -74,9 +74,10 @@ gt_require_repo
 gt_require_gh
 
 _view=$(gt_pr_view_tsv "$_target") || gt_die "could not read pull request"
-IFS=$'\t' read -r _number _state _draft _merge_state _head _base _url _title <<<"$_view"
+IFS=$'\t' read -r _number _state _draft _merge_state _head _head_oid _base \
+  _head_repo _cross_repo _url _title <<<"$_view"
 
-_checks=$(gt_pr_checks_status "$_target") || gt_die "could not read pull request checks"
+_checks=$(gt_pr_checks_status "$_url") || gt_die "could not read pull request checks"
 _checks_state=$(gt_checks_ready_state "$_checks")
 
 _ready=true

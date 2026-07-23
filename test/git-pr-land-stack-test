@@ -7,22 +7,10 @@ PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
 
 _failures=0
-_temps=()
-
-_tmpdir() {
-  local dir
-  dir=$(mktemp -d)
-  _temps+=("$dir")
-  printf '%s\n' "$dir"
-}
-
-_cleanup() {
-  local dir
-  for dir in "${_temps[@]}"; do
-    rm -rf "$dir"
-  done
-}
-trap _cleanup EXIT
+# shellcheck source=test/lib/test-temp.sh
+. "$ROOT/test/lib/test-temp.sh"
+gt_test_temp_init || exit 1
+_tmpdir() { gt_test_temp_dir; }
 
 _pass() {
   printf 'ok - %s\n' "$1"
@@ -72,21 +60,66 @@ _git_init() {
   git -C "$repo" commit -m base >/dev/null
 }
 
+_add_github_remote() {
+  local repo="$1" name="$2" path="$3" identity="${4:-example/repo}"
+  local url="https://github.test/$identity.git"
+
+  git -C "$repo" config "url.$path.insteadOf" "$url"
+  git -C "$repo" remote add "$name" "$url"
+}
+
+_write_git_remote_ssh() {
+  cat >"$1" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+for argument in "$@"; do
+  [[ "$argument" != -G ]] || exit 1
+done
+command=""
+for argument in "$@"; do
+  command=$argument
+done
+case "$command" in
+  "git-upload-pack "*) exec /usr/bin/git-upload-pack "${GIT_TEST_SSH_REPO:?}" ;;
+  "git-receive-pack "*) exec /usr/bin/git-receive-pack "${GIT_TEST_SSH_REPO:?}" ;;
+esac
+printf 'unexpected ssh invocation: %s\n' "$*" >&2
+exit 99
+EOF
+  chmod +x "$1"
+}
+
+_pr_land_stack() {
+  local repo="$1"
+  shift
+  (cd "$repo" && "$ROOT/bin/git-pr-land-stack" "$@")
+}
+
 _write_tool_stubs() {
   local dir="$1"
 
   cat >"$dir/git-pr-stack" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+topology_state=${STACK_TOPOLOGY_STATE:-${STACK_LOG}.topology}
+rm -f "$topology_state.1" "$topology_state.2" "$topology_state.3"
+oid_a=$(git rev-parse refs/heads/feature/a)
+oid_b=$(git rev-parse refs/heads/feature/b)
+oid_c=$(git rev-parse refs/heads/feature/c)
 case "${STACK_CASE:-ready}" in
   ready)
-    printf 'pr\t0\t1\tmain\tfeature/a\ttrue\tready\tpass\thttps://example/pr/1\n'
-    printf 'pr\t1\t2\tfeature/a\tfeature/b\ttrue\tready\tpass\thttps://example/pr/2\n'
-    printf 'pr\t2\t3\tfeature/b\tfeature/c\ttrue\tready\tpass\thttps://example/pr/3\n'
+    printf 'pr\t0\t1\tmain\tfeature/a\ttrue\tready\tpass\thttps://github.test/example/repo/pull/1\t%s\texample/repo\tfalse\n' "$oid_a"
+    printf 'pr\t1\t2\tfeature/a\tfeature/b\ttrue\tready\tpass\thttps://github.test/example/repo/pull/2\t%s\texample/repo\tfalse\n' "$oid_b"
+    printf 'pr\t2\t3\tfeature/b\tfeature/c\ttrue\tready\tpass\thttps://github.test/example/repo/pull/3\t%s\texample/repo\tfalse\n' "$oid_c"
     ;;
   blocked)
-    printf 'pr\t0\t1\tmain\tfeature/a\ttrue\tready\tpass\thttps://example/pr/1\n'
-    printf 'pr\t1\t2\tfeature/a\tfeature/b\tfalse\tchecks pending\tpending\thttps://example/pr/2\n'
+    printf 'pr\t0\t1\tmain\tfeature/a\ttrue\tready\tpass\thttps://github.test/example/repo/pull/1\t%s\texample/repo\tfalse\n' "$oid_a"
+    printf 'pr\t1\t2\tfeature/a\tfeature/b\tfalse\tchecks pending\tpending\thttps://github.test/example/repo/pull/2\t%s\texample/repo\tfalse\n' "$oid_b"
+    ;;
+  partial-failure)
+    printf 'pr\t0\t1\tmain\tfeature/a\ttrue\tready\tpass\thttps://github.test/example/repo/pull/1\t%s\texample/repo\tfalse\n' "$oid_a"
+    exit 88
     ;;
 esac
 EOF
@@ -95,14 +128,71 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'land %s\n' "$*" >>"${STACK_LOG:?}"
+number=${1##*/}
+if [[ -n "${STACK_DRIFT_AFTER_LAND:-}" && "$number" == 1 ]]; then
+  : >"$STACK_DRIFT_AFTER_LAND"
+fi
 EOF
 
   cat >"$dir/git-pr-restack" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'restack %s\n' "$*" >>"${STACK_LOG:?}"
-if [[ -n "${STACK_RACE_REPO:-}" && "${1:-}" == 2 ]]; then
+number=${1##*/}
+topology_state=${STACK_TOPOLOGY_STATE:-${STACK_LOG}.topology}
+if [[ " $* " == *" --dry-run "* ]]; then
+  exit 0
+fi
+: >"$topology_state.$number"
+if [[ -z "${STACK_REWRITE_REPO:-}" ]]; then
+  case "$number" in
+    2) rewrite_branch=feature/b ;;
+    3) rewrite_branch=feature/c ;;
+    *) rewrite_branch="" ;;
+  esac
+  if [[ -n "$rewrite_branch" ]]; then
+    old=$(git rev-parse "refs/heads/$rewrite_branch")
+    tree=$(git rev-parse "$old^{tree}")
+    new=$(printf '%s\n' "restacked-$rewrite_branch" |
+      git commit-tree "$tree" -p "$old")
+    git update-ref "refs/heads/$rewrite_branch" "$new" "$old"
+  fi
+fi
+if [[ -n "${STACK_RACE_REPO:-}" && "$number" == 2 ]]; then
   git -C "$STACK_RACE_REPO" worktree add --quiet "${STACK_RACE_WORKTREE:?}" feature/a
+fi
+if [[ -n "${STACK_ADVANCE_LOCAL_REPO:-}" && "$number" == 2 ]]; then
+  old=$(git -C "$STACK_ADVANCE_LOCAL_REPO" rev-parse refs/heads/feature/a)
+  tree=$(git -C "$STACK_ADVANCE_LOCAL_REPO" rev-parse "$old^{tree}")
+  new=$(printf '%s\n' concurrent-local |
+    git -C "$STACK_ADVANCE_LOCAL_REPO" commit-tree "$tree" -p "$old")
+  git -C "$STACK_ADVANCE_LOCAL_REPO" update-ref refs/heads/feature/a "$new" "$old"
+  printf '%s\n' "$new" >"${STACK_ADVANCE_LOCAL_OID:?}"
+fi
+if [[ -n "${STACK_ADVANCE_REMOTE_REPO:-}" && "$number" == 2 ]]; then
+  old=$(git -C "$STACK_ADVANCE_REMOTE_REPO" rev-parse refs/remotes/origin/feature/a)
+  tree=$(git -C "$STACK_ADVANCE_REMOTE_REPO" rev-parse "$old^{tree}")
+  new=$(printf '%s\n' concurrent-remote |
+    git -C "$STACK_ADVANCE_REMOTE_REPO" commit-tree "$tree" -p "$old")
+  git -C "$STACK_ADVANCE_REMOTE_REPO" push --quiet origin \
+    "$new:refs/heads/feature/a"
+  printf '%s\n' "$new" >"${STACK_ADVANCE_REMOTE_OID:?}"
+fi
+if [[ -n "${STACK_REWRITE_REPO:-}" ]]; then
+  case "$number" in
+    2) rewrite_branch=feature/b ;;
+    3) rewrite_branch=feature/c ;;
+    *) rewrite_branch="" ;;
+  esac
+  if [[ -n "$rewrite_branch" ]]; then
+    old=$(git -C "$STACK_REWRITE_REPO" rev-parse "refs/heads/$rewrite_branch")
+    tree=$(git -C "$STACK_REWRITE_REPO" rev-parse "$old^{tree}")
+    new=$(printf '%s\n' "restacked-$rewrite_branch" |
+      git -C "$STACK_REWRITE_REPO" commit-tree "$tree" -p "$old")
+    git -C "$STACK_REWRITE_REPO" update-ref "refs/heads/$rewrite_branch" "$new" "$old"
+    git -C "$STACK_REWRITE_REPO" push --quiet origin \
+      "$new:refs/heads/$rewrite_branch"
+  fi
 fi
 EOF
 
@@ -121,12 +211,17 @@ _merge_state() {
       printf 'DIRTY\n'
       ;;
     dirty-then-clean)
+      topology_state=${STACK_TOPOLOGY_STATE:-${STACK_LOG}.topology}
+      if [[ ! -e "$topology_state.$target" ]]; then
+        printf 'CLEAN\n'
+        return 0
+      fi
       count_file="${GH_VIEW_COUNT:?}.$target"
       count=0
       [[ ! -f "$count_file" ]] || count=$(< "$count_file")
       count=$((count + 1))
       printf '%s\n' "$count" >"$count_file"
-      if ((count == 1)); then
+      if ((count <= 2)); then
         printf 'DIRTY\n'
       else
         printf 'CLEAN\n'
@@ -142,14 +237,69 @@ _merge_state() {
 if [[ "$1 $2" == "auth status" ]]; then
   exit 0
 fi
+if [[ "$1 $2" == "repo view" ]]; then
+  printf 'example/repo\thttps://github.test/example/repo\n'
+  exit 0
+fi
+if [[ "$1 $2" == "pr list" && "${GH_STACK_CASE:-}" == inventory-overflow ]]; then
+  limit=0
+  previous=""
+  for argument in "$@"; do
+    if [[ "$previous" == --limit ]]; then
+      limit=$argument
+      break
+    fi
+    previous=$argument
+  done
+  count=$limit
+  ((count <= 201)) || count=201
+  index=1
+  while ((index <= count)); do
+    if ((index == 201)); then
+      printf '201\tOPEN\tfalse\tCLEAN\tfeature/201\t1111111111111111111111111111111111111111\tfeature/1\texample/repo\tfalse\thttps://github.test/example/repo/pull/201\tHidden child\n'
+    else
+      printf '%s\tOPEN\tfalse\tCLEAN\tfeature/%s\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/%s\tVisible PR\n' "$index" "$index" "$index"
+    fi
+    index=$((index + 1))
+  done
+  exit 0
+fi
+if [[ "$1 $2" == "pr list" ]]; then
+  exit 0
+fi
 if [[ "$1 $2" == "pr view" ]]; then
-  merge_state=$(_merge_state "${3:-}")
-  case "${3:-}" in
+  target=${3:-}
+  number=${target##*/}
+  merge_state=$(_merge_state "$number")
+  case "$number" in
+    1)
+      base=main
+      if [[ -n "${STACK_DRIFT_BEFORE_LAND:-}" ]]; then
+        base=release
+      fi
+      oid=$(git rev-parse refs/heads/feature/a)
+      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\t%s\t%s\texample/repo\tfalse\thttps://github.test/example/repo/pull/1\tRoot PR\n' "$oid" "$base"
+      ;;
     2)
-      printf '2\tOPEN\tfalse\t%s\tfeature/b\tmain\thttps://example/pr/2\tChild PR\n' "$merge_state"
+      base=feature/a
+      topology_state=${STACK_TOPOLOGY_STATE:-${STACK_LOG}.topology}
+      [[ ! -e "$topology_state.2" ]] || base=main
+      if [[ -n "${STACK_DRIFT_AFTER_LAND:-}" && -e "$STACK_DRIFT_AFTER_LAND" ]]; then
+        base=release
+      fi
+      if [[ "${STACK_DRIFT_DURING_WAIT:-0}" == 1 &&
+        -e "$topology_state.2" && "$merge_state" == CLEAN ]]; then
+        base=release
+      fi
+      oid=$(git rev-parse refs/heads/feature/b)
+      printf '2\tOPEN\tfalse\t%s\tfeature/b\t%s\t%s\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tChild PR\n' "$merge_state" "$oid" "$base"
       ;;
     3)
-      printf '3\tOPEN\tfalse\t%s\tfeature/c\tmain\thttps://example/pr/3\tGrandchild PR\n' "$merge_state"
+      base=feature/b
+      topology_state=${STACK_TOPOLOGY_STATE:-${STACK_LOG}.topology}
+      [[ ! -e "$topology_state.3" ]] || base=main
+      oid=$(git rev-parse refs/heads/feature/c)
+      printf '3\tOPEN\tfalse\t%s\tfeature/c\t%s\t%s\texample/repo\tfalse\thttps://github.test/example/repo/pull/3\tGrandchild PR\n' "$merge_state" "$oid" "$base"
       ;;
     *)
       printf 'unexpected pr view target: %s\n' "${3:-}" >&2
@@ -177,7 +327,48 @@ printf 'unexpected gh call: %s\n' "$*" >&2
 exit 99
 EOF
 
-  chmod +x "$dir/git-pr-stack" "$dir/git-pr-land" "$dir/git-pr-restack" "$dir/gh"
+  cat >"$dir/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-} ${2:-} ${3:-} ${4:-}" == "remote get-url --push --all" ]] &&
+  [[ "${GIT_TEST_REAL_EFFECTIVE_PUSH_URL:-0}" != 1 ]]; then
+  remote=${5:-}
+  url=$(/usr/bin/git config --get-all "remote.$remote.pushurl" 2>/dev/null || true)
+  [[ -n "$url" ]] || url=$(/usr/bin/git config --get-all "remote.$remote.url")
+  printf '%s\n' "$url"
+  exit 0
+fi
+if [[ "${GIT_TEST_REAL_EFFECTIVE_PUSH_URL:-0}" != 1 &&
+  "${1:-}" == -c && "${2:-}" == url.*.insteadOf=* &&
+  "${3:-}" == -c && "${4:-}" == url.*.pushInsteadOf=* ]]; then
+  pin=${2#url.}
+  target=${pin%%.insteadOf=*}
+  alias=${pin#*.insteadOf=}
+  shift 4
+  rewritten=()
+  for argument in "$@"; do
+    [[ "$argument" != "$alias" ]] || argument=$target
+    rewritten+=("$argument")
+  done
+  set -- "${rewritten[@]}"
+fi
+exec /usr/bin/git "$@"
+EOF
+
+  chmod +x "$dir/git-pr-stack" "$dir/git-pr-land" "$dir/git-pr-restack" \
+    "$dir/gh" "$dir/git"
+}
+
+_write_worktree_list_failure_git() {
+  cat >"$1/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == worktree && "${2:-}" == list ]]; then
+  exit 88
+fi
+exec /usr/bin/git "$@"
+EOF
+  chmod +x "$1/git"
 }
 
 echo "=== git pr-land-stack ==="
@@ -191,6 +382,122 @@ git -C "$repo" branch feature/b
 git -C "$repo" branch feature/c
 _write_tool_stubs "$bin_dir"
 
+drift_before_log=$(_tmpdir)/stack.log
+drift_before_rc=0
+drift_before_output=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  STACK_LOG="$drift_before_log" STACK_DRIFT_BEFORE_LAND=1 \
+  _pr_land_stack "$repo" 1 2>&1) || drift_before_rc=$?
+_assert_eq "pre-land topology drift exits nonzero" "1" "$drift_before_rc"
+_assert_contains "pre-land topology drift reports rejection" \
+  "PR #1 topology changed since stack discovery" "$drift_before_output"
+if [[ ! -s "$drift_before_log" ]]; then
+  _pass "pre-land topology drift causes no stack mutation"
+else
+  _fail "pre-land topology drift causes no stack mutation"
+fi
+
+drift_parent_log=$(_tmpdir)/stack.log
+drift_parent_marker=$(_tmpdir)/drifted
+drift_parent_state=$(_tmpdir)/topology
+drift_parent_oid=$(git -C "$repo" rev-parse refs/heads/feature/a)
+drift_parent_rc=0
+drift_parent_output=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  STACK_LOG="$drift_parent_log" STACK_DRIFT_AFTER_LAND="$drift_parent_marker" \
+  STACK_TOPOLOGY_STATE="$drift_parent_state" \
+  _pr_land_stack "$repo" 1 2>&1) || drift_parent_rc=$?
+_assert_eq "post-parent topology drift exits nonzero" "1" "$drift_parent_rc"
+_assert_contains "post-parent topology drift reports rejection" \
+  "PR #2 topology changed since stack discovery" "$drift_parent_output"
+_assert_eq "post-parent topology drift stops before child restack" \
+  $'land https://github.test/example/repo/pull/1 --method squash --keep-branch --expect-topology 1\tfeature/a\t'"$drift_parent_oid"$'\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/1' \
+  "$(cat "$drift_parent_log")"
+
+drift_wait_log=$(_tmpdir)/stack.log
+drift_wait_count=$(_tmpdir)/view-count
+drift_wait_state=$(_tmpdir)/topology
+drift_wait_rc=0
+drift_wait_output=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  STACK_LOG="$drift_wait_log" STACK_TOPOLOGY_STATE="$drift_wait_state" \
+  STACK_DRIFT_DURING_WAIT=1 GH_MERGE_CASE=dirty-then-clean \
+  GH_VIEW_COUNT="$drift_wait_count" \
+  _pr_land_stack "$repo" 1 --check-timeout 3 --check-interval 1 2>&1) ||
+  drift_wait_rc=$?
+_assert_eq "readiness-poll topology drift exits nonzero" "1" "$drift_wait_rc"
+_assert_contains "readiness-poll topology drift reports rejection" \
+  "PR #2 topology changed after restack" "$drift_wait_output"
+if [[ "$(cat "$drift_wait_log")" != *"land https://github.test/example/repo/pull/2"* ]]; then
+  _pass "readiness-poll topology drift stops before child land"
+else
+  _fail "readiness-poll topology drift stops before child land"
+fi
+
+enumeration_repo=$(_tmpdir)
+enumeration_bin=$(_tmpdir)
+enumeration_log=$(_tmpdir)/stack.log
+_git_init "$enumeration_repo"
+git -C "$enumeration_repo" branch feature/a
+git -C "$enumeration_repo" branch feature/b
+git -C "$enumeration_repo" branch feature/c
+_write_worktree_list_failure_git "$enumeration_bin"
+rc=0
+result=$(cd "$enumeration_repo" &&
+  PATH="$enumeration_bin:$bin_dir:$ROOT/bin:/usr/bin:/bin" \
+    GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$enumeration_log" \
+    "$ROOT/bin/git-pr-land-stack" 1 2>&1) || rc=$?
+_assert_eq "worktree enumeration failure: stack refuses before landing" "1" "$rc"
+_assert_contains "worktree enumeration failure: stack reports preflight failure" \
+  "could not inspect worktrees" "$result"
+if [[ -s "$enumeration_log" ]]; then
+  _fail "worktree enumeration failure: stack does not land"
+else
+  _pass "worktree enumeration failure: stack does not land"
+fi
+
+newline_parent=$(_tmpdir)
+newline_repo="$newline_parent/current"$'\n'
+newline_log=$(_tmpdir)/stack.log
+_git_init "$newline_repo"
+git -C "$newline_repo" branch feature/a
+git -C "$newline_repo" branch feature/b
+git -C "$newline_repo" branch feature/c
+git -C "$newline_repo" switch --quiet feature/c
+result=$(PATH="$bin_dir:$ROOT/bin:/usr/bin:/bin" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  STACK_LOG="$newline_log" _pr_land_stack "$newline_repo" 1 --dry-run 2>&1)
+rc=$?
+_assert_eq "terminal-newline current stack worktree passes topology" "0" "$rc"
+
+for current_operation in rebase bisect; do
+  operation_parent=$(_tmpdir)
+  operation_repo="$operation_parent/current-$current_operation"$'\n'
+  operation_log=$(_tmpdir)/stack.log
+  _git_init "$operation_repo"
+  git -C "$operation_repo" switch --quiet -c feature/a
+  printf '%s\n' "$current_operation" >"$operation_repo/operation.txt"
+  git -C "$operation_repo" add operation.txt
+  git -C "$operation_repo" commit -m operation >/dev/null
+  git -C "$operation_repo" branch feature/b
+  git -C "$operation_repo" branch feature/c
+  if [[ "$current_operation" == rebase ]]; then
+    git -C "$operation_repo" rebase --exec false HEAD~1 >/dev/null 2>&1 || true
+  else
+    printf 'second\n' >"$operation_repo/second.txt"
+    git -C "$operation_repo" add second.txt
+    git -C "$operation_repo" commit -m second >/dev/null
+    git -C "$operation_repo" bisect start HEAD HEAD~2 >/dev/null
+  fi
+  result=$(PATH="$bin_dir:$ROOT/bin:/usr/bin:/bin" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+    STACK_LOG="$operation_log" _pr_land_stack "$operation_repo" 1 2>&1)
+  rc=$?
+  _assert_eq "terminal-newline stack $current_operation refuses before landing" "1" "$rc"
+  _assert_contains "terminal-newline stack $current_operation reports operation" \
+    "current worktree has $current_operation in progress: ${operation_repo%$'\n'}" "$result"
+  if [[ -s "$operation_log" ]]; then
+    _fail "terminal-newline stack $current_operation does not land before refusal"
+  else
+    _pass "terminal-newline stack $current_operation does not land before refusal"
+  fi
+done
+
 topology_repo=$(_tmpdir)
 topology_worktree=$(_tmpdir)
 topology_log=$(_tmpdir)/stack.log
@@ -200,7 +507,7 @@ git -C "$topology_repo" branch feature/b
 git -C "$topology_repo" branch feature/c
 git -C "$topology_repo" worktree add --quiet "$topology_worktree" feature/b
 result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$topology_log" \
-  git -C "$topology_repo" pr-land-stack 1 2>&1)
+  _pr_land_stack "$topology_repo" 1 2>&1)
 rc=$?
 _assert_eq "linked stack: refuses before first merge" "1" "$rc"
 _assert_contains "linked stack: reports reserved child branch" \
@@ -209,27 +516,6 @@ if [[ -s "$topology_log" ]]; then
   _fail "linked stack: does not land before refusal"
 else
   _pass "linked stack: does not land before refusal"
-fi
-
-base_topology_repo=$(_tmpdir)
-base_topology_worktree=$(_tmpdir)
-base_topology_log=$(_tmpdir)/stack.log
-_git_init "$base_topology_repo"
-git -C "$base_topology_repo" branch feature/a
-git -C "$base_topology_repo" branch feature/b
-git -C "$base_topology_repo" branch feature/c
-git -C "$base_topology_repo" switch --quiet -c runner
-git -C "$base_topology_repo" worktree add --quiet "$base_topology_worktree" main
-result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$base_topology_log" \
-  git -C "$base_topology_repo" pr-land-stack 1 2>&1)
-rc=$?
-_assert_eq "linked stack base: refuses before first merge" "1" "$rc"
-_assert_contains "linked stack base: reports final cleanup conflict" \
-  "cannot delete feature/c while main is checked out or reserved" "$result"
-if [[ -s "$base_topology_log" ]]; then
-  _fail "linked stack base: does not land before refusal"
-else
-  _pass "linked stack base: does not land before refusal"
 fi
 
 race_repo=$(_tmpdir)
@@ -241,51 +527,196 @@ git -C "$race_repo" branch feature/b
 git -C "$race_repo" branch feature/c
 result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$race_log" \
   STACK_RACE_REPO="$race_repo" STACK_RACE_WORKTREE="$race_worktree" \
-  git -C "$race_repo" pr-land-stack 1 2>&1)
+  _pr_land_stack "$race_repo" 1 2>&1)
 rc=$?
-_assert_eq "stack cleanup race: exits before branch deletion" "1" "$rc"
-_assert_contains "stack cleanup race: reports new branch owner" \
-  "cannot delete feature/a; branch is checked out or reserved" "$result"
+_assert_eq "stack checkout race: landing remains successful" "0" "$rc"
 if git -C "$race_repo" show-ref --verify --quiet refs/heads/feature/a; then
   _pass "stack cleanup race: preserves local branch"
 else
   _fail "stack cleanup race: preserves local branch"
 fi
 
-push_race_repo=$(_tmpdir)
-push_race_remote=$(_tmpdir)
-push_race_worktree=$(_tmpdir)
-push_race_hooks=$(_tmpdir)
-push_race_log=$(_tmpdir)/stack.log
-_git_init "$push_race_repo"
-git -C "$push_race_repo" branch feature/a
-git -C "$push_race_repo" branch feature/b
-git -C "$push_race_repo" branch feature/c
-git init -q --bare "$push_race_remote"
-git -C "$push_race_repo" remote add origin "$push_race_remote"
-git -C "$push_race_repo" push --quiet origin main feature/a feature/b feature/c
-git -C "$push_race_repo" fetch --quiet origin
-cat >"$push_race_hooks/pre-push" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-git branch feature/a refs/remotes/origin/feature/a >/dev/null
-git worktree add --quiet "$push_race_worktree" feature/a
-EOF
-chmod +x "$push_race_hooks/pre-push"
-git -C "$push_race_repo" config core.hooksPath "$push_race_hooks"
-result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$push_race_log" \
-  git -C "$push_race_repo" pr-land-stack 1 2>&1)
+advance_local_repo=$(_tmpdir)
+advance_local_log=$(_tmpdir)/stack.log
+advance_local_oid_file=$(_tmpdir)/advanced
+_git_init "$advance_local_repo"
+git -C "$advance_local_repo" branch feature/a
+git -C "$advance_local_repo" branch feature/b
+git -C "$advance_local_repo" branch feature/c
+advance_local_before=$(git -C "$advance_local_repo" rev-parse feature/a)
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  STACK_LOG="$advance_local_log" \
+  STACK_ADVANCE_LOCAL_REPO="$advance_local_repo" \
+  STACK_ADVANCE_LOCAL_OID="$advance_local_oid_file" \
+  _pr_land_stack "$advance_local_repo" 1 2>&1)
 rc=$?
-_assert_eq "stack push race: reports partial cleanup" "1" "$rc"
-_assert_contains "stack push race: explains recreated local branch" \
-  "remote branch origin/feature/a was deleted but the local branch was recreated" "$result"
-if git -C "$push_race_remote" show-ref --verify --quiet refs/heads/feature/a; then
-  _fail "stack push race: remote deletion completed"
+advance_local_after=$(cat "$advance_local_oid_file")
+_assert_eq "stack local advance: landing remains successful" "0" "$rc"
+_assert_eq "stack local advance: preserves concurrent commit" "$advance_local_after" \
+  "$(git -C "$advance_local_repo" rev-parse refs/heads/feature/a)"
+if [[ "$advance_local_before" != "$advance_local_after" ]]; then
+  _pass "stack local advance: fixture changes local OID"
 else
-  _pass "stack push race: remote deletion completed"
+  _fail "stack local advance: fixture changes local OID"
 fi
-_assert_eq "stack push race: preserves concurrent checkout" \
-  "feature/a" "$(git -C "$push_race_worktree" branch --show-current)"
+
+advance_remote_repo=$(_tmpdir)
+advance_remote=$(_tmpdir)
+advance_remote_log=$(_tmpdir)/stack.log
+advance_remote_oid_file=$(_tmpdir)/advanced
+_git_init "$advance_remote_repo"
+git -C "$advance_remote_repo" branch feature/a
+git -C "$advance_remote_repo" branch feature/b
+git -C "$advance_remote_repo" branch feature/c
+git init -q --bare "$advance_remote"
+_add_github_remote "$advance_remote_repo" origin "$advance_remote"
+git -C "$advance_remote_repo" push --quiet origin main feature/a feature/b feature/c
+git -C "$advance_remote_repo" fetch --quiet origin
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  STACK_LOG="$advance_remote_log" \
+  STACK_ADVANCE_REMOTE_REPO="$advance_remote_repo" \
+  STACK_ADVANCE_REMOTE_OID="$advance_remote_oid_file" \
+  _pr_land_stack "$advance_remote_repo" 1 2>&1)
+rc=$?
+advance_remote_after=$(cat "$advance_remote_oid_file")
+_assert_eq "stack remote advance: landing remains successful" "0" "$rc"
+_assert_eq "stack remote advance: preserves concurrent remote commit" "$advance_remote_after" \
+  "$(git -C "$advance_remote" rev-parse refs/heads/feature/a)"
+
+# Each child restack rewrites its local and remote commits. Cleanup for the
+# middle PR must use the identity captured after its own restack, not the stale
+# identity from whole-stack preflight.
+rewrite_repo=$(_tmpdir)
+rewrite_remote=$(_tmpdir)
+rewrite_log=$(_tmpdir)/stack.log
+_git_init "$rewrite_repo"
+git -C "$rewrite_repo" branch feature/a
+git -C "$rewrite_repo" branch feature/b
+git -C "$rewrite_repo" branch feature/c
+git init -q --bare "$rewrite_remote"
+_add_github_remote "$rewrite_repo" origin "$rewrite_remote"
+git -C "$rewrite_repo" push --quiet origin main feature/a feature/b feature/c
+rewrite_rc=0
+rewrite_output=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  STACK_LOG="$rewrite_log" STACK_REWRITE_REPO="$rewrite_repo" \
+  _pr_land_stack "$rewrite_repo" 1 2>&1) || rewrite_rc=$?
+_assert_eq "ref-rewriting stack: cleanup completes" "0" "$rewrite_rc"
+_assert_contains "ref-rewriting stack: reports completion" \
+  "landed stack rooted at PR #1" "$rewrite_output"
+for rewrite_branch in feature/a feature/b; do
+  if git -C "$rewrite_repo" show-ref --verify --quiet "refs/heads/$rewrite_branch"; then
+    _pass "ref-rewriting stack: preserves local $rewrite_branch"
+  else
+    _fail "ref-rewriting stack: preserves local $rewrite_branch"
+  fi
+  if git -C "$rewrite_remote" show-ref --verify --quiet "refs/heads/$rewrite_branch"; then
+    _pass "ref-rewriting stack: preserves remote $rewrite_branch"
+  else
+    _fail "ref-rewriting stack: preserves remote $rewrite_branch"
+  fi
+done
+
+# Cleanup leases must begin from live remote state, not a possibly stale local
+# tracking ref. The stale OID predates this invocation, so authoritative
+# preflight should capture the live OID and complete normally.
+stale_remote_repo=$(_tmpdir)
+stale_remote=$(_tmpdir)
+stale_remote_log=$(_tmpdir)/stack.log
+_git_init "$stale_remote_repo"
+git -C "$stale_remote_repo" branch feature/a
+git -C "$stale_remote_repo" branch feature/b
+git -C "$stale_remote_repo" branch feature/c
+git init -q --bare "$stale_remote"
+_add_github_remote "$stale_remote_repo" origin "$stale_remote"
+git -C "$stale_remote_repo" push --quiet origin main feature/a feature/b feature/c
+git -C "$stale_remote_repo" fetch --quiet origin
+stale_remote_old=$(git -C "$stale_remote_repo" rev-parse refs/remotes/origin/feature/a)
+stale_remote_tree=$(git -C "$stale_remote_repo" rev-parse "$stale_remote_old^{tree}")
+stale_remote_new=$(printf '%s\n' live-remote |
+  git -C "$stale_remote_repo" commit-tree "$stale_remote_tree" -p "$stale_remote_old")
+git -C "$stale_remote_repo" push --quiet origin \
+  "$stale_remote_new:refs/heads/feature/a"
+git -C "$stale_remote_repo" update-ref refs/remotes/origin/feature/a \
+  "$stale_remote_old" "$stale_remote_new"
+stale_remote_rc=0
+stale_remote_output=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  STACK_LOG="$stale_remote_log" \
+  _pr_land_stack "$stale_remote_repo" 1 2>&1) || stale_remote_rc=$?
+_assert_eq "stale remote snapshot: stack completes" "0" "$stale_remote_rc"
+_assert_contains "stale remote snapshot: reports completion" \
+  "landed stack rooted at PR #1" "$stale_remote_output"
+if git -C "$stale_remote" show-ref --verify --quiet refs/heads/feature/a; then
+  _pass "stale remote snapshot: preserves the live intermediate branch"
+else
+  _fail "stale remote snapshot: preserves the live intermediate branch"
+fi
+
+# A missing tracking ref is not proof that the live branch is absent. Snapshot
+# the remote directly and delete the known live OID with a lease.
+missing_tracking_repo=$(_tmpdir)
+missing_tracking_remote=$(_tmpdir)
+missing_tracking_log=$(_tmpdir)/stack.log
+_git_init "$missing_tracking_repo"
+git -C "$missing_tracking_repo" branch feature/a
+git -C "$missing_tracking_repo" branch feature/b
+git -C "$missing_tracking_repo" branch feature/c
+git init -q --bare "$missing_tracking_remote"
+_add_github_remote "$missing_tracking_repo" origin "$missing_tracking_remote"
+git -C "$missing_tracking_repo" push --quiet origin \
+  main feature/a feature/b feature/c
+git -C "$missing_tracking_repo" fetch --quiet origin
+git -C "$missing_tracking_repo" update-ref -d refs/remotes/origin/feature/a
+missing_tracking_rc=0
+missing_tracking_output=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  STACK_LOG="$missing_tracking_log" \
+  _pr_land_stack "$missing_tracking_repo" 1 2>&1) || missing_tracking_rc=$?
+_assert_eq "missing tracking ref: stack completes" "0" "$missing_tracking_rc"
+_assert_contains "missing tracking ref: reports completion" \
+  "landed stack rooted at PR #1" "$missing_tracking_output"
+if git -C "$missing_tracking_remote" show-ref --verify --quiet \
+  refs/heads/feature/a; then
+  _pass "missing tracking ref: preserves the live intermediate branch"
+else
+  _fail "missing tracking ref: preserves the live intermediate branch"
+fi
+
+# Failure to obtain authoritative remote state is a preflight failure. No PR
+# may merge or restack first.
+lookup_failure_repo=$(_tmpdir)
+lookup_failure_remote=$(_tmpdir)
+lookup_failure_bin=$(_tmpdir)
+lookup_failure_log=$(_tmpdir)/stack.log
+_git_init "$lookup_failure_repo"
+git -C "$lookup_failure_repo" branch feature/a
+git -C "$lookup_failure_repo" branch feature/b
+git -C "$lookup_failure_repo" branch feature/c
+git init -q --bare "$lookup_failure_remote"
+_add_github_remote "$lookup_failure_repo" origin "$lookup_failure_remote"
+git -C "$lookup_failure_repo" push --quiet origin \
+  main feature/a feature/b feature/c
+cat >"$lookup_failure_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == ls-remote || "${5:-}" == ls-remote ]]; then
+  exit 88
+fi
+exec "$GIT_TEST_PROXY" "$@"
+EOF
+chmod +x "$lookup_failure_bin/git"
+lookup_failure_rc=0
+lookup_failure_output=$(cd "$lookup_failure_repo" &&
+  PATH="$lookup_failure_bin:$bin_dir:$ROOT/bin:/usr/bin:/bin" \
+    GIT_TEST_PROXY="$bin_dir/git" \
+    GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$lookup_failure_log" \
+    "$ROOT/bin/git-pr-land-stack" 1 2>&1) || lookup_failure_rc=$?
+_assert_eq "unused cleanup lookup failure does not block landing" \
+  "0" "$lookup_failure_rc"
+_assert_contains "unused cleanup lookup still lands stack" \
+  "landed stack rooted at PR #1" "$lookup_failure_output"
+if [[ -s "$lookup_failure_log" ]]; then
+  _pass "unused cleanup lookup still invokes stack tooling"
+else
+  _fail "unused cleanup lookup still invokes stack tooling"
+fi
 
 remote_repo=$(_tmpdir)
 origin_remote=$(_tmpdir)
@@ -297,8 +728,8 @@ git -C "$remote_repo" branch feature/b
 git -C "$remote_repo" branch feature/c
 git init -q --bare "$origin_remote"
 git init -q --bare "$upstream_remote"
-git -C "$remote_repo" remote add origin "$origin_remote"
-git -C "$remote_repo" remote add upstream "$upstream_remote"
+_add_github_remote "$remote_repo" origin "$origin_remote" example/base
+_add_github_remote "$remote_repo" upstream "$upstream_remote"
 git -C "$remote_repo" push --quiet origin main feature/a feature/b feature/c
 git -C "$remote_repo" push --quiet upstream main feature/a feature/b feature/c
 git -C "$remote_repo" fetch --quiet origin
@@ -306,16 +737,91 @@ git -C "$remote_repo" fetch --quiet upstream
 git -C "$remote_repo" config branch.feature/a.remote upstream
 git -C "$remote_repo" config branch.feature/b.remote upstream
 PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$remote_log" \
-  git -C "$remote_repo" pr-land-stack 1 >/tmp/pr-land-stack-remote.out 2>&1
+  _pr_land_stack "$remote_repo" 1 >/dev/null 2>&1
 if git -C "$upstream_remote" show-ref --verify --quiet refs/heads/feature/a; then
-  _fail "configured remote cleanup: deletes upstream feature/a"
+  _pass "configured remote cleanup: preserves upstream feature/a"
 else
-  _pass "configured remote cleanup: deletes upstream feature/a"
+  _fail "configured remote cleanup: preserves upstream feature/a"
 fi
 if git -C "$origin_remote" show-ref --verify --quiet refs/heads/feature/a; then
   _pass "configured remote cleanup: preserves same-named origin branch"
 else
   _fail "configured remote cleanup: preserves same-named origin branch"
+fi
+
+redirect_stack_repo=$(_tmpdir)
+redirect_stack_expected=$(_tmpdir)
+redirect_stack_unrelated=$(_tmpdir)
+redirect_stack_log=$(_tmpdir)/stack.log
+_git_init "$redirect_stack_repo"
+git -C "$redirect_stack_repo" branch feature/a
+git -C "$redirect_stack_repo" branch feature/b
+git -C "$redirect_stack_repo" branch feature/c
+git init -q --bare "$redirect_stack_expected"
+git init -q --bare "$redirect_stack_unrelated"
+_add_github_remote "$redirect_stack_repo" origin "$redirect_stack_expected"
+git -C "$redirect_stack_repo" push --quiet origin \
+  main feature/a feature/b feature/c
+git -C "$redirect_stack_repo" push --quiet "$redirect_stack_unrelated" \
+  refs/heads/feature/a:refs/heads/feature/a
+redirect_stack_before=$(git -C "$redirect_stack_unrelated" \
+  rev-parse refs/heads/feature/a)
+git -C "$redirect_stack_repo" config \
+  "url.$redirect_stack_unrelated.pushInsteadOf" \
+  https://github.test/example/repo.git
+redirect_stack_output=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  GIT_TEST_REAL_EFFECTIVE_PUSH_URL=1 STACK_LOG="$redirect_stack_log" \
+  _pr_land_stack "$redirect_stack_repo" 1 2>&1)
+: "$redirect_stack_output"
+_assert_eq "stack pushInsteadOf mismatch preserves unrelated branch" \
+  "$redirect_stack_before" \
+  "$(git -C "$redirect_stack_unrelated" rev-parse refs/heads/feature/a)"
+
+chain_stack_repo=$(_tmpdir)
+chain_stack_expected=$(_tmpdir)
+chain_stack_unrelated=$(_tmpdir)
+chain_stack_log=$(_tmpdir)/stack.log
+chain_stack_ssh=$(_tmpdir)/ssh
+chain_stack_path=$(_tmpdir)
+_git_init "$chain_stack_repo"
+git -C "$chain_stack_repo" branch feature/a
+git -C "$chain_stack_repo" branch feature/b
+git -C "$chain_stack_repo" branch feature/c
+git init -q --bare --initial-branch=main "$chain_stack_expected"
+git init -q --bare --initial-branch=main "$chain_stack_unrelated"
+git -C "$chain_stack_repo" push --quiet "$chain_stack_expected" \
+  main feature/a feature/b feature/c
+git -C "$chain_stack_repo" push --quiet "$chain_stack_unrelated" \
+  refs/heads/feature/a:refs/heads/feature/a
+chain_stack_before=$(git -C "$chain_stack_unrelated" \
+  rev-parse refs/heads/feature/a)
+chain_stack_url=https://github.test/example/repo.git
+chain_stack_effective=ssh://git@github.test/example/repo.git
+git -C "$chain_stack_repo" remote add origin "$chain_stack_url"
+git -C "$chain_stack_repo" config \
+  "url.$chain_stack_effective.pushInsteadOf" "$chain_stack_url"
+_write_git_remote_ssh "$chain_stack_ssh"
+cp "$bin_dir/gh" "$chain_stack_path/gh"
+chain_stack_rc=0
+chain_stack_output=$(cd "$chain_stack_repo" &&
+  PATH="$chain_stack_path:$ROOT/bin:/usr/bin:/bin" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+    STACK_LOG="$chain_stack_log" \
+    GIT_SSH_COMMAND="$chain_stack_ssh" GIT_TEST_SSH_REPO="$chain_stack_expected" \
+    /usr/bin/git \
+    -c "url.file://$chain_stack_unrelated.insteadOf=$chain_stack_effective" \
+    -c "url.file://$chain_stack_unrelated.pushInsteadOf=$chain_stack_effective" \
+    pr-land-stack 1 2>&1) || chain_stack_rc=$?
+_assert_eq "stack chained pushInsteadOf cleanup completes" "0" "$chain_stack_rc"
+_assert_contains "stack chained pushInsteadOf reports completion" \
+  "landed stack rooted at PR #1" "$chain_stack_output"
+_assert_eq "stack chained pushInsteadOf preserves second rewrite target" \
+  "$chain_stack_before" \
+  "$(git -C "$chain_stack_unrelated" rev-parse --verify \
+    refs/heads/feature/a 2>/dev/null || printf missing)"
+if git -C "$chain_stack_expected" show-ref --verify --quiet refs/heads/feature/a; then
+  _pass "stack chained pushInsteadOf preserves validated effective target"
+else
+  _fail "stack chained pushInsteadOf preserves validated effective target"
 fi
 
 # Regression: a dry run must NOT delete intermediate stack branches. The bug was
@@ -329,7 +835,8 @@ _git_init "$dry_repo"
 git -C "$dry_repo" branch feature/a
 git -C "$dry_repo" branch feature/b
 git -C "$dry_repo" branch feature/c
-PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$dry_log" git -C "$dry_repo" pr-land-stack 1 --dry-run >/tmp/pr-land-stack-dryrun-safe.out 2>&1
+PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$dry_log" \
+  _pr_land_stack "$dry_repo" 1 --dry-run >/dev/null 2>&1
 rc=$?
 _assert_eq "dry run completes successfully" "0" "$rc"
 for _dry_branch in feature/a feature/b feature/c; do
@@ -339,7 +846,38 @@ for _dry_branch in feature/a feature/b feature/c; do
     _fail "dry run keeps $_dry_branch"
   fi
 done
-_assert_contains "dry run still plans the land" "land 1 --method squash --keep-branch --dry-run" "$(cat "$dry_log")"
+_assert_contains "dry run still plans the land" \
+  "land https://github.test/example/repo/pull/1 --method squash --keep-branch --dry-run" \
+  "$(cat "$dry_log")"
+
+# A dry run observes the current topology throughout: its restack subprocesses
+# do not rewrite branches or PR bases. It must still print every operation in
+# the plan instead of validating hypothetical post-restack state as live.
+dry_plan_repo=$(_tmpdir)
+dry_plan_log=$(_tmpdir)/stack.log
+dry_plan_topology=$(_tmpdir)/topology
+_git_init "$dry_plan_repo"
+git -C "$dry_plan_repo" branch feature/a
+git -C "$dry_plan_repo" branch feature/b
+git -C "$dry_plan_repo" branch feature/c
+dry_plan_rc=0
+PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  STACK_LOG="$dry_plan_log" STACK_TOPOLOGY_STATE="$dry_plan_topology" \
+  _pr_land_stack "$dry_plan_repo" 1 --dry-run >/dev/null 2>&1 || dry_plan_rc=$?
+_assert_eq "three-PR dry run completes successfully" "0" "$dry_plan_rc"
+_assert_eq "three-PR dry run prints the full land/restack plan" "5" \
+  "$(wc -l <"$dry_plan_log" | tr -d ' ')"
+_assert_eq "three-PR dry run preserves plan order" \
+  $'land https://github.test/example/repo/pull/1\nrestack https://github.test/example/repo/pull/2\nland https://github.test/example/repo/pull/2\nrestack https://github.test/example/repo/pull/3\nland https://github.test/example/repo/pull/3' \
+  "$(awk '{ print $1, $2 }' "$dry_plan_log")"
+_assert_contains "three-PR dry run plans the final land" \
+  "land https://github.test/example/repo/pull/3 --method squash --dry-run" \
+  "$(cat "$dry_plan_log")"
+if compgen -G "$dry_plan_topology.*" >/dev/null; then
+  _fail "three-PR dry run leaves discovered topology unchanged"
+else
+  _pass "three-PR dry run leaves discovered topology unchanged"
+fi
 
 # Regression: a dry run must NOT delete the REMOTE intermediate branches either
 # (the most destructive path: git push --delete). Wire a real bare remote so
@@ -352,10 +890,11 @@ _git_init "$dry_remote_repo"
 git -C "$dry_remote_repo" branch feature/a
 git -C "$dry_remote_repo" branch feature/b
 git -C "$dry_remote_repo" branch feature/c
-git -C "$dry_remote_repo" remote add origin "$dry_remote"
+_add_github_remote "$dry_remote_repo" origin "$dry_remote"
 git -C "$dry_remote_repo" push -q origin feature/a feature/b feature/c
 git -C "$dry_remote_repo" fetch -q origin
-PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$dry_remote_log" git -C "$dry_remote_repo" pr-land-stack 1 --dry-run >/tmp/pr-land-stack-dryrun-remote.out 2>&1
+PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$dry_remote_log" \
+  _pr_land_stack "$dry_remote_repo" 1 --dry-run >/dev/null 2>&1
 rc=$?
 _assert_eq "dry run with remote branches completes successfully" "0" "$rc"
 for _dry_branch in feature/a feature/b feature/c; do
@@ -366,68 +905,138 @@ for _dry_branch in feature/a feature/b feature/c; do
   fi
 done
 
-PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" git -C "$repo" pr-land-stack 1 >/tmp/pr-land-stack.out 2>&1
+topology_state=$(_tmpdir)/topology
+stack_output=$(_tmpdir)/stack.out
+expected_oid_a=$(git -C "$repo" rev-parse refs/heads/feature/a)
+expected_oid_b=$(git -C "$repo" rev-parse refs/heads/feature/b)
+expected_oid_c=$(git -C "$repo" rev-parse refs/heads/feature/c)
+PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" \
+  STACK_TOPOLOGY_STATE="$topology_state" \
+  _pr_land_stack "$repo" 1 >"$stack_output" 2>&1
+expected_new_oid_b=$(git -C "$repo" rev-parse refs/heads/feature/b)
+expected_new_oid_c=$(git -C "$repo" rev-parse refs/heads/feature/c)
 expected="$(
   cat <<'EOF'
-land 1 --method squash --keep-branch
-restack 2 --base main --fork feature/a
-checks pr checks 2 --json bucket --jq [.[].bucket] as $buckets | if any($buckets[]; . != "pass" and . != "skipping" and . != "fail" and . != "cancel" and . != "pending") then error("unknown check bucket") elif ($buckets | length) == 0 then "none" elif any($buckets[]; . == "fail" or . == "cancel") then "fail" elif any($buckets[]; . == "pending") then "pending" else "pass" end
-land 2 --method squash --keep-branch
-restack 3 --base main --fork feature/b
-checks pr checks 3 --json bucket --jq [.[].bucket] as $buckets | if any($buckets[]; . != "pass" and . != "skipping" and . != "fail" and . != "cancel" and . != "pending") then error("unknown check bucket") elif ($buckets | length) == 0 then "none" elif any($buckets[]; . == "fail" or . == "cancel") then "fail" elif any($buckets[]; . == "pending") then "pending" else "pass" end
-land 3 --method squash
+land https://github.test/example/repo/pull/1 --method squash --keep-branch --expect-topology 1	feature/a	@OID_A@	main	example/repo	false	https://github.test/example/repo/pull/1
+restack https://github.test/example/repo/pull/2 --base main --fork oid:@OID_A@ --expect-topology 2	feature/b	@OID_B@	feature/a	example/repo	false	https://github.test/example/repo/pull/2
+checks pr checks https://github.test/example/repo/pull/2 --json bucket --jq [.[].bucket] as $buckets | if any($buckets[]; . != "pass" and . != "skipping" and . != "fail" and . != "cancel" and . != "pending") then error("unknown check bucket") elif ($buckets | length) == 0 then "none" elif any($buckets[]; . == "fail" or . == "cancel") then "fail" elif any($buckets[]; . == "pending") then "pending" else "pass" end --repo github.test/example/repo
+land https://github.test/example/repo/pull/2 --method squash --keep-branch --expect-topology 2	feature/b	@NEW_OID_B@	main	example/repo	false	https://github.test/example/repo/pull/2
+restack https://github.test/example/repo/pull/3 --base main --fork oid:@OID_B@ --expect-topology 3	feature/c	@OID_C@	feature/b	example/repo	false	https://github.test/example/repo/pull/3
+checks pr checks https://github.test/example/repo/pull/3 --json bucket --jq [.[].bucket] as $buckets | if any($buckets[]; . != "pass" and . != "skipping" and . != "fail" and . != "cancel" and . != "pending") then error("unknown check bucket") elif ($buckets | length) == 0 then "none" elif any($buckets[]; . == "fail" or . == "cancel") then "fail" elif any($buckets[]; . == "pending") then "pending" else "pass" end --repo github.test/example/repo
+land https://github.test/example/repo/pull/3 --method squash --expect-topology 3	feature/c	@NEW_OID_C@	main	example/repo	false	https://github.test/example/repo/pull/3
 EOF
 )"
+expected=${expected//@OID_A@/$expected_oid_a}
+expected=${expected//@OID_B@/$expected_oid_b}
+expected=${expected//@OID_C@/$expected_oid_c}
+expected=${expected//@NEW_OID_B@/$expected_new_oid_b}
+expected=${expected//@NEW_OID_C@/$expected_new_oid_c}
 _assert_eq "lands and restacks in stack order" "$expected" "$(cat "$log")"
 if git -C "$repo" show-ref --verify --quiet refs/heads/feature/a; then
-  _fail "deletes first intermediate branch after child restack"
+  _pass "preserves first intermediate branch for manual cleanup"
 else
-  _pass "deletes first intermediate branch after child restack"
+  _fail "preserves first intermediate branch for manual cleanup"
 fi
 if git -C "$repo" show-ref --verify --quiet refs/heads/feature/b; then
-  _fail "deletes second intermediate branch after child restack"
+  _pass "preserves second intermediate branch for manual cleanup"
 else
-  _pass "deletes second intermediate branch after child restack"
+  _fail "preserves second intermediate branch for manual cleanup"
 fi
 if git -C "$repo" show-ref --verify --quiet refs/heads/feature/c; then
   _pass "leaves final branch cleanup to git pr-land"
 else
   _fail "leaves final branch cleanup to git pr-land"
 fi
-_assert_contains "reports stack completion" "landed stack rooted at PR #1" "$(</tmp/pr-land-stack.out)"
+_assert_contains "reports stack completion" "landed stack rooted at PR #1" \
+  "$(<"$stack_output")"
 
 log_dirty=$(_tmpdir)/stack.log
 view_count=$(_tmpdir)/view-count
-PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" GH_MERGE_CASE=dirty-then-clean GH_VIEW_COUNT="$view_count" STACK_LOG="$log_dirty" git -C "$repo" pr-land-stack 1 --check-timeout 3 --check-interval 1 >/tmp/pr-land-stack-dirty.out 2>&1
-_assert_contains "waits through transient dirty merge state" "waiting for PR #2 after restack: merge DIRTY, checks pass" "$(</tmp/pr-land-stack-dirty.out)"
-_assert_contains "lands after transient dirty merge state" "land 3 --method squash" "$(cat "$log_dirty")"
+dirty_output=$(_tmpdir)/stack.out
+PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  GH_MERGE_CASE=dirty-then-clean GH_VIEW_COUNT="$view_count" \
+  STACK_LOG="$log_dirty" _pr_land_stack "$repo" 1 \
+  --check-timeout 3 --check-interval 1 >"$dirty_output" 2>&1
+_assert_contains "waits through transient dirty merge state" \
+  "waiting for PR #2 after restack: merge DIRTY, checks pass" \
+  "$(<"$dirty_output")"
+_assert_contains "lands after transient dirty merge state" \
+  "land https://github.test/example/repo/pull/3 --method squash" \
+  "$(cat "$log_dirty")"
 
-result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" GH_MERGE_CASE=dirty STACK_LOG="$log" git -C "$repo" pr-land-stack 1 --check-timeout 1 --check-interval 1 2>&1 || true)
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" GH_MERGE_CASE=dirty STACK_LOG="$log" _pr_land_stack "$repo" 1 --check-timeout 1 --check-interval 1 2>&1 || true)
 _assert_contains "times out persistent dirty merge state" "timed out waiting for PR #2 after restack: merge DIRTY, checks pass" "$result"
 
 log_keep=$(_tmpdir)/stack.log
-PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log_keep" git -C "$repo" pr-land-stack 1 --method merge --keep-branch >/tmp/pr-land-stack-keep.out 2>&1
-_assert_contains "passes keep-branch to land" "land 1 --method merge --keep-branch" "$(cat "$log_keep")"
+PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log_keep" \
+  _pr_land_stack "$repo" 1 --method merge --keep-branch >/dev/null 2>&1
+_assert_contains "passes keep-branch to land" \
+  "land https://github.test/example/repo/pull/1 --method merge --keep-branch" \
+  "$(cat "$log_keep")"
 
 log_dry=$(_tmpdir)/stack.log
-PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log_dry" git -C "$repo" pr-land-stack 1 --dry-run >/tmp/pr-land-stack-dry.out 2>&1
-_assert_contains "dry run passes through to land" "land 1 --method squash --keep-branch --dry-run" "$(cat "$log_dry")"
-_assert_contains "dry run passes through to restack" "restack 2 --base main --fork feature/a --dry-run" "$(cat "$log_dry")"
+dry_fork_oid=$(git -C "$repo" rev-parse refs/heads/feature/a)
+PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log_dry" \
+  _pr_land_stack "$repo" 1 --dry-run >/dev/null 2>&1
+_assert_contains "dry run passes through to land" \
+  "land https://github.test/example/repo/pull/1 --method squash --keep-branch --dry-run" \
+  "$(cat "$log_dry")"
+_assert_contains "dry run passes through to restack" \
+  "restack https://github.test/example/repo/pull/2 --base main --fork oid:$dry_fork_oid --dry-run" \
+  "$(cat "$log_dry")"
 
-result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_CASE=blocked STACK_LOG="$log" git -C "$repo" pr-land-stack 1 2>&1 || true)
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_CASE=blocked STACK_LOG="$log" _pr_land_stack "$repo" 1 2>&1 || true)
 _assert_contains "refuses unready stacks before landing" "PR #2 is not ready: checks pending" "$result"
 
-result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" GH_CHECK_CASE=fail STACK_LOG="$log" git -C "$repo" pr-land-stack 1 2>&1 || true)
+partial_log=$(_tmpdir)/stack.log
+partial_rc=0
+partial_result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  STACK_CASE=partial-failure STACK_LOG="$partial_log" \
+  _pr_land_stack "$repo" 1 2>&1) || partial_rc=$?
+if [[ "$partial_rc" != 0 && ! -e "$partial_log" ]]; then
+  _pass "rejects partial stack discovery before landing"
+else
+  _fail "rejects partial stack discovery before landing"
+  printf '  exit status: %s\n' "$partial_rc" >&2
+  printf '  actual output:\n%s\n' "$partial_result" >&2
+fi
+
+foreign_log=$(_tmpdir)/stack.log
+foreign_rc=0
+foreign_result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  STACK_LOG="$foreign_log" _pr_land_stack "$repo" \
+  https://github.test/foreign/repo/pull/1 2>&1) || foreign_rc=$?
+_assert_contains "stack rejects a foreign same-number PR target" \
+  "target pull request belongs to a different repository" "$foreign_result"
+if [[ "$foreign_rc" != 0 && ! -e "$foreign_log" ]]; then
+  _pass "foreign stack target is rejected before stack tooling"
+else
+  _fail "foreign stack target is rejected before stack tooling"
+fi
+
+overflow_rc=0
+overflow_result=$(PATH="$bin_dir:$ROOT/bin:$PATH" \
+  GIT_TOOLS_TOOL_DIR="$ROOT/bin" GH_STACK_CASE=inventory-overflow \
+  STACK_LOG="$log" _pr_land_stack "$repo" 1 --dry-run 2>&1) || overflow_rc=$?
+_assert_contains "stack landing rejects a hidden 201st PR" \
+  "open pull request inventory exceeds 200 entries" "$overflow_result"
+if [[ "$overflow_rc" != 0 ]]; then
+  _pass "overflowing stack inventory aborts landing"
+else
+  _fail "overflowing stack inventory aborts landing"
+fi
+
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" GH_CHECK_CASE=fail STACK_LOG="$log" _pr_land_stack "$repo" 1 2>&1 || true)
 _assert_contains "refuses failed post-restack checks" "PR #2 checks failed after restack" "$result"
 
-result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" git -C "$repo" pr-land-stack 1 --method bad 2>&1 || true)
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" _pr_land_stack "$repo" 1 --method bad 2>&1 || true)
 _assert_contains "validates merge method" "merge method must be squash, merge, or rebase" "$result"
 
-result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" git -C "$repo" pr-land-stack 1 --check-timeout 0 2>&1 || true)
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" _pr_land_stack "$repo" 1 --check-timeout 0 2>&1 || true)
 _assert_contains "validates check timeout" "--check-timeout must be greater than zero" "$result"
 
 outside=$(_tmpdir)
-result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" git -C "$outside" pr-land-stack 1 2>&1 || true)
+result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" _pr_land_stack "$outside" 1 2>&1 || true)
 _assert_contains "requires git repo" "not inside a git repository" "$result"
 
 if ((_failures > 0)); then

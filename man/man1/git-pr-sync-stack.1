@@ -17,6 +17,18 @@ and
 .BR git-pr-restack (1)
 so force-with-lease push behavior stays centralized in the single-PR restack
 primitive.
+.PP
+Each restack is bound to the number, head, head OID, base, head repository,
+cross-repository state, and canonical URL discovered for that pull request.
+Children use their parent's original head OID as the immutable fork boundary.
+After each pushed restack, a fresh PR record must report the same rewritten OID
+as the local branch before synchronization continues. With
+.BR \-\-no\-push ,
+each rewritten local parent OID becomes the child's exact local base instead of
+falling back to a stale remote parent branch.
+.PP
+Repository-qualified pull request URLs are retained between stack discovery and
+every restack operation.
 .SH OPTIONS
 .TP
 .BI "\-b, \-\-base " branch

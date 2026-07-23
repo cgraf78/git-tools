@@ -101,19 +101,69 @@ _run() {
 
 _restack() {
   local number="$1"
-  local base="$2"
-  local -a args=(git pr-restack "$number" --base "$base")
+  local url="$2"
+  local base="$3"
+  local fork="$4"
+  local expected_topology="$5"
+  local base_oid="$6"
+  local -a args=(git pr-restack "$url" --base "$base")
 
+  [[ -z "$base_oid" ]] || args+=(--base-oid "$base_oid")
+  [[ -z "$fork" ]] || args+=(--fork "$fork")
   [[ "$_push" == 1 ]] || args+=(--no-push)
   [[ "$_dry_run" == 0 ]] || args+=(--dry-run)
+  args+=(--expect-topology "$expected_topology")
 
   gt_say "restacking PR #$number onto $base"
   _run "${args[@]}"
 }
 
-gt_require_repo
+_refresh_local_restacked_oid() {
+  local index="$1" local_oid
 
-_stack_args=(git pr-stack --porcelain)
+  local_oid=$(git rev-parse --verify \
+    "refs/heads/${_heads[$index]}^{commit}") ||
+    gt_die "could not read local head for PR #${_numbers[$index]} after restack"
+  _expected_head_oids[index]=$local_oid
+}
+
+_refresh_restacked_topology() {
+  local index="$1" base="$2" local_oid view live_oid expected
+
+  local_oid=$(git rev-parse --verify \
+    "refs/heads/${_heads[$index]}^{commit}") ||
+    gt_die "could not read local head for PR #${_numbers[$index]} after restack"
+  view=$(gt_pr_view_tsv "${_urls[$index]}") ||
+    gt_die "could not read PR #${_numbers[$index]} after restack"
+  IFS=$'\t' read -r _ _ _ _ _ live_oid _ _ _ _ _ <<<"$view"
+  expected=$(gt_pr_topology_tsv "${_numbers[$index]}" \
+    "${_heads[$index]}" "$live_oid" "$base" "${_head_repos[$index]}" \
+    "${_head_cross_repos[$index]}" "${_urls[$index]}") ||
+    gt_die "could not validate restacked topology for PR #${_numbers[$index]}"
+  gt_pr_record_matches_topology "$view" "$expected" ||
+    gt_die "PR #${_numbers[$index]} topology changed after restack"
+  [[ "$live_oid" == "$local_oid" ]] ||
+    gt_die "PR #${_numbers[$index]} head OID does not match the restacked branch"
+  _expected_head_oids[index]=$live_oid
+  _bases[index]=$base
+}
+
+_stack_topology() {
+  local index="$1" normalized_head_repo
+
+  normalized_head_repo=$(gt_github_name_with_owner \
+    "${_head_repos[$index]}") || return 1
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${_numbers[$index]}" "${_heads[$index]}" "${_expected_head_oids[$index]}" \
+    "${_bases[$index]}" \
+    "$normalized_head_repo" "${_head_cross_repos[$index]}" \
+    "${_urls[$index]}"
+}
+
+gt_require_repo
+gt_require_gh
+
+_stack_args=(git pr-stack --porcelain=v2)
 [[ -z "$_target" ]] || _stack_args+=("$_target")
 
 _stack_output=$("${_stack_args[@]}") || gt_die "could not read pull request stack"
@@ -121,12 +171,23 @@ _stack_output=$("${_stack_args[@]}") || gt_die "could not read pull request stac
 _numbers=()
 _bases=()
 _heads=()
+_original_head_oids=()
+_expected_head_oids=()
+_urls=()
+_head_repos=()
+_head_cross_repos=()
 
-while IFS=$'\t' read -r _kind _index _number _base _head _ready _reason _checks _url; do
+while IFS=$'\t' read -r _kind _index _number _base _head _ready _reason _checks \
+  _url _head_oid _head_repo _head_cross_repo; do
   [[ "$_kind" == "pr" ]] || continue
   _numbers+=("$_number")
   _bases+=("$_base")
   _heads+=("$_head")
+  _original_head_oids+=("$_head_oid")
+  _expected_head_oids+=("$_head_oid")
+  _urls+=("$_url")
+  _head_repos+=("$_head_repo")
+  _head_cross_repos+=("$_head_cross_repo")
 done <<<"$_stack_output"
 
 ((${#_numbers[@]} > 0)) || gt_die "no pull requests found in stack"
@@ -138,8 +199,24 @@ while ((_index < ${#_numbers[@]})); do
   else
     _base="${_heads[$((_index - 1))]}"
   fi
+  _fork=""
+  _base_oid=""
+  if ((_index > 0)); then
+    _fork="oid:${_original_head_oids[$((_index - 1))]}"
+    if [[ "$_push" == 0 ]]; then
+      _base_oid=${_expected_head_oids[$((_index - 1))]}
+    fi
+  fi
 
-  _restack "${_numbers[$_index]}" "$_base"
+  _expected_topology=$(_stack_topology "$_index") ||
+    gt_die "could not validate expected topology for PR #${_numbers[$_index]}"
+  _restack "${_numbers[$_index]}" "${_urls[$_index]}" "$_base" \
+    "$_fork" "$_expected_topology" "$_base_oid"
+  if [[ "$_push" == 1 && "$_dry_run" == 0 ]]; then
+    _refresh_restacked_topology "$_index" "$_base"
+  elif [[ "$_push" == 0 && "$_dry_run" == 0 ]]; then
+    _refresh_local_restacked_oid "$_index"
+  fi
   _index=$((_index + 1))
 done
 

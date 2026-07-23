@@ -10,8 +10,33 @@ pushes the current branch with upstream tracking and creates a GitHub pull
 request without interactive prompts.
 .PP
 The command refuses dirty worktrees, refuses to open a pull request from the
-base branch itself, fetches the base remote, and rejects a stale local base
-branch when the local base branch differs from its remote-tracking branch.
+base branch itself, and rejects a stale local base branch when it differs from
+the exact remote base object ID.
+.PP
+GitHub pull request creation is pinned to the host and owner/repository derived
+from the current checkout. Ambient GH_REPO and GH_HOST values cannot redirect
+the operation. Structured default-branch discovery is pinned to the same
+repository, so a foreign remote named origin cannot select the base. The base
+fetch URL is validated against that repository, then the exact
+refs/heads/base source is fetched without named-remote refspecs or tags. The
+feature push target is resolved independently from branch push configuration;
+fork heads are qualified as owner:branch.
+.PP
+The feature branch is pushed by immutable object ID through the captured
+validated URL and the resulting remote object ID is verified. Upstream tracking
+is installed locally only after the named remote is revalidated against that
+URL. A concurrent remote configuration change aborts pull request creation with
+a tracking-incomplete diagnostic after preserving the validated push.
+.PP
+The remote head is checked again immediately before creation. After creation,
+the returned pull request is queried through structured output and must match
+the requested repository, head and base refs, head repository,
+cross-repository state, and exact head object ID. If a server-side race creates
+an inconsistent pull request, the command reports its URL and exits nonzero.
+.PP
+Credential-bearing HTTP URLs, query or fragment suffixes, unsafe git-config key
+bytes, and invalid GitHub owner or repository components are rejected before
+exact transport helpers run. Normal SSH usernames remain supported.
 .SH OPTIONS
 .TP
 .BI "\-t, \-\-title " title

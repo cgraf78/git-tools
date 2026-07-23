@@ -28,13 +28,14 @@ _usage() {
   cat <<'EOF'
 Usage: git pr-land [options] <number|url|branch>
 
-Verify that one GitHub pull request is ready, merge it, sync the base branch,
-and delete the local PR branch. This command does not discover or land stacks.
+Verify that one GitHub pull request is ready, merge it, and sync the base branch.
+Local and remote PR heads are reported for manual cleanup and are never deleted
+automatically.
+This command does not discover or land stacks.
 
 Options:
   -m, --method <method>   Merge method: squash, merge, or rebase (default: squash).
-      --keep-branch       Do not ask GitHub to delete the remote branch and do
-                          not delete the local branch.
+      --keep-branch       Accepted for compatibility; remote heads are preserved.
   -n, --dry-run           Print actions without changing anything.
   -h, --help              Show this help.
 
@@ -47,12 +48,16 @@ EOF
 
 _target=""
 _method="squash"
-_keep_branch=0
 _dry_run=0
+_expected_topology=""
 
 _run() {
   if [[ "$_dry_run" == 1 ]]; then
     printf 'git pr-land: would run:' >&2
+    if [[ "${1:-}" == gt_gh_pr ]]; then
+      shift
+      printf ' gh pr' >&2
+    fi
     printf ' %q' "$@" >&2
     printf '\n' >&2
     return 0
@@ -75,7 +80,20 @@ while (($#)); do
       shift
       ;;
     --keep-branch)
-      _keep_branch=1
+      shift
+      ;;
+    # Private handoff used by bundled stack orchestrators, not a stable CLI
+    # serialization format.
+    --expect-topology)
+      shift
+      (($#)) || gt_usage_error "--expect-topology requires a value"
+      _expected_topology="$1"
+      shift
+      ;;
+    --expect-topology=*)
+      _expected_topology="${1#--expect-topology=}"
+      [[ -n "$_expected_topology" ]] ||
+        gt_usage_error "--expect-topology requires a value"
       shift
       ;;
     -n | --dry-run)
@@ -110,126 +128,134 @@ case "$_method" in
   *) gt_usage_error "merge method must be squash, merge, or rebase" ;;
 esac
 
-_remote_for_branch() {
-  local branch="$1"
-  local remote
-
-  remote=$(git config "branch.$branch.remote" 2>/dev/null || true)
-  if [[ -n "$remote" ]]; then
-    printf '%s\n' "$remote"
-    return 0
-  fi
-  printf 'origin\n'
-}
-
 _local_branch_exists() {
-  git show-ref --verify --quiet "refs/heads/$1"
-}
-
-_remote_branch_exists() {
-  local remote="$1"
-  local branch="$2"
-  git show-ref --verify --quiet "refs/remotes/$remote/$branch"
-}
-
-_current_worktree() {
-  git rev-parse --show-toplevel
+  gt_find_ref_commit "refs/heads/$1"
 }
 
 _worktree_status() {
   gt_git_without_local_env -C "$1" status --porcelain
 }
 
-_fetch_remote() {
-  _run git fetch --quiet --prune --tags "$1"
+_load_exact_base_oid() {
+  local remote="$1" url="$2" base="$3" status=0
+
+  if [[ "$_dry_run" == 1 ]]; then
+    gt_say "would fetch refs/heads/$base from $remote"
+    gt_find_remote_ref_exact_url "$url" "refs/heads/$base" || status=$?
+    case "$status" in
+      0) _exact_base_oid=$GT_REMOTE_REF_OID ;;
+      1) return 1 ;;
+      *) return 2 ;;
+    esac
+  else
+    gt_snapshot_and_fetch_ref_exact_url "$url" "refs/heads/$base" || return $?
+    _exact_base_oid=$GT_EXACT_REF_OID
+  fi
 }
 
 _preflight_local_plan() {
   local remote="$1"
-  local base="$2"
-  local head="$3"
-  local current_worktree base_worktree head_worktree operation status
+  local url="$2"
+  local base="$3"
+  local current_worktree base_worktree operation status ref_status=0
 
-  _fetch_remote "$remote"
-  _remote_branch_exists "$remote" "$base" ||
-    gt_die "base branch does not exist on $remote: $base"
+  _load_exact_base_oid "$remote" "$url" "$base" || ref_status=$?
+  case "$ref_status" in
+    0) ;;
+    1) gt_die "base branch does not exist on $remote: $base" ;;
+    *) gt_die "could not fetch exact base branch from $remote: $base" ;;
+  esac
+  _preflight_base_oid=$_exact_base_oid
 
-  if _local_branch_exists "$base" &&
-    ! git merge-base --is-ancestor "$base" "$remote/$base" 2>/dev/null; then
-    gt_die "local $base cannot fast-forward to $remote/$base"
+  ref_status=0
+  _local_branch_exists "$base" || ref_status=$?
+  if [[ "$ref_status" == 0 ]]; then
+    git merge-base --is-ancestor "$GT_REF_OID" "$_preflight_base_oid" 2>/dev/null ||
+      gt_die "local $base cannot fast-forward to $remote/$base"
+  elif [[ "$ref_status" != 1 ]]; then
+    gt_die "could not inspect local base branch: $base"
   fi
 
-  current_worktree=$(_current_worktree) || gt_die "could not resolve current worktree"
-  operation=$(gt_worktree_operation "$current_worktree")
+  gt_find_current_worktree || gt_die "could not resolve current worktree"
+  current_worktree=$GT_WORKTREE_PATH
+  operation=$(gt_worktree_operation "$current_worktree") ||
+    gt_die "could not inspect current worktree operation"
   [[ -z "$operation" ]] ||
     gt_die "current worktree has $operation in progress: $current_worktree"
-  base_worktree=$(gt_worktree_reserving_branch "$base")
-  head_worktree=$(gt_worktree_reserving_branch "$head")
-
+  gt_find_worktree_reserving_branch "$base" ||
+    gt_die "could not inspect worktrees"
+  base_worktree=$GT_WORKTREE_PATH
   if [[ -n "$base_worktree" ]]; then
-    operation=$(gt_worktree_operation "$base_worktree")
+    operation=$(gt_worktree_operation "$base_worktree") ||
+      gt_die "could not inspect base worktree operation: $base_worktree"
     [[ -z "$operation" ]] ||
       gt_die "base worktree has $operation in progress: $base_worktree"
     status=$(_worktree_status "$base_worktree") ||
       gt_die "could not inspect base worktree: $base_worktree"
     [[ -z "$status" ]] || gt_die "base worktree must be clean: $base_worktree"
   fi
-
-  [[ "$_keep_branch" == 1 || -z "$head_worktree" ]] && return 0
-  if [[ "$head_worktree" != "$current_worktree" ]]; then
-    gt_die "PR branch is checked out in another worktree: $head_worktree (use --keep-branch or remove that worktree)"
-  fi
-  if [[ -n "$base_worktree" && "$base_worktree" != "$current_worktree" ]]; then
-    gt_die "cannot delete $head while $base is checked out in $base_worktree (use --keep-branch or remove that worktree)"
-  fi
 }
 
 _sync_base() {
   local remote="$1"
-  local base="$2"
-  local current_worktree base_worktree
+  local url="$2"
+  local base="$3"
+  local current_worktree base_worktree base_oid ref_status=0
 
-  _fetch_remote "$remote" || return 1
-  _remote_branch_exists "$remote" "$base" || return 1
-  current_worktree=$(_current_worktree) || return 1
-  base_worktree=$(gt_worktree_reserving_branch "$base")
+  _load_exact_base_oid "$remote" "$url" "$base" || return 1
+  base_oid=$_exact_base_oid
+  gt_find_current_worktree || return 1
+  current_worktree=$GT_WORKTREE_PATH
+  gt_find_worktree_reserving_branch "$base" || return 1
+  base_worktree=$GT_WORKTREE_PATH
 
   if [[ -n "$base_worktree" && "$base_worktree" != "$current_worktree" ]]; then
-    _run gt_git_without_local_env -C "$base_worktree" merge --quiet --ff-only "$remote/$base" ||
+    _run gt_git_without_local_env -C "$base_worktree" merge --quiet --ff-only "$base_oid" ||
       return 1
     return 0
   fi
 
-  if _local_branch_exists "$base"; then
+  _local_branch_exists "$base" || ref_status=$?
+  if [[ "$ref_status" == 0 ]]; then
     _run git switch --quiet "$base" || return 1
-  elif _remote_branch_exists "$remote" "$base"; then
-    _run git switch --quiet -c "$base" --track "$remote/$base" || return 1
-  else
+  elif [[ "$ref_status" != 1 ]]; then
     return 1
+  else
+    _run git switch --quiet -c "$base" "$base_oid" || return 1
+    if [[ "$_dry_run" != 1 ]]; then
+      git config --local "branch.$base.remote" "$remote" || return 1
+      git config --local "branch.$base.merge" "refs/heads/$base" || return 1
+    fi
   fi
 
-  _run git merge --quiet --ff-only "$remote/$base"
+  _run git merge --quiet --ff-only "$base_oid"
 }
 
-_delete_local_head() {
-  local head="$1"
-  local current worktree
+_report_local_head() {
+  local head="$1" status=0
 
-  [[ "$_keep_branch" == 0 ]] || return 0
-  _local_branch_exists "$head" || return 0
-  if [[ "$_dry_run" == 1 ]]; then
-    _run git branch -D "$head"
-    return 0
-  fi
-  current=$(git symbolic-ref -q --short HEAD 2>/dev/null || true)
-  [[ "$current" != "$head" ]] || return 1
-  worktree=$(gt_worktree_reserving_branch "$head")
-  [[ -z "$worktree" ]] || return 1
-  _run git branch -D "$head"
+  _local_branch_exists "$head" || status=$?
+  case "$status" in
+    0)
+      gt_say "preserving local PR head $head at $GT_REF_OID; delete it manually after verifying no checkout is in flight"
+      ;;
+    1) ;;
+    *) return 1 ;;
+  esac
 }
 
 _cleanup_incomplete() {
   gt_die "PR #$_number merged; cleanup incomplete: $*"
+}
+
+_require_expected_topology() {
+  local view
+
+  [[ -n "$_expected_topology" ]] || return 0
+  view=$(gt_pr_view_tsv "$_url") ||
+    gt_die "could not revalidate PR #$_number topology"
+  gt_pr_record_matches_topology "$view" "$_expected_topology" ||
+    gt_die "PR #$_number topology changed since stack discovery"
 }
 
 gt_require_repo
@@ -238,11 +264,36 @@ if [[ "$_dry_run" != 1 ]]; then
   gt_require_clean_worktree
 fi
 
-_view=$(gt_pr_view_tsv "$_target") || gt_die "could not read pull request"
-IFS=$'\t' read -r _number _state _draft _merge_state _head _base _url _title <<<"$_view"
+_target_repo_status=0
+gt_validate_pr_target_repository "$_target" || _target_repo_status=$?
+case "$_target_repo_status" in
+  0) ;;
+  1) gt_die "target pull request belongs to a different repository" ;;
+  *) gt_die "could not resolve the current GitHub repository" ;;
+esac
 
-_checks=$(gt_pr_checks_status "$_target") || gt_die "could not read pull request checks"
+_view=$(gt_pr_view_tsv "$_target") || gt_die "could not read pull request"
+IFS=$'\t' read -r _number _state _draft _merge_state _head _head_oid _base \
+  _head_repo _cross_repo _url _title <<<"$_view"
+if [[ -n "$_expected_topology" ]]; then
+  gt_pr_record_matches_topology "$_view" "$_expected_topology" ||
+    gt_die "PR #$_number topology changed since stack discovery"
+else
+  _expected_topology=$(gt_pr_record_topology_tsv "$_view") ||
+    gt_die "could not snapshot PR #$_number topology"
+fi
+
+_target_repo_status=0
+gt_validate_pr_url_repository "$_url" || _target_repo_status=$?
+case "$_target_repo_status" in
+  0) ;;
+  1) gt_die "target pull request belongs to a different repository" ;;
+  *) gt_die "could not resolve the current GitHub repository" ;;
+esac
+
+_checks=$(gt_pr_checks_status "$_url") || gt_die "could not read pull request checks"
 _checks_state=$(gt_checks_ready_state "$_checks")
+_require_expected_topology
 
 if [[ "$_state" != "OPEN" ]]; then
   gt_die "PR #$_number is not open"
@@ -253,26 +304,69 @@ elif [[ "$_merge_state" != "CLEAN" ]]; then
 elif [[ "$_checks_state" != "pass" ]]; then
   gt_die "PR #$_number checks are $_checks_state"
 fi
+case "$_cross_repo" in
+  true | false) ;;
+  *) gt_die "could not parse pull request head repository state" ;;
+esac
 
-_remote=$(_remote_for_branch "$_base")
+_base_remote_status=0
+gt_find_current_repo_fetch_remote || _base_remote_status=$?
+case "$_base_remote_status" in
+  0)
+    _remote=$GT_REPO_FETCH_REMOTE
+    _base_remote_url=$GT_REPO_FETCH_REMOTE_URL
+    ;;
+  1) gt_die "could not resolve one exact fetch remote for the base repository" ;;
+  *) gt_die "could not inspect configured fetch remotes for the base repository" ;;
+esac
 if [[ "$_dry_run" != 1 ]]; then
-  _preflight_local_plan "$_remote" "$_base" "$_head"
+  _preflight_local_plan "$_remote" "$_base_remote_url" "$_base"
+  _head_remote=""
+  _head_remote_url=""
+  _head_remote_map_status=0
+  gt_find_pr_head_remote "$_head" "$_head_repo" "$_url" ||
+    _head_remote_map_status=$?
+  case "$_head_remote_map_status" in
+    0)
+      _head_remote=$GT_PR_HEAD_REMOTE
+      _head_remote_url=$GT_PR_HEAD_REMOTE_URL
+      ;;
+    1) ;;
+    *) gt_die "could not inspect configured remotes for PR head $_head" ;;
+  esac
+  _remote_head_oid=""
+  _remote_head_status=0
+  if [[ -n "$_head_remote_url" ]]; then
+    gt_find_remote_ref_exact_url "$_head_remote_url" "refs/heads/$_head" ||
+      _remote_head_status=$?
+    case "$_remote_head_status" in
+      0)
+        _remote_head_oid=$GT_REMOTE_REF_OID
+        [[ "$_remote_head_oid" == "$_head_oid" ]] ||
+          gt_die "remote PR head $_head_remote/$_head does not match PR #$_number head OID"
+        ;;
+      1) gt_die "remote PR head does not exist: $_head_remote/$_head" ;;
+      *) gt_die "could not snapshot remote branch $_head_remote/$_head" ;;
+    esac
+  fi
 fi
-_merge_args=(pr merge "$_number" "--$_method")
-if [[ "$_keep_branch" == 0 ]]; then
-  _merge_args+=(--delete-branch)
-fi
+_merge_args=(merge "$_number" "--$_method" --match-head-commit "$_head_oid")
 
+_require_expected_topology
 gt_say "merging PR #$_number with $_method"
 _merge_status=0
-_run gh "${_merge_args[@]}" || _merge_status=$?
+_run gt_gh_pr "${_merge_args[@]}" || _merge_status=$?
 if [[ "$_dry_run" != 1 ]]; then
-  _after_view=$(gt_pr_view_tsv "$_number") || {
+  _after_view=$(gt_pr_view_tsv "$_url") || {
     if ((_merge_status != 0)); then
       gt_die "merge command failed and PR #$_number state could not be verified"
     fi
     gt_die "merge command succeeded but PR #$_number state could not be verified"
   }
+  if [[ -n "$_expected_topology" ]] &&
+    ! gt_pr_record_matches_topology "$_after_view" "$_expected_topology"; then
+    gt_die "PR #$_number merged; cleanup incomplete: topology changed after merge"
+  fi
   IFS=$'\t' read -r _ _after_state _ <<<"$_after_view"
   if [[ "$_after_state" != "MERGED" ]]; then
     if ((_merge_status != 0)); then
@@ -286,9 +380,14 @@ if [[ "$_dry_run" != 1 ]]; then
 fi
 
 gt_say "syncing $_base from $_remote"
-_sync_base "$_remote" "$_base" ||
+_sync_base "$_remote" "$_base_remote_url" "$_base" ||
   _cleanup_incomplete "could not fast-forward $_base from $_remote"
-_delete_local_head "$_head" ||
-  _cleanup_incomplete "local branch $_head is still checked out in a worktree"
+if [[ "$_dry_run" != 1 && -n "${_head_remote_url:-}" ]]; then
+  gt_say "preserving remote PR head $_head at $_remote_head_oid; delete it manually after verifying no pull request consumes it"
+elif [[ "$_dry_run" != 1 ]]; then
+  gt_say "preserving remote PR head $_head; no configured remote maps to $_head_repo"
+fi
+_report_local_head "$_head" ||
+  _cleanup_incomplete "could not inspect local branch $_head for manual cleanup"
 
 gt_say "landed PR #$_number ($_head -> $_base)"

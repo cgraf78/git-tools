@@ -13,11 +13,34 @@ pull request for the current branch.
 .PP
 A stack is connected when one pull request's base branch is another pull
 request's head branch. If a stack branches into multiple child pull requests,
-the command stops instead of guessing a landing order.
+contains a cycle, or has multiple same-repository parent heads, the command
+stops instead of guessing a landing order.
+.PP
+URL targets must belong to the current GitHub repository. Discovery requests a
+201st sentinel record and fails closed when more than 200 pull requests are
+open, rather than returning a truncated stack.
+.PP
+Repository identity is derived with ambient GH_REPO and GH_HOST routing
+removed. List, view, and checks requests are pinned to that exact host and
+owner/repository, and every returned canonical pull request URL is validated.
+.PP
+Each structured record must have matching pull request numbers and canonical
+URLs, exact boolean fields, well-formed head and base refs, and a head repository
+consistent with its cross-repository flag. Its head OID must be a canonical
+40- or 64-digit lowercase hexadecimal value. Explicit numeric and URL targets
+must resolve to the same pull request number. Branch targets must resolve back
+to the exact head branch.
+The independently viewed target must also match its inventory topology;
+concurrent retargeting aborts discovery.
 .SH OPTIONS
 .TP
 .B \-\-porcelain
-Print one stable tab-separated record per pull request for scripts.
+Print one stable tab-separated schema-v1 record per pull request. Its nine
+columns remain kind, index, number, base, head, ready, reason, checks, and URL.
+.TP
+.B \-\-porcelain=v2
+Print a stable schema-v2 record. V2 appends head OID, structured head repository,
+and cross-repository flag to the nine schema-v1 columns.
 .TP
 .BR \-h ", " \-\-help
 Show help.
@@ -27,7 +50,7 @@ Show help.
 Stack printed.
 .TP
 .B 1
-Stack could not be read or is branched.
+Stack could not be read or has ambiguous, branched, or cyclic topology.
 .TP
 .B 2
 Usage or local environment error.

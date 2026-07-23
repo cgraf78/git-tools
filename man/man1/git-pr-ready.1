@@ -10,6 +10,9 @@ git-pr-ready \- check whether a GitHub pull request is landable
 checks whether a GitHub pull request is open, non-draft, conflict-free, and has
 passing checks. Without a target, it uses the pull request for the current
 branch.
+.PP
+Pull request and checks lookups are pinned to the repository derived from the
+current checkout, independent of ambient GitHub CLI routing.
 .SH OPTIONS
 .TP
 .B \-\-porcelain

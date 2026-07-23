@@ -6,5 +6,6 @@ end
 
 complete -c git-pr-stack -f
 complete -c git-pr-stack -l porcelain -d "Print one stable tab-separated record per PR"
+complete -c git-pr-stack -a "--porcelain=v2" -d "Print one stable schema-v2 record per PR"
 complete -c git-pr-stack -s h -l help -d "Show help"
 complete -c git-pr-stack -a "(__git_pr_stack_refs)" -d "Pull request branch"

@@ -7,22 +7,10 @@ PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
 
 _failures=0
-_temps=()
-
-_tmpdir() {
-  local dir
-  dir=$(mktemp -d)
-  _temps+=("$dir")
-  printf '%s\n' "$dir"
-}
-
-_cleanup() {
-  local dir
-  for dir in "${_temps[@]}"; do
-    rm -rf "$dir"
-  done
-}
-trap _cleanup EXIT
+# shellcheck source=test/lib/test-temp.sh
+. "$ROOT/test/lib/test-temp.sh"
+gt_test_temp_init || exit 1
+_tmpdir() { gt_test_temp_dir; }
 
 _pass() {
   printf 'ok - %s\n' "$1"
@@ -67,9 +55,12 @@ set -euo pipefail
 printf '%s\n' "$*" >>"${STACK_LOG:?}"
 case "${STACK_CASE:-linear}" in
   linear)
-    printf 'pr\t0\t1\tmain\tfeature/a\ttrue\tready\tpass\thttps://example/pr/1\n'
-    printf 'pr\t1\t2\tfeature/a\tfeature/b\ttrue\tready\tpass\thttps://example/pr/2\n'
-    printf 'pr\t2\t3\tfeature/b\tfeature/c\ttrue\tready\tpass\thttps://example/pr/3\n'
+    oid_a=$(git rev-parse refs/heads/feature/a)
+    oid_b=$(git rev-parse refs/heads/feature/b)
+    oid_c=$(git rev-parse refs/heads/feature/c)
+    printf 'pr\t0\t1\tmain\tfeature/a\ttrue\tready\tpass\thttps://github.test/example/repo/pull/1\t%s\texample/repo\tfalse\n' "$oid_a"
+    printf 'pr\t1\t2\tfeature/a\tfeature/b\ttrue\tready\tpass\thttps://github.test/example/repo/pull/2\t%s\texample/repo\tfalse\n' "$oid_b"
+    printf 'pr\t2\t3\tfeature/b\tfeature/c\ttrue\tready\tpass\thttps://github.test/example/repo/pull/3\t%s\texample/repo\tfalse\n' "$oid_c"
     ;;
   empty)
     ;;
@@ -84,10 +75,51 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"${RESTACK_LOG:?}"
-exit "${RESTACK_STATUS:-0}"
+status=${RESTACK_STATUS:-0}
+((status == 0)) || exit "$status"
+case " $* " in
+  *" --dry-run "* | *" --no-push "*) exit 0 ;;
+esac
+number=${1##*/}
+case "$number" in
+  1) head=feature/a ;;
+  2) head=feature/b ;;
+  3) head=feature/c ;;
+  *) exit 99 ;;
+esac
+old=$(git rev-parse "refs/heads/$head")
+tree=$(git rev-parse "$old^{tree}")
+new=$(printf 'sync-%s\n' "$head" | git commit-tree "$tree" -p "$old")
+git update-ref "refs/heads/$head" "$new" "$old"
 EOF
 
-  chmod +x "$dir/git-pr-stack" "$dir/git-pr-restack"
+  cat >"$dir/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1 $2" == "auth status" ]]; then
+  exit 0
+fi
+if [[ "$1 $2" == "repo view" ]]; then
+  printf 'example/repo\thttps://github.test/example/repo\n'
+  exit 0
+fi
+if [[ "$1 $2" == "pr view" ]]; then
+  number=${3##*/}
+  case "$number" in
+    1) head=feature/a; base=main; title=Root ;;
+    2) head=feature/b; base=feature/a; title=Child ;;
+    3) head=feature/c; base=feature/b; title=Grandchild ;;
+    *) exit 99 ;;
+  esac
+  oid=$(git rev-parse "refs/heads/$head")
+  printf '%s\tOPEN\tfalse\tCLEAN\t%s\t%s\t%s\texample/repo\tfalse\thttps://github.test/example/repo/pull/%s\t%s PR\n' \
+    "$number" "$head" "$oid" "$base" "$number" "$title"
+  exit 0
+fi
+exit 99
+EOF
+
+  chmod +x "$dir/git-pr-stack" "$dir/git-pr-restack" "$dir/gh"
 }
 
 echo "=== git pr-sync-stack ==="
@@ -99,21 +131,140 @@ restack_log=$(_tmpdir)/restack.log
 export STACK_LOG="$stack_log"
 export RESTACK_LOG="$restack_log"
 _git_init "$repo"
+git -C "$repo" branch feature/a
+git -C "$repo" branch feature/b
+git -C "$repo" branch feature/c
 _write_tool_stubs "$bin_dir"
 
+oid_a=$(git -C "$repo" rev-parse refs/heads/feature/a)
+oid_b=$(git -C "$repo" rev-parse refs/heads/feature/b)
+
 result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-sync-stack 2 2>&1)
-_assert_contains "passes target to stack" "--porcelain 2" "$(<"$stack_log")"
-_assert_contains "restacks root onto current base" "1 --base main" "$(<"$restack_log")"
-_assert_contains "restacks child onto parent head" "2 --base feature/a" "$(<"$restack_log")"
-_assert_contains "restacks grandchild onto parent head" "3 --base feature/b" "$(<"$restack_log")"
+_assert_contains "passes target to stack" "--porcelain=v2 2" "$(<"$stack_log")"
+_assert_contains "restacks root onto current base" \
+  "https://github.test/example/repo/pull/1 --base main" "$(<"$restack_log")"
+_assert_contains "restacks child onto parent head" \
+  "https://github.test/example/repo/pull/2 --base feature/a" "$(<"$restack_log")"
+_assert_contains "restacks grandchild onto parent head" \
+  "https://github.test/example/repo/pull/3 --base feature/b" "$(<"$restack_log")"
+_assert_contains "binds restacks to discovered topology" \
+  $'--expect-topology 2\tfeature/b\t'"$oid_b"$'\tfeature/a\texample/repo\tfalse\thttps://github.test/example/repo/pull/2' \
+  "$(<"$restack_log")"
+_assert_contains "child drops commits through the original parent OID" \
+  "--fork oid:$oid_a" "$(<"$restack_log")"
+_assert_contains "grandchild drops commits through the original child OID" \
+  "--fork oid:$oid_b" "$(<"$restack_log")"
 _assert_contains "reports stack sync" "synced 3 PR(s)" "$result"
 
 : >"$stack_log"
 : >"$restack_log"
+dry_parent_oid=$(git -C "$repo" rev-parse refs/heads/feature/a)
 result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-sync-stack 2 --base release --no-push --dry-run 2>&1)
-_assert_contains "root base can be overridden" "1 --base release --no-push --dry-run" "$(<"$restack_log")"
-_assert_contains "children still rebase onto parent heads" "2 --base feature/a --no-push --dry-run" "$(<"$restack_log")"
+_assert_contains "root base can be overridden" \
+  "https://github.test/example/repo/pull/1 --base release --no-push --dry-run" \
+  "$(<"$restack_log")"
+_assert_contains "children still rebase onto parent heads" \
+  "https://github.test/example/repo/pull/2 --base feature/a --base-oid $dry_parent_oid --fork" \
+  "$(<"$restack_log")"
 _assert_contains "dry run reports composed restack" "would run:" "$result"
+
+# Exercise the production restack command in local-only mode. Rewriting the root
+# onto release changes its OID; each child must then use that rewritten local OID
+# as its exact base rather than resolving the stale remote parent branch.
+graph_repo=$(_tmpdir)
+graph_remote=$(_tmpdir)/remote.git
+graph_bin=$(_tmpdir)
+graph_stack_log=$(_tmpdir)/stack.log
+graph_restack_log=$(_tmpdir)/restack.log
+git init -q --bare --initial-branch=main "$graph_remote"
+_git_init "$graph_repo"
+git -C "$graph_repo" config "url.$graph_remote.insteadOf" \
+  https://github.test/example/repo.git
+git -C "$graph_repo" remote add origin https://github.test/example/repo.git
+git -C "$graph_repo" push -q -u origin main
+git -C "$graph_repo" switch -q -c release
+printf 'release\n' >"$graph_repo/release.txt"
+git -C "$graph_repo" add release.txt
+git -C "$graph_repo" commit -qm release
+git -C "$graph_repo" push -q -u origin release
+git -C "$graph_repo" switch -q main
+git -C "$graph_repo" switch -q -c feature/a
+printf 'a\n' >"$graph_repo/a.txt"
+git -C "$graph_repo" add a.txt
+git -C "$graph_repo" commit -qm a
+git -C "$graph_repo" push -q -u origin feature/a
+git -C "$graph_repo" switch -q -c feature/b
+printf 'b\n' >"$graph_repo/b.txt"
+git -C "$graph_repo" add b.txt
+git -C "$graph_repo" commit -qm b
+git -C "$graph_repo" push -q -u origin feature/b
+git -C "$graph_repo" switch -q -c feature/c
+printf 'c\n' >"$graph_repo/c.txt"
+git -C "$graph_repo" add c.txt
+git -C "$graph_repo" commit -qm c
+git -C "$graph_repo" push -q -u origin feature/c
+graph_original_a=$(git -C "$graph_repo" rev-parse feature/a)
+_write_tool_stubs "$graph_bin"
+rm -f "$graph_bin/git-pr-restack"
+cat >"$graph_bin/git-pr-restack" <<EOF
+#!/usr/bin/env bash
+PATH="$graph_bin:$ROOT/bin:/usr/bin:/bin"
+export PATH
+exec "$ROOT/bin/git-pr-restack" "\$@"
+EOF
+chmod +x "$graph_bin/git-pr-restack"
+cat >"$graph_bin/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-} ${2:-} ${3:-} ${4:-}" == "remote get-url --push --all" ]]; then
+  remote=${5:-}
+  url=$(/usr/bin/git config --get-all "remote.$remote.pushurl" 2>/dev/null || true)
+  [[ -n "$url" ]] || url=$(/usr/bin/git config --get-all "remote.$remote.url")
+  printf '%s\n' "$url"
+  exit 0
+fi
+if [[ "${1:-} ${2:-} ${3:-}" == "remote get-url --all" ]]; then
+  /usr/bin/git config --get-all "remote.${4:-}.url"
+  exit $?
+fi
+if [[ "${1:-}" == -c && "${2:-}" == url.*.insteadOf=* &&
+  "${3:-}" == -c && "${4:-}" == url.*.pushInsteadOf=* ]]; then
+  pin=${2#url.}
+  target=${pin%%.insteadOf=*}
+  alias=${pin#*.insteadOf=}
+  shift 4
+  rewritten=()
+  for argument in "$@"; do
+    [[ "$argument" != "$alias" ]] || argument=$target
+    rewritten+=("$argument")
+  done
+  set -- "${rewritten[@]}"
+fi
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$graph_bin/git"
+graph_result=$(cd "$graph_repo" && STACK_LOG="$graph_stack_log" \
+  RESTACK_LOG="$graph_restack_log" PATH="$graph_bin:$ROOT/bin:$PATH" \
+  "$ROOT/bin/git-pr-sync-stack" 2 --base release --no-push 2>&1)
+graph_new_a=$(git -C "$graph_repo" rev-parse feature/a)
+graph_new_b=$(git -C "$graph_repo" rev-parse feature/b)
+graph_new_c=$(git -C "$graph_repo" rev-parse feature/c)
+if [[ "$graph_new_a" != "$graph_original_a" ]]; then
+  _pass "no-push graph rewrites the root onto the override base"
+else
+  _fail "no-push graph rewrites the root onto the override base"
+fi
+if git -C "$graph_repo" merge-base --is-ancestor "$graph_new_a" "$graph_new_b"; then
+  _pass "no-push graph propagates rewritten root OID to child"
+else
+  _fail "no-push graph propagates rewritten root OID to child"
+fi
+if git -C "$graph_repo" merge-base --is-ancestor "$graph_new_b" "$graph_new_c"; then
+  _pass "no-push graph propagates rewritten child OID to grandchild"
+else
+  _fail "no-push graph propagates rewritten child OID to grandchild"
+fi
+_assert_contains "no-push graph reports completion" "synced 3 PR(s)" "$graph_result"
 
 result=$(STACK_CASE=empty PATH="$bin_dir:$PATH" git -C "$repo" pr-sync-stack 2 2>&1 || true)
 _assert_contains "requires stack records" "no pull requests found in stack" "$result"

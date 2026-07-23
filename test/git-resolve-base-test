@@ -6,23 +6,12 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
 
+# shellcheck source=test/lib/test-temp.sh
+. "$ROOT/test/lib/test-temp.sh"
+gt_test_temp_init || exit 1
+
 _failures=0
-_temps=()
-
-_tmpdir() {
-  local dir
-  dir=$(mktemp -d)
-  _temps+=("$dir")
-  printf '%s\n' "$dir"
-}
-
-_cleanup() {
-  local dir
-  for dir in "${_temps[@]}"; do
-    rm -rf "$dir"
-  done
-}
-trap _cleanup EXIT
+_tmpdir() { gt_test_temp_dir; }
 
 _pass() {
   printf 'ok - %s\n' "$1"
@@ -101,6 +90,34 @@ git -C "$repo" commit -q -am "tracked work"
 result=$(git -C "$repo" resolve-base --ref 2>&1)
 _assert_eq "--ref reports the configured upstream" "main" "$result"
 
+# A rewritten upstream retains the original branch point in its reflog even
+# when the current graph merge-base has moved farther back.
+fork_repo=$(_tmpdir)
+_git_init "$fork_repo"
+fork_ancestor=$(git -C "$fork_repo" rev-parse HEAD)
+printf 'old upstream tip\n' >>"$fork_repo/README.md"
+git -C "$fork_repo" commit -q -am "old upstream tip"
+fork_point=$(git -C "$fork_repo" rev-parse HEAD)
+git -C "$fork_repo" switch -q -c topic
+git -C "$fork_repo" branch -q --set-upstream-to main >/dev/null
+printf 'topic\n' >"$fork_repo/topic.txt"
+git -C "$fork_repo" add topic.txt
+git -C "$fork_repo" commit -q -m "topic work"
+git -C "$fork_repo" branch -f main "$fork_ancestor"
+git -C "$fork_repo" switch -q -c rewritten-main "$fork_ancestor"
+printf 'rewritten upstream\n' >"$fork_repo/rewritten.txt"
+git -C "$fork_repo" add rewritten.txt
+git -C "$fork_repo" commit -q -m "rewritten upstream"
+git -C "$fork_repo" branch -f main HEAD
+git -C "$fork_repo" switch -q topic
+git -C "$fork_repo" branch -q -D rewritten-main
+plain_base=$(git -C "$fork_repo" merge-base main HEAD)
+_assert_eq "rewritten upstream moves the graph merge-base" \
+  "$fork_ancestor" "$plain_base"
+result=$(git -C "$fork_repo" resolve-base 2>&1)
+_assert_eq "fork-point preserves the pre-rewrite branch point" \
+  "$fork_point" "$result"
+
 # A branch off a remote default with no upstream resolves through origin/HEAD.
 remote=$(_tmpdir)
 clone=$(_tmpdir)
@@ -112,12 +129,154 @@ rm -rf "$clone"
 git clone -q "$remote" "$clone"
 git -C "$clone" config user.email "test@test.com"
 git -C "$clone" config user.name "Test"
+git -C "$clone" config core.hooksPath /dev/null
 remote_point=$(git -C "$clone" rev-parse origin/main)
 git -C "$clone" switch -q -c topic
 printf 'topic\n' >>"$clone/README.md"
 git -C "$clone" commit -q -am "topic work"
 result=$(git -C "$clone" resolve-base 2>&1)
 _assert_eq "resolves the remote default branch point" "$remote_point" "$result"
+
+# A remote that uses trunk must still resolve when it has no remote HEAD and
+# there is no same-named local branch to mask the remote fallback.
+trunk_remote=$(_tmpdir)
+trunk_seed=$(_tmpdir)
+trunk_clone=$(_tmpdir)
+git init -q --bare --initial-branch=trunk "$trunk_remote"
+git init -q --initial-branch=trunk "$trunk_seed"
+git -C "$trunk_seed" config user.email "test@test.com"
+git -C "$trunk_seed" config user.name "Test"
+git -C "$trunk_seed" config core.hooksPath /dev/null
+printf 'trunk base\n' >"$trunk_seed/README.md"
+git -C "$trunk_seed" add README.md
+git -C "$trunk_seed" commit -q -m "trunk base"
+git -C "$trunk_seed" remote add origin "$trunk_remote"
+git -C "$trunk_seed" push -q -u origin trunk
+rm -rf "$trunk_clone"
+git clone -q "$trunk_remote" "$trunk_clone"
+git -C "$trunk_clone" config user.email "test@test.com"
+git -C "$trunk_clone" config user.name "Test"
+git -C "$trunk_clone" config core.hooksPath /dev/null
+trunk_point=$(git -C "$trunk_clone" rev-parse refs/remotes/origin/trunk)
+git -C "$trunk_clone" switch -q -c topic
+git -C "$trunk_clone" branch -D trunk >/dev/null
+git -C "$trunk_clone" symbolic-ref -d refs/remotes/origin/HEAD
+printf 'topic\n' >>"$trunk_clone/README.md"
+git -C "$trunk_clone" commit -q -am "topic work"
+
+result=$(git -C "$trunk_clone" resolve-base --ref 2>&1)
+status=$?
+_assert_eq "origin/trunk resolution succeeds" "0" "$status"
+_assert_eq "resolves origin/trunk without a remote HEAD" "origin/trunk" "$result"
+
+git -C "$trunk_clone" remote rename origin upstream
+git -C "$trunk_clone" symbolic-ref -d refs/remotes/upstream/HEAD 2>/dev/null || true
+git -C "$trunk_clone" branch upstream/trunk HEAD
+result=$(git -C "$trunk_clone" resolve-base --ref 2>&1)
+status=$?
+_assert_eq "non-origin remote trunk resolution succeeds" "0" "$status"
+_assert_eq "resolves a non-origin remote trunk branch" "upstream/trunk" "$result"
+result=$(git -C "$trunk_clone" resolve-base 2>&1)
+_assert_eq "remote trunk is not shadowed by a same-named local branch" \
+  "$trunk_point" "$result"
+
+# Remote candidates must be resolved by their exact refnames. A local branch
+# whose name resembles a remote-tracking branch must not shadow local main.
+shadow_repo=$(_tmpdir)
+_git_init "$shadow_repo"
+git -C "$shadow_repo" branch origin/trunk HEAD
+printf 'main work\n' >>"$shadow_repo/README.md"
+git -C "$shadow_repo" commit -q -am "main work"
+git -C "$shadow_repo" switch -q -c topic
+printf 'topic\n' >>"$shadow_repo/README.md"
+git -C "$shadow_repo" commit -q -am "topic work"
+result=$(git -C "$shadow_repo" resolve-base --ref 2>&1)
+status=$?
+_assert_eq "shadowed remote-like branch resolution succeeds" "0" "$status"
+_assert_eq "local origin/trunk cannot shadow local main" "main" "$result"
+
+# A failed remote inventory is not an empty inventory. Do not silently fall
+# through to a potentially older local default branch.
+git -C "$trunk_clone" branch --no-track main "refs/remotes/upstream/trunk"
+git -C "$trunk_clone" branch --unset-upstream 2>/dev/null || :
+failure_bin=$(_tmpdir)
+original_path=$PATH
+# Use the original executable search path inside the mock. The active `git`
+# may itself be a launcher that locates a platform Git through PATH.
+cat >"$failure_bin/git" <<EOF
+#!/bin/sh
+if [ "\${FAIL_UPSTREAM_LOOKUP-}" = 1 ]; then
+  if [ "\${1-}" = rev-parse ] && [ "\${2-}" = --symbolic-full-name ] &&
+    [ "\${3-}" = '@{upstream}' ]; then
+    exit 70
+  fi
+  if [ "\${1-}" = for-each-ref ] &&
+    [ "\${2-}" = '--format=%(refname)%09%(upstream)' ]; then
+    exit 70
+  fi
+fi
+if [ "\${1-}" = "\${FAIL_GIT_SUBCOMMAND-}" ]; then
+  exit 70
+fi
+if [ "\${1-}" = "\${FAIL_GIT_SUBCOMMAND_ONCE-}" ] &&
+  mkdir "\${FAIL_GIT_ONCE_MARKER:?}" 2>/dev/null; then
+  exit 70
+fi
+if [ "\${MOVE_REF_AFTER_REV_PARSE-}" = 1 ] &&
+  [ "\${1-}" = rev-parse ] && [ "\${2-}" = --verify ] &&
+  [ "\${3-}" = "\${MOVE_REF:?}^{commit}" ] &&
+  mkdir "\${MOVE_REF_ONCE_MARKER:?}" 2>/dev/null; then
+  output=\$(env PATH="\${REAL_GIT_PATH:?}" git "\$@") || exit \$?
+  printf '%s\n' "\$output"
+  env PATH="\$REAL_GIT_PATH" git -C "\${MOVE_REF_REPO:?}" update-ref \
+    "\$MOVE_REF" "\${MOVE_REF_TO:?}"
+  exit \$?
+fi
+exec env PATH="\${REAL_GIT_PATH:?}" git "\$@"
+EOF
+chmod +x "$failure_bin/git"
+
+result=$(cd "$trunk_clone" && FAIL_UPSTREAM_LOOKUP=1 \
+  REAL_GIT_PATH="$original_path" PATH="$failure_bin:$PATH" \
+  "$ROOT/bin/git-resolve-base" --ref 2>&1)
+status=$?
+_assert_eq "upstream lookup failure is fatal" "2" "$status"
+_assert_contains "upstream lookup failure does not select another base" \
+  "could not determine branch base" "$result"
+
+merge_base_once_marker="$failure_bin/merge-base-once"
+result=$(cd "$trunk_clone" && FAIL_GIT_SUBCOMMAND_ONCE=merge-base \
+  FAIL_GIT_ONCE_MARKER="$merge_base_once_marker" \
+  REAL_GIT_PATH="$original_path" PATH="$failure_bin:$PATH" \
+  "$ROOT/bin/git-resolve-base" --ref 2>&1)
+status=$?
+_assert_eq "merge-base operational failure is fatal" "2" "$status"
+_assert_contains "merge-base failure does not select another base" \
+  "could not determine branch base" "$result"
+
+race_ref=refs/remotes/upstream/trunk
+race_ref_once_marker="$failure_bin/ref-race-once"
+race_target=$(git -C "$trunk_clone" rev-parse HEAD)
+result=$(cd "$trunk_clone" && MOVE_REF_AFTER_REV_PARSE=1 \
+  MOVE_REF="$race_ref" MOVE_REF_ONCE_MARKER="$race_ref_once_marker" \
+  MOVE_REF_REPO="$trunk_clone" MOVE_REF_TO="$race_target" \
+  REAL_GIT_PATH="$original_path" PATH="$failure_bin:$PATH" \
+  "$ROOT/bin/git-resolve-base" --ref 2>&1)
+status=$?
+_assert_eq "remote default movement is fatal" "2" "$status"
+_assert_contains "remote movement does not return a mixed snapshot" \
+  "could not determine branch base" "$result"
+git -C "$trunk_clone" update-ref "$race_ref" "$trunk_point"
+
+for failed_subcommand in for-each-ref remote show-ref; do
+  result=$(cd "$trunk_clone" && FAIL_GIT_SUBCOMMAND="$failed_subcommand" \
+    REAL_GIT_PATH="$original_path" \
+    PATH="$failure_bin:$PATH" "$ROOT/bin/git-resolve-base" --ref 2>&1)
+  status=$?
+  _assert_eq "$failed_subcommand failure is fatal" "2" "$status"
+  _assert_contains "$failed_subcommand failure does not select local main" \
+    "could not determine branch base" "$result"
+done
 
 # Guard rails.
 result=$(git -C "$repo" resolve-base --ref --short 2>&1 || true)

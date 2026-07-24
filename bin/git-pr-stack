@@ -29,15 +29,16 @@ Usage: git pr-stack [options] [<number|url|branch>]
 Discover the linear GitHub pull-request stack connected to a target PR and print
 it in parent-to-child order. Without a target, uses the PR for the current
 branch. A stack is connected when one PR's base branch is another PR's head
-branch.
+branch. Ambiguous, branched, or cyclic topology fails closed.
 
 Options:
-      --porcelain   Print one stable tab-separated record per PR.
+      --porcelain      Print one stable schema-v1 record per PR.
+      --porcelain=v2   Print one stable schema-v2 record per PR.
   -h, --help        Show this help.
 
 Exit status:
   0  Stack printed.
-  1  Stack could not be read or is branched.
+  1  Stack could not be read or has invalid topology.
   2  Usage or local environment error.
 EOF
 }
@@ -50,6 +51,13 @@ while (($#)); do
     --porcelain)
       _porcelain=1
       shift
+      ;;
+    --porcelain=v2)
+      _porcelain=2
+      shift
+      ;;
+    --porcelain=*)
+      gt_usage_error "unsupported porcelain version: ${1#*=}"
       ;;
     -h | --help)
       _usage
@@ -103,21 +111,39 @@ _head() {
 }
 
 _base() {
-  local number state draft merge_state head base _rest
-  IFS=$'\t' read -r number state draft merge_state head base _rest <<<"$1"
+  local number state draft merge_state head head_oid base _rest
+  IFS=$'\t' read -r number state draft merge_state head head_oid base _rest <<<"$1"
   printf '%s\n' "$base"
 }
 
+_head_oid() {
+  local number state draft merge_state head head_oid _rest
+  IFS=$'\t' read -r number state draft merge_state head head_oid _rest <<<"$1"
+  printf '%s\n' "$head_oid"
+}
+
 _url() {
-  local number state draft merge_state head base url _rest
-  IFS=$'\t' read -r number state draft merge_state head base url _rest <<<"$1"
+  local number state draft merge_state head head_oid base head_repo cross url _rest
+  IFS=$'\t' read -r number state draft merge_state head head_oid base head_repo cross url _rest <<<"$1"
   printf '%s\n' "$url"
 }
 
 _title() {
-  local number state draft merge_state head base url title
-  IFS=$'\t' read -r number state draft merge_state head base url title <<<"$1"
+  local number state draft merge_state head head_oid base head_repo cross url title
+  IFS=$'\t' read -r number state draft merge_state head head_oid base head_repo cross url title <<<"$1"
   printf '%s\n' "$title"
+}
+
+_head_repo() {
+  local number state draft merge_state head head_oid base head_repo _rest
+  IFS=$'\t' read -r number state draft merge_state head head_oid base head_repo _rest <<<"$1"
+  printf '%s\n' "$head_repo"
+}
+
+_cross_repo() {
+  local number state draft merge_state head head_oid base head_repo cross _rest
+  IFS=$'\t' read -r number state draft merge_state head head_oid base head_repo cross _rest <<<"$1"
+  printf '%s\n' "$cross"
 }
 
 _find_by_number() {
@@ -133,13 +159,18 @@ _find_by_number() {
 
 _find_by_head() {
   local want="$1"
-  local record
+  local record found="" count=0
   for record in "${_prs[@]}"; do
+    [[ "$(_cross_repo "$record")" == false ]] || continue
     [[ "$(_head "$record")" == "$want" ]] || continue
-    printf '%s\n' "$record"
-    return 0
+    found=$record
+    count=$((count + 1))
   done
-  return 1
+  if ((count > 1)); then
+    return 2
+  fi
+  [[ "$count" == 1 ]] || return 1
+  printf '%s\n' "$found"
 }
 
 _parent_of() {
@@ -152,6 +183,9 @@ _child_of() {
   local child_base
   local found="" count=0 candidate
 
+  # A fork head is not a branch in the repository whose open PRs are being
+  # listed, so it cannot be another listed PR's base branch.
+  [[ "$(_cross_repo "$record")" == false ]] || return 1
   child_base=$(_head "$record")
   for candidate in "${_prs[@]}"; do
     [[ "$(_base "$candidate")" == "$child_base" ]] || continue
@@ -160,7 +194,7 @@ _child_of() {
   done
 
   if ((count > 1)); then
-    gt_die "stack is branched at $child_base; multiple child PRs found"
+    return 2
   fi
   [[ "$count" == 1 ]] || return 1
   printf '%s\n' "$found"
@@ -175,11 +209,19 @@ _prepend_stack() {
   _stack=("$record" "${_stack[@]}")
 }
 
+_stack_contains_number() {
+  local want="$1" record
+  for record in "${_stack[@]}"; do
+    [[ "$(_number "$record")" != "$want" ]] || return 0
+  done
+  return 1
+}
+
 _record_ready() {
   local record="$1"
   local checks checks_state
 
-  checks=$(gt_pr_checks_status "$(_number "$record")") || return 1
+  checks=$(gt_pr_checks_status "$(_url "$record")") || return 1
   checks_state=$(gt_checks_ready_state "$checks")
 
   if [[ "$(_state "$record")" != "OPEN" ]]; then
@@ -198,27 +240,80 @@ _record_ready() {
 gt_require_repo
 gt_require_gh
 
+_target_repo_status=0
+gt_validate_pr_target_repository "$_target" || _target_repo_status=$?
+case "$_target_repo_status" in
+  0) ;;
+  1) gt_die "target pull request belongs to a different repository" ;;
+  *) gt_die "could not resolve the current GitHub repository" ;;
+esac
+
+_pr_records=$(gt_pr_list_open_tsv) || gt_die "could not list open pull requests"
 _prs=()
 while IFS= read -r _record; do
   [[ -n "$_record" ]] || continue
+  case "$(_cross_repo "$_record")" in
+    true | false) ;;
+    *) gt_die "could not parse pull request repository identity" ;;
+  esac
   _prs+=("$_record")
-done < <(gt_pr_list_open_tsv)
+done <<<"$_pr_records"
 
 ((${#_prs[@]} > 0)) || gt_die "no open pull requests found"
 
 _target_view=$(gt_pr_view_tsv "$_target") || gt_die "could not read target pull request"
+_target_url=$(_url "$_target_view")
+_target_repo_status=0
+gt_validate_pr_url_repository "$_target_url" || _target_repo_status=$?
+case "$_target_repo_status" in
+  0) ;;
+  1) gt_die "target pull request belongs to a different repository" ;;
+  *) gt_die "could not resolve the current GitHub repository" ;;
+esac
 _target_number=$(_number "$_target_view")
 _current=$(_find_by_number "$_target_number") ||
   gt_die "target PR #$_target_number is not open"
+gt_pr_records_match_topology "$_target_view" "$_current" ||
+  gt_die "target PR #$_target_number topology changed while discovering the stack"
 
 _stack=("$_current")
 
-while _parent=$(_parent_of "${_stack[0]}"); do
-  _prepend_stack "$_parent"
+while :; do
+  _parent_status=0
+  _parent=$(_parent_of "${_stack[0]}") || _parent_status=$?
+  case "$_parent_status" in
+    0)
+      _parent_number=$(_number "$_parent")
+      if _stack_contains_number "$_parent_number"; then
+        gt_die "stack topology contains a cycle at PR #$_parent_number"
+      fi
+      _prepend_stack "$_parent"
+      ;;
+    1) break ;;
+    2)
+      gt_die "stack parent is ambiguous at $(_base "${_stack[0]}"); multiple same-repository heads found"
+      ;;
+    *) gt_die "could not discover stack parent" ;;
+  esac
 done
 
-while _child=$(_child_of "${_stack[${#_stack[@]} - 1]}"); do
-  _append_stack "$_child"
+while :; do
+  _child_status=0
+  _child=$(_child_of "${_stack[${#_stack[@]} - 1]}") || _child_status=$?
+  case "$_child_status" in
+    0)
+      _child_number=$(_number "$_child")
+      if _stack_contains_number "$_child_number"; then
+        gt_die "stack topology contains a cycle at PR #$_child_number"
+      fi
+      _append_stack "$_child"
+      ;;
+    1) break ;;
+    2)
+      gt_die "stack is branched at $(_head "${_stack[${#_stack[@]} - 1]}"); multiple child PRs found"
+      ;;
+    *) gt_die "could not discover stack child" ;;
+  esac
 done
 
 _index=0
@@ -226,10 +321,16 @@ for _record in "${_stack[@]}"; do
   _ready_info=$(_record_ready "$_record") || gt_die "could not read PR checks"
   IFS=$'\t' read -r _ready _reason _checks_state <<<"$_ready_info"
 
+  # Legacy Bash read binds the final URL, so v1 must stay exactly nine fields.
   if [[ "$_porcelain" == 1 ]]; then
     printf 'pr\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$_index" "$(_number "$_record")" "$(_base "$_record")" "$(_head "$_record")" \
       "$_ready" "$_reason" "$_checks_state" "$(_url "$_record")"
+  elif [[ "$_porcelain" == 2 ]]; then
+    printf 'pr\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$_index" "$(_number "$_record")" "$(_base "$_record")" "$(_head "$_record")" \
+      "$_ready" "$_reason" "$_checks_state" "$(_url "$_record")" \
+      "$(_head_oid "$_record")" "$(_head_repo "$_record")" "$(_cross_repo "$_record")"
   else
     printf '%s. #%s %s -> %s checks=%s ready=%s\n' \
       "$((_index + 1))" "$(_number "$_record")" "$(_base "$_record")" \

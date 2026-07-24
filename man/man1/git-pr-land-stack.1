@@ -17,6 +17,24 @@ and
 The command refuses the whole stack before merging anything if any pull request
 is not ready. As each parent lands, the next child is restacked onto the root
 base branch before it is landed.
+.PP
+URL targets and every discovered pull request are required to belong to the
+current GitHub repository before landing begins.
+.PP
+Repository-qualified pull request URLs are retained across discovery, landing,
+restacking, and post-restack readiness polling.
+.PP
+Every handoff revalidates the live pull request number, head, head OID, base,
+head repository, cross-repository state, and canonical URL before the next
+mutation. A child restack uses the parent's original head OID as its immutable
+fork boundary. The rewritten child OID is accepted only when a fresh PR record
+matches the local branch. Retargeting during discovery, a parent action, or
+readiness polling fails closed.
+.PP
+Local and remote heads are retained for manual cleanup. Stack topology is
+repository-qualified, so a
+same-named fork head is not treated as a base-repository parent. Cycles and
+ambiguous same-repository parents fail closed.
 .SH OPTIONS
 .TP
 .BR \-m ", " \-\-method " " \fImethod\fR

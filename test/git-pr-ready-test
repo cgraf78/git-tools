@@ -7,22 +7,10 @@ PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
 
 _failures=0
-_temps=()
-
-_tmpdir() {
-  local dir
-  dir=$(mktemp -d)
-  _temps+=("$dir")
-  printf '%s\n' "$dir"
-}
-
-_cleanup() {
-  local dir
-  for dir in "${_temps[@]}"; do
-    rm -rf "$dir"
-  done
-}
-trap _cleanup EXIT
+# shellcheck source=test/lib/test-temp.sh
+. "$ROOT/test/lib/test-temp.sh"
+gt_test_temp_init || exit 1
+_tmpdir() { gt_test_temp_dir; }
 
 _pass() {
   printf 'ok - %s\n' "$1"
@@ -82,16 +70,21 @@ if [[ "$1 $2" == "auth status" ]]; then
   exit 0
 fi
 
+if [[ "$1 $2" == "repo view" ]]; then
+  printf 'example/repo\thttps://github.test/example/repo\n'
+  exit 0
+fi
+
 if [[ "$1 $2" == "pr view" ]]; then
   case "${GH_PR_CASE:-ready}" in
     ready)
-      printf '12\tOPEN\tfalse\tCLEAN\tfeature/a\tmain\thttps://example/pr/12\tReady PR\n'
+      printf '12\tOPEN\tfalse\tCLEAN\tfeature/a\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/12\tReady PR\n'
       ;;
     draft)
-      printf '12\tOPEN\ttrue\tCLEAN\tfeature/a\tmain\thttps://example/pr/12\tDraft PR\n'
+      printf '12\tOPEN\ttrue\tCLEAN\tfeature/a\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/12\tDraft PR\n'
       ;;
     dirty)
-      printf '12\tOPEN\tfalse\tDIRTY\tfeature/a\tmain\thttps://example/pr/12\tDirty PR\n'
+      printf '12\tOPEN\tfalse\tDIRTY\tfeature/a\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/12\tDirty PR\n'
       ;;
   esac
   exit 0

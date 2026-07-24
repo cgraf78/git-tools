@@ -14,6 +14,9 @@ The command does not require GitHub access. If
 .B gh
 is unavailable or unauthenticated, local repository state is still reported and
 pull request fields are left empty.
+.PP
+When GitHub data is available, view and checks queries are pinned to the current
+checkout repository rather than ambient GitHub CLI routing.
 .SH OPTIONS
 .TP
 .B \-\-porcelain

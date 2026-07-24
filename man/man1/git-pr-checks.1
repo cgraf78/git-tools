@@ -10,6 +10,10 @@ git-pr-checks \- summarize GitHub pull request checks
 summarizes GitHub pull request checks. Without a target, it uses the pull
 request for the current branch.
 .PP
+The target and checks request are pinned to the host and owner/repository
+derived from the current checkout. Ambient GH_REPO and GH_HOST values are
+ignored.
+.PP
 The command preserves useful GitHub CLI status semantics: passing checks return
 0, pending checks return 8, and failing, cancelled, or missing checks return 1.
 .SH OPTIONS

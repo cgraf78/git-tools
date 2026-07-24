@@ -7,22 +7,10 @@ PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
 
 _failures=0
-_temps=()
-
-_tmpdir() {
-  local dir
-  dir=$(mktemp -d)
-  _temps+=("$dir")
-  printf '%s\n' "$dir"
-}
-
-_cleanup() {
-  local dir
-  for dir in "${_temps[@]}"; do
-    rm -rf "$dir"
-  done
-}
-trap _cleanup EXIT
+# shellcheck source=test/lib/test-temp.sh
+. "$ROOT/test/lib/test-temp.sh"
+gt_test_temp_init || exit 1
+_tmpdir() { gt_test_temp_dir; }
 
 _pass() {
   printf 'ok - %s\n' "$1"
@@ -47,6 +35,51 @@ _assert_contains() {
   fi
 }
 
+_assert_eq() {
+  local name="$1" expected="$2" actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %q\n' "$expected" >&2
+    printf '  actual:   %q\n' "$actual" >&2
+  fi
+}
+
+_assert_line() {
+  local name="$1" expected="$2" file="$3"
+  if grep -Fqx -- "$expected" "$file"; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected exact line: %s\n' "$expected" >&2
+    printf '  actual calls:\n%s\n' "$(<"$file")" >&2
+  fi
+}
+
+_run_with_deadline() {
+  local output_file="$1"
+  shift
+  local pid count=0 rc=0
+
+  "$@" >"$output_file" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && ((count < 2000)); do
+    sleep 0.01
+    count=$((count + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rc=124
+  else
+    wait "$pid" || rc=$?
+  fi
+  _deadline_rc=$rc
+  _deadline_output=$(<"$output_file")
+}
+
 _git_init() {
   local repo="$1"
   git init -q --initial-branch=main "$repo"
@@ -64,21 +97,136 @@ _write_gh_stub() {
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -n "${GH_CALL_LOG:-}" ]]; then
+  printf 'repo=%s host=%s argv=%s\n' \
+    "${GH_REPO:-}" "${GH_HOST:-}" "$*" >>"$GH_CALL_LOG"
+fi
+
 if [[ "$1 $2" == "auth status" ]]; then
   exit 0
+fi
+
+if [[ "$1 $2" == "repo view" ]]; then
+  case "${GH_REPO_VIEW_CASE:-current}" in
+    current) printf 'example/repo\thttps://github.test/example/repo\n' ;;
+    mismatch) printf 'example/repo\thttps://github.test/other/repo\n' ;;
+  esac
+  exit 0
+fi
+
+if [[ "$1" == pr && ("${GH_REPO:-}" != github.test/example/repo ||
+  "${GH_HOST:-}" != github.test) ]]; then
+  printf 'unbound gh route: repo=%s host=%s\n' \
+    "${GH_REPO:-}" "${GH_HOST:-}" >&2
+  exit 97
 fi
 
 if [[ "$1 $2" == "pr list" ]]; then
   case "${GH_STACK_CASE:-linear}" in
     linear)
-      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\tmain\thttps://example/pr/1\tParent PR\n'
-      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\tfeature/a\thttps://example/pr/2\tMiddle PR\n'
-      printf '3\tOPEN\tfalse\tCLEAN\tfeature/c\tfeature/b\thttps://example/pr/3\tChild PR\n'
+      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/1\tParent PR\n'
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tfeature/a\tExample/Repo\tfalse\thttps://github.test/example/repo/pull/2\tMiddle PR\n'
+      printf '3\tOPEN\tfalse\tCLEAN\tfeature/c\t1111111111111111111111111111111111111111\tfeature/b\texample/repo\tfalse\thttps://github.test/example/repo/pull/3\tChild PR\n'
       ;;
     branched)
-      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\tmain\thttps://example/pr/1\tParent PR\n'
-      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\tfeature/a\thttps://example/pr/2\tChild A\n'
-      printf '3\tOPEN\tfalse\tCLEAN\tfeature/c\tfeature/a\thttps://example/pr/3\tChild B\n'
+      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/1\tParent PR\n'
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tfeature/a\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tChild A\n'
+      printf '3\tOPEN\tfalse\tCLEAN\tfeature/c\t1111111111111111111111111111111111111111\tfeature/a\texample/repo\tfalse\thttps://github.test/example/repo/pull/3\tChild B\n'
+      ;;
+    partial-failure)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tfeature/a\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tPartial PR\n'
+      exit 88
+      ;;
+    foreign-record)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/foreign/repo/pull/2\tForeign record\n'
+      ;;
+    number-url-mismatch)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/3\tMismatched number\n'
+      ;;
+    noncanonical-url)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/2/files\tNoncanonical URL\n'
+      ;;
+    wrong-same-repo-head)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tmain\tforeign/repo\tfalse\thttps://github.test/example/repo/pull/2\tWrong head repository\n'
+      ;;
+    wrong-cross-repo-head)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tmain\texample/repo\ttrue\thttps://github.test/example/repo/pull/2\tWrong cross repository state\n'
+      ;;
+    malformed-draft)
+      printf '2\tOPEN\tmaybe\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tMalformed draft\n'
+      ;;
+    malformed-cross)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tmain\texample/repo\tmaybe\thttps://github.test/example/repo/pull/2\tMalformed cross state\n'
+      ;;
+    malformed-head-repo)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tmain\tbad owner/repo\tfalse\thttps://github.test/example/repo/pull/2\tMalformed head repository\n'
+      ;;
+    uppercase-head-oid)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\tAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tUppercase head OID\n'
+      ;;
+    short-head-oid)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tShort head OID\n'
+      ;;
+    nonhex-head-oid)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\tgggggggggggggggggggggggggggggggggggggggg\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tNonhex head OID\n'
+      ;;
+    sha256-head-oid)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t2222222222222222222222222222222222222222222222222222222222222222\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tSHA-256 head OID\n'
+      ;;
+    empty-head)
+      printf '2\tOPEN\tfalse\tCLEAN\t\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tEmpty head\n'
+      ;;
+    empty-base)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\t\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tEmpty base\n'
+      ;;
+    malformed-head)
+      printf '2\tOPEN\tfalse\tCLEAN\tbad..head\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tMalformed head\n'
+      ;;
+    malformed-base)
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tbad..base\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tMalformed base\n'
+      ;;
+    same-head-base)
+      printf '2\tOPEN\tfalse\tCLEAN\tmain\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tSame head and base\n'
+      ;;
+    fork-collision)
+      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\t1111111111111111111111111111111111111111\tmain\tforker/repo\ttrue\thttps://github.test/example/repo/pull/1\tFork PR\n'
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tfeature/a\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tSame-repo PR\n'
+      ;;
+    duplicate-head)
+      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/1\tFirst parent PR\n'
+      printf '4\tOPEN\tfalse\tCLEAN\tfeature/a\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tDuplicate parent PR\n'
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tfeature/a\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tChild PR\n'
+      ;;
+    parent-cycle)
+      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\t1111111111111111111111111111111111111111\tfeature/b\texample/repo\tfalse\thttps://github.test/example/repo/pull/1\tCycle A\n'
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tfeature/a\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tCycle B\n'
+      ;;
+    child-cycle)
+      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/1\tRoot PR\n'
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tfeature/a\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tCycle child A\n'
+      printf '3\tOPEN\tfalse\tCLEAN\tfeature/a\t1111111111111111111111111111111111111111\tfeature/b\texample/repo\tfalse\thttps://github.test/example/repo/pull/3\tCycle child B\n'
+      ;;
+    inventory-overflow)
+      limit=0
+      previous=""
+      for argument in "$@"; do
+        if [[ "$previous" == --limit ]]; then
+          limit=$argument
+          break
+        fi
+        previous=$argument
+      done
+      count=$limit
+      ((count <= 201)) || count=201
+      index=1
+      while ((index <= count)); do
+        if ((index == 201)); then
+          printf '201\tOPEN\tfalse\tCLEAN\tfeature/201\t1111111111111111111111111111111111111111\tfeature/1\texample/repo\tfalse\thttps://github.test/example/repo/pull/201\tHidden child\n'
+        else
+          printf '%s\tOPEN\tfalse\tCLEAN\tfeature/%s\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/%s\tVisible PR\n' "$index" "$index" "$index"
+        fi
+        index=$((index + 1))
+      done
       ;;
   esac
   exit 0
@@ -89,26 +237,47 @@ if [[ "$1 $2" == "pr view" ]]; then
   if [[ "${3:-}" != --* ]]; then
     target="${3:-}"
   fi
+  if [[ "${GH_VIEW_CASE:-}" == rebound ]]; then
+    printf '3\tOPEN\tfalse\tCLEAN\tfeature/c\t1111111111111111111111111111111111111111\tfeature/b\texample/repo\tfalse\thttps://github.test/example/repo/pull/3\tRebound PR\n'
+    exit 0
+  fi
+  if [[ "${GH_VIEW_CASE:-}" == topology-drift ]]; then
+    printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tRetargeted PR\n'
+    exit 0
+  fi
+  if [[ "${GH_STACK_CASE:-}" == sha256-head-oid ]]; then
+    printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t2222222222222222222222222222222222222222222222222222222222222222\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tSHA-256 head OID\n'
+    exit 0
+  fi
   case "${target:-2}" in
-    1 | feature/a)
-      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\tmain\thttps://example/pr/1\tParent PR\n'
+    https://github.test/foreign/repo/pull/2)
+      printf '2\tOPEN\tfalse\tCLEAN\tforeign-head\t1111111111111111111111111111111111111111\tmain\tforeign/repo\tfalse\thttps://github.test/foreign/repo/pull/2\tForeign PR\n'
       ;;
-    2 | feature/b | "")
-      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\tfeature/a\thttps://example/pr/2\tMiddle PR\n'
+    1 | feature/a)
+      base=main
+      [[ "${GH_STACK_CASE:-linear}" != parent-cycle ]] || base=feature/b
+      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\t1111111111111111111111111111111111111111\t%s\texample/repo\tfalse\thttps://github.test/example/repo/pull/1\tParent PR\n' "$base"
+      ;;
+    2 | feature/b | example:feature/b | \
+      https://github.test/example/repo/pull/2 | \
+      https://github.test/example/repo/pull/2/files | "")
+      printf '2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tfeature/a\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tMiddle PR\n'
       ;;
     3 | feature/c)
-      printf '3\tOPEN\tfalse\tCLEAN\tfeature/c\tfeature/b\thttps://example/pr/3\tChild PR\n'
+      printf '3\tOPEN\tfalse\tCLEAN\tfeature/c\t1111111111111111111111111111111111111111\tfeature/b\texample/repo\tfalse\thttps://github.test/example/repo/pull/3\tChild PR\n'
       ;;
   esac
   exit 0
 fi
 
 if [[ "$1 $2" == "pr checks" ]]; then
-  if [[ "${GH_NO_CHECKS_FOR:-}" == "${3:-}" ]]; then
+  target=${3:-}
+  number=${target##*/}
+  if [[ "${GH_NO_CHECKS_FOR:-}" == "$number" ]]; then
     printf "no checks reported on the 'feature/%s' branch\n" "${3:-unknown}"
     exit 1
   fi
-  case "${3:-}" in
+  case "$number" in
     3) printf 'pending\n'; exit 8 ;;
     *) printf 'pass\n' ;;
   esac
@@ -134,18 +303,273 @@ _assert_contains "prints middle PR" "2. #2 feature/a -> feature/b" "$result"
 _assert_contains "prints child PR" "3. #3 feature/b -> feature/c" "$result"
 _assert_contains "reports child readiness" "not ready: checks pending" "$result"
 
-result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-stack 2 --porcelain 2>&1)
+legacy_result=$(PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-stack 2 --porcelain 2>&1)
+_assert_eq "default porcelain preserves exact schema-v1 records" \
+  $'pr\t0\t1\tmain\tfeature/a\ttrue\tready\tpass\thttps://github.test/example/repo/pull/1\npr\t1\t2\tfeature/a\tfeature/b\ttrue\tready\tpass\thttps://github.test/example/repo/pull/2\npr\t2\t3\tfeature/b\tfeature/c\tfalse\tchecks pending\tpending\thttps://github.test/example/repo/pull/3' \
+  "$legacy_result"
+legacy_urls=""
+while IFS=$'\t' read -r _legacy_kind _legacy_index _legacy_number \
+  _legacy_base _legacy_head _legacy_ready _legacy_reason _legacy_checks \
+  _legacy_url; do
+  legacy_urls+="${legacy_urls:+$'\n'}$_legacy_url"
+done <<<"$legacy_result"
+_assert_eq "legacy nine-column reader keeps URL as its final field" \
+  $'https://github.test/example/repo/pull/1\nhttps://github.test/example/repo/pull/2\nhttps://github.test/example/repo/pull/3' \
+  "$legacy_urls"
+contract_log=$(_tmpdir)/gh-contract.log
+result=$(GH_CALL_LOG="$contract_log" PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-stack 2 --porcelain=v2 2>&1)
 _assert_contains "porcelain includes parent record" \
-  $'pr\t0\t1\tmain\tfeature/a\ttrue\tready\tpass' "$result"
+  $'pr\t0\t1\tmain\tfeature/a\ttrue\tready\tpass\thttps://github.test/example/repo/pull/1\t1111111111111111111111111111111111111111\texample/repo\tfalse' "$result"
 _assert_contains "porcelain includes pending child" \
-  $'pr\t2\t3\tfeature/b\tfeature/c\tfalse\tchecks pending\tpending' "$result"
+  $'pr\t2\t3\tfeature/b\tfeature/c\tfalse\tchecks pending\tpending\thttps://github.test/example/repo/pull/3\t1111111111111111111111111111111111111111\texample/repo\tfalse' "$result"
+_assert_contains "same-repository identity comparison is case-insensitive" \
+  $'1111111111111111111111111111111111111111\tExample/Repo\tfalse' "$result"
 
-result=$(GH_NO_CHECKS_FOR=2 PATH="$bin_dir:$PATH" git -C "$repo" pr-stack 2 --porcelain 2>&1)
+pr_fields=number,state,isDraft,mergeStateStatus,headRefName,headRefOid,baseRefName,headRepository,isCrossRepository,url,title
+pr_jq='[.number,.state,.isDraft,.mergeStateStatus,.headRefName,.headRefOid,.baseRefName,(.headRepository.nameWithOwner // ""),.isCrossRepository,.url,.title] | @tsv'
+list_jq='.[] | [.number,.state,.isDraft,.mergeStateStatus,.headRefName,.headRefOid,.baseRefName,(.headRepository.nameWithOwner // ""),.isCrossRepository,.url,.title] | @tsv'
+# shellcheck disable=SC2016 # $buckets is jq state, not shell expansion.
+check_jq='[.[].bucket] as $buckets | if any($buckets[]; . != "pass" and . != "skipping" and . != "fail" and . != "cancel" and . != "pending") then error("unknown check bucket") elif ($buckets | length) == 0 then "none" elif any($buckets[]; . == "fail" or . == "cancel") then "fail" elif any($buckets[]; . == "pending") then "pending" else "pass" end'
+_assert_line "gh contract: repository discovery fields and jq" \
+  'repo= host= argv=repo view --json nameWithOwner,url --jq [.nameWithOwner,.url] | @tsv' \
+  "$contract_log"
+_assert_line "gh contract: auth hostname" \
+  'repo=github.test/example/repo host=github.test argv=auth status --hostname github.test' \
+  "$contract_log"
+_assert_line "gh contract: complete capped open inventory" \
+  "repo=github.test/example/repo host=github.test argv=pr list --state open --limit 201 --json $pr_fields --jq $list_jq --repo github.test/example/repo" \
+  "$contract_log"
+_assert_line "gh contract: explicit target precedes structured view options" \
+  "repo=github.test/example/repo host=github.test argv=pr view 2 --json $pr_fields --jq $pr_jq --repo github.test/example/repo" \
+  "$contract_log"
+_assert_line "gh contract: checks target and route are exact" \
+  "repo=github.test/example/repo host=github.test argv=pr checks https://github.test/example/repo/pull/2 --json bucket --jq $check_jq --repo github.test/example/repo" \
+  "$contract_log"
+
+branch_result=$(GH_REPO=github.test/foreign/repo GH_HOST=foreign.test \
+  PATH="$bin_dir:$PATH" git -C "$repo" pr-stack feature/b --porcelain=v2 2>&1)
+_assert_contains "branch target stays bound to the checkout repository" \
+  $'pr\t1\t2\tfeature/a\tfeature/b' "$branch_result"
+caller_state_rc=0
+caller_state_result=$(bash -c '
+  set -uo pipefail
+  # shellcheck source=lib/git-tools-pr.sh
+  . "$1/lib/git-tools-pr.sh"
+  gt_validate_pr_target_repository() { return 0; }
+  gt_gh_pr() {
+    printf "2\tOPEN\tfalse\tCLEAN\tfeature/b\t1111111111111111111111111111111111111111\tfeature/a\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tMiddle PR\n"
+  }
+  gt_load_current_repo_identity() {
+    GT_CURRENT_REPO_IDENTITY=github.test/example/repo
+  }
+  gt_github_name_with_owner() { printf "example/repo\n"; }
+  gt_parse_pr_url() {
+    GT_PR_URL_HAS_SUFFIX=0
+    GT_PR_URL_IDENTITY=github.test/example/repo
+    GT_PR_URL_NUMBER=2
+  }
+  readonly _=caller-state
+  readonly GT_PR_RECORD_NUMBER=caller-state
+  gt_pr_view_tsv feature/b
+' bash "$ROOT" 2>&1) || caller_state_rc=$?
+_assert_eq "branch validation preserves readonly caller state" "0" "$caller_state_rc"
+_assert_contains "branch validation still returns the structured record" \
+  $'2\tOPEN\tfalse\tCLEAN\tfeature/b\t' "$caller_state_result"
+url_result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-stack \
+  https://github.test/example/repo/pull/2 --porcelain 2>&1)
+_assert_contains "qualified current-repository URL target is preserved" \
+  $'pr\t1\t2\tfeature/a\tfeature/b' "$url_result"
+files_url_result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-stack \
+  https://github.test/example/repo/pull/2/files --porcelain 2>&1)
+_assert_contains "qualified URL suffix binds to the returned PR number" \
+  $'pr\t1\t2\tfeature/a\tfeature/b' "$files_url_result"
+
+result=$(GH_NO_CHECKS_FOR=2 PATH="$bin_dir:$PATH" git -C "$repo" pr-stack 2 --porcelain=v2 2>&1)
 _assert_contains "porcelain includes no-checks state" \
-  $'pr\t1\t2\tfeature/a\tfeature/b\tfalse\tchecks none\tnone' "$result"
+  $'pr\t1\t2\tfeature/a\tfeature/b\tfalse\tchecks none\tnone\thttps://github.test/example/repo/pull/2\t1111111111111111111111111111111111111111\tExample/Repo\tfalse' "$result"
 
-result=$(GH_STACK_CASE=branched PATH="$bin_dir:$PATH" git -C "$repo" pr-stack 1 2>&1 || true)
+sha256_result=$(GH_STACK_CASE=sha256-head-oid PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-stack 2 --porcelain=v2 2>&1)
+_assert_contains "accepts a canonical SHA-256 head OID" \
+  $'https://github.test/example/repo/pull/2\t2222222222222222222222222222222222222222222222222222222222222222\t' \
+  "$sha256_result"
+
+unsupported_porcelain_rc=0
+unsupported_porcelain=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-stack \
+  --porcelain=v3 2>&1) || unsupported_porcelain_rc=$?
+_assert_eq "unsupported porcelain version is a usage error" \
+  "2" "$unsupported_porcelain_rc"
+_assert_contains "unsupported porcelain version is diagnosed" \
+  "unsupported porcelain version: v3" "$unsupported_porcelain"
+
+branched_rc=0
+result=$(GH_STACK_CASE=branched PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-stack 1 2>&1) || branched_rc=$?
 _assert_contains "rejects branched stacks" "stack is branched at feature/a" "$result"
+if [[ "$branched_rc" != 0 ]]; then
+  _pass "branched stack exits nonzero"
+else
+  _fail "branched stack exits nonzero"
+fi
+
+partial_rc=0
+partial_result=$(GH_STACK_CASE=partial-failure PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-stack 2 --porcelain 2>&1) || partial_rc=$?
+if [[ "$partial_rc" != 0 && "$partial_result" != *$'pr\t'* ]]; then
+  _pass "rejects partial GitHub PR inventory"
+else
+  _fail "rejects partial GitHub PR inventory"
+fi
+
+fork_result=$(GH_STACK_CASE=fork-collision PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-stack 2 --porcelain 2>&1)
+_assert_contains "fork name collision keeps target PR" \
+  $'pr\t0\t2\tfeature/a\tfeature/b' "$fork_result"
+if [[ "$fork_result" != *$'\t1\tmain\tfeature/a\t'* ]]; then
+  _pass "fork head is not treated as a base-repository parent"
+else
+  _fail "fork head is not treated as a base-repository parent"
+fi
+
+duplicate_rc=0
+duplicate_result=$(GH_STACK_CASE=duplicate-head PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-stack 2 --porcelain 2>&1) || duplicate_rc=$?
+_assert_contains "rejects ambiguous same-repository parent heads" \
+  "stack parent is ambiguous at feature/a" "$duplicate_result"
+if [[ "$duplicate_rc" != 0 ]]; then
+  _pass "ambiguous same-repository parent exits nonzero"
+else
+  _fail "ambiguous same-repository parent exits nonzero"
+fi
+
+foreign_calls=$(_tmpdir)/gh.log
+foreign_rc=0
+foreign_result=$(GH_CALL_LOG="$foreign_calls" PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-stack \
+  https://github.test/foreign/repo/pull/2 --porcelain 2>&1) || foreign_rc=$?
+_assert_contains "rejects a foreign same-number PR target" \
+  "target pull request belongs to a different repository" "$foreign_result"
+if [[ "$foreign_rc" != 0 &&
+  "$(<"$foreign_calls")" != *"pr view"* &&
+  "$foreign_result" != *$'pr\t'* ]]; then
+  _pass "foreign PR target is rejected before PR lookup"
+else
+  _fail "foreign PR target is rejected before PR lookup"
+fi
+
+overflow_rc=0
+overflow_result=$(GH_STACK_CASE=inventory-overflow PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-stack 1 --porcelain 2>&1) || overflow_rc=$?
+_assert_contains "rejects an open PR inventory beyond the supported cap" \
+  "open pull request inventory exceeds 200 entries" "$overflow_result"
+if [[ "$overflow_rc" != 0 && "$overflow_result" != *$'pr\t'* ]]; then
+  _pass "overflowing PR inventory produces no partial stack"
+else
+  _fail "overflowing PR inventory produces no partial stack"
+fi
+
+mismatch_calls=$(_tmpdir)/gh.log
+mismatch_rc=0
+mismatch_result=$(GH_REPO_VIEW_CASE=mismatch GH_CALL_LOG="$mismatch_calls" \
+  PATH="$bin_dir:$PATH" git -C "$repo" pr-stack 2 --porcelain 2>&1) ||
+  mismatch_rc=$?
+_assert_contains "rejects mismatched repository name and canonical URL" \
+  "could not resolve the current GitHub repository" "$mismatch_result"
+if [[ "$mismatch_rc" != 0 && "$(<"$mismatch_calls")" != *"pr list"* ]]; then
+  _pass "identity mismatch is rejected before PR inventory"
+else
+  _fail "identity mismatch is rejected before PR inventory"
+fi
+
+foreign_record_rc=0
+foreign_record_result=$(GH_STACK_CASE=foreign-record PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-stack 2 --porcelain 2>&1) || foreign_record_rc=$?
+if [[ "$foreign_record_rc" != 0 && "$foreign_record_result" != *$'pr\t'* ]]; then
+  _pass "foreign canonical inventory record fails closed"
+else
+  _fail "foreign canonical inventory record fails closed"
+fi
+
+for malformed_case in number-url-mismatch noncanonical-url \
+  wrong-same-repo-head wrong-cross-repo-head malformed-draft malformed-cross \
+  malformed-head-repo empty-head empty-base malformed-head malformed-base \
+  same-head-base uppercase-head-oid short-head-oid nonhex-head-oid; do
+  malformed_rc=0
+  malformed_result=$(GH_STACK_CASE="$malformed_case" PATH="$bin_dir:$PATH" \
+    git -C "$repo" pr-stack 2 --porcelain 2>&1) || malformed_rc=$?
+  if [[ "$malformed_rc" != 0 && "$malformed_result" != *$'pr\t'* ]]; then
+    _pass "rejects malformed PR record: $malformed_case"
+  else
+    _fail "rejects malformed PR record: $malformed_case"
+  fi
+done
+
+rebound_rc=0
+rebound_result=$(GH_VIEW_CASE=rebound PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-stack 2 --porcelain 2>&1) || rebound_rc=$?
+if [[ "$rebound_rc" != 0 && "$rebound_result" != *$'pr\t'* ]]; then
+  _pass "rejects an explicit numeric target rebound"
+else
+  _fail "rejects an explicit numeric target rebound"
+fi
+
+branch_rebound_rc=0
+branch_rebound_result=$(GH_VIEW_CASE=rebound PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-stack feature/b --porcelain 2>&1) || branch_rebound_rc=$?
+if [[ "$branch_rebound_rc" != 0 && "$branch_rebound_result" != *$'pr\t'* ]]; then
+  _pass "rejects an explicit branch target rebound"
+else
+  _fail "rejects an explicit branch target rebound"
+fi
+
+invalid_branch_target_rc=0
+invalid_branch_target_result=$(PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-stack example:feature/b --porcelain 2>&1) ||
+  invalid_branch_target_rc=$?
+if [[ "$invalid_branch_target_rc" != 0 &&
+  "$invalid_branch_target_result" != *$'pr\t'* ]]; then
+  _pass "rejects an invalid explicit branch target"
+else
+  _fail "rejects an invalid explicit branch target"
+fi
+
+drift_rc=0
+drift_result=$(GH_VIEW_CASE=topology-drift PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-stack 2 --porcelain 2>&1) || drift_rc=$?
+if [[ "$drift_rc" != 0 && "$drift_result" != *$'pr\t'* ]]; then
+  _pass "rejects target topology drift between inventory and view"
+else
+  _fail "rejects target topology drift between inventory and view"
+fi
+
+ambient_result=$(GH_REPO=github.test/foreign/repo GH_HOST=foreign.test \
+  PATH="$bin_dir:$PATH" git -C "$repo" pr-stack 2 --porcelain 2>&1)
+_assert_contains "ambient routing cannot redirect stack reads" \
+  $'pr\t1\t2\tfeature/a\tfeature/b' "$ambient_result"
+
+cycle_output=$(_tmpdir)/parent-cycle.out
+_run_with_deadline "$cycle_output" env GH_STACK_CASE=parent-cycle \
+  PATH="$bin_dir:$PATH" git -C "$repo" pr-stack 1 --porcelain
+_assert_contains "rejects a parent-direction stack cycle" \
+  "stack topology contains a cycle at PR #1" "$_deadline_output"
+if [[ "$_deadline_rc" != 0 && "$_deadline_rc" != 124 ]]; then
+  _pass "parent-direction stack cycle exits promptly"
+else
+  _fail "parent-direction stack cycle exits promptly"
+fi
+
+cycle_output=$(_tmpdir)/child-cycle.out
+_run_with_deadline "$cycle_output" env GH_STACK_CASE=child-cycle \
+  PATH="$bin_dir:$PATH" git -C "$repo" pr-stack 1 --porcelain
+_assert_contains "rejects a child-direction stack cycle" \
+  "stack topology contains a cycle at PR #2" "$_deadline_output"
+if [[ "$_deadline_rc" != 0 && "$_deadline_rc" != 124 ]]; then
+  _pass "child-direction stack cycle exits promptly"
+else
+  _fail "child-direction stack cycle exits promptly"
+fi
 
 outside=$(_tmpdir)
 result=$(PATH="$bin_dir:$PATH" git -C "$outside" pr-stack 2>&1 || true)

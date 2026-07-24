@@ -31,12 +31,15 @@ if command -v shellcheck >/dev/null 2>&1; then
     "$ROOT/support/sync-launcher-bootstrap" \
     "$ROOT/test/extras-test" \
     "$ROOT/test/launcher-bootstrap-test" \
+    "$ROOT/test/lib/test-temp.sh" \
+    "$ROOT/test/test-temp-test" \
     "${test_files[@]}" \
     "$ROOT/test/run"
 fi
 
 "$ROOT/test/launcher-bootstrap-test"
 "$ROOT/test/extras-test"
+"$ROOT/test/test-temp-test"
 for command in "${commands[@]}"; do
   "$ROOT/test/$command-test"
 done

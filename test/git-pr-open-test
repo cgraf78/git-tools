@@ -7,22 +7,10 @@ PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
 
 _failures=0
-_temps=()
-
-_tmpdir() {
-  local dir
-  dir=$(mktemp -d)
-  _temps+=("$dir")
-  printf '%s\n' "$dir"
-}
-
-_cleanup() {
-  local dir
-  for dir in "${_temps[@]}"; do
-    rm -rf "$dir"
-  done
-}
-trap _cleanup EXIT
+# shellcheck source=test/lib/test-temp.sh
+. "$ROOT/test/lib/test-temp.sh"
+gt_test_temp_init || exit 1
+_tmpdir() { gt_test_temp_dir; }
 
 _pass() {
   printf 'ok - %s\n' "$1"
@@ -45,6 +33,34 @@ _assert_contains() {
     printf '  expected output to contain: %s\n' "$needle" >&2
     printf '  actual output:\n%s\n' "$haystack" >&2
   fi
+}
+
+_assert_eq() {
+  local name="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %q\n' "$expected" >&2
+    printf '  actual:   %q\n' "$actual" >&2
+  fi
+}
+
+_assert_line() {
+  local name="$1" expected="$2" file="$3" line
+
+  while IFS= read -r line; do
+    if [[ "$line" == "$expected" ]]; then
+      _pass "$name"
+      return 0
+    fi
+  done <"$file"
+  _fail "$name"
+  printf '  expected exact line: %s\n' "$expected" >&2
+  printf '  actual output:\n%s\n' "$(<"$file")" >&2
 }
 
 _git_remote_repo() {
@@ -71,6 +87,9 @@ _clone_feature_repo() {
   git -C "$repo" config user.email "test@test.com"
   git -C "$repo" config user.name "Test"
   git -C "$repo" config core.hooksPath /dev/null
+  git -C "$repo" config "url.$remote.insteadOf" \
+    https://github.test/example/repo.git
+  git -C "$repo" remote set-url origin https://github.test/example/repo.git
   git -C "$repo" switch -q -c feature/open
   printf 'feature\n' >"$repo/feature.txt"
   git -C "$repo" add feature.txt
@@ -83,14 +102,62 @@ _write_gh_stub() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-printf '%s\n' "$*" >>"${GH_LOG:?}"
+printf 'repo=%s host=%s %s\n' "${GH_REPO:-}" "${GH_HOST:-}" "$*" >>"${GH_LOG:?}"
 
 if [[ "$1 $2" == "auth status" ]]; then
   exit 0
 fi
 
+if [[ "$1 $2" == "repo view" ]]; then
+  if [[ "$*" == *"--json defaultBranchRef"* ]]; then
+    printf '%s\n' "${GH_DEFAULT_BRANCH:-main}"
+    exit 0
+  fi
+  if [[ -n "${GH_REPO:-}" || -n "${GH_HOST:-}" ]]; then
+    printf 'foreign/repo\thttps://foreign.test/foreign/repo\n'
+  else
+    printf 'example/repo\thttps://github.test/example/repo\n'
+  fi
+  exit 0
+fi
+
 if [[ "$1 $2" == "pr create" ]]; then
-  printf 'https://example/pr/11\n'
+  base=""
+  head=""
+  previous=""
+  for argument in "$@"; do
+    case "$previous" in
+      --base) base=$argument ;;
+      --head) head=$argument ;;
+    esac
+    previous=$argument
+  done
+  head_ref=${head#*:}
+  head_repo=example/repo
+  cross=false
+  if [[ "$head" == *:* ]]; then
+    head_owner=${head%%:*}
+    head_repo="$head_owner/repo"
+    cross=true
+  fi
+  created_oid=$(git rev-parse HEAD)
+  if [[ -n "${GH_CREATE_RACE_REMOTE:-}" ]]; then
+    tree=$(git rev-parse "$created_oid^{tree}")
+    raced_oid=$(printf 'concurrent create race\n' |
+      git commit-tree "$tree" -p "$created_oid")
+    git push --quiet "$GH_CREATE_RACE_REMOTE" \
+      "$raced_oid:refs/heads/$head_ref"
+    created_oid=$raced_oid
+  fi
+  printf '11\tOPEN\tfalse\tCLEAN\t%s\t%s\t%s\t%s\t%s\thttps://github.test/example/repo/pull/11\tCreated PR\n' \
+    "$head_ref" "$created_oid" "$base" "$head_repo" "$cross" \
+    >"${GH_LOG}.created"
+  printf 'https://github.test/example/repo/pull/11\n'
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr view" && -e "${GH_LOG}.created" ]]; then
+  cat "${GH_LOG}.created"
   exit 0
 fi
 
@@ -98,6 +165,64 @@ printf 'unexpected gh call: %s\n' "$*" >&2
 exit 99
 EOF
   chmod +x "$bin"
+  cat >"$1/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n "${GIT_TEST_FORBIDDEN_SECRET:-}" &&
+  "$*" == *"$GIT_TEST_FORBIDDEN_SECRET"* ]]; then
+  ps -o args= -p "$$" -p "$PPID" >"${GIT_TEST_SECRET_PS_LOG:?}"
+  exit 88
+fi
+if [[ "${GIT_TEST_MUTATE_PUSH:-0}" == 1 &&
+  " $* " == *" push "* && ! -e "${GIT_TEST_MUTATE_MARKER:?}" ]]; then
+  : >"$GIT_TEST_MUTATE_MARKER"
+  /usr/bin/git config remote.origin.pushurl \
+    "${GIT_TEST_MUTATED_PUSH_URL:?}"
+fi
+if [[ "${1:-} ${2:-} ${3:-} ${4:-}" == "remote get-url --push --all" ]]; then
+  remote=${5:-}
+  url=$(/usr/bin/git config --get-all "remote.$remote.pushurl" 2>/dev/null || true)
+  [[ -n "$url" ]] || url=$(/usr/bin/git config --get-all "remote.$remote.url")
+  printf '%s\n' "$url"
+  exit 0
+fi
+if [[ "${1:-} ${2:-} ${3:-}" == "remote get-url --all" ]]; then
+  /usr/bin/git config --get-all "remote.${4:-}.url"
+  exit $?
+fi
+if [[ "${1:-}" == -c && "${2:-}" == url.*.insteadOf=* &&
+  "${3:-}" == -c && "${4:-}" == url.*.pushInsteadOf=* ]]; then
+  pin=${2#url.}
+  target=${pin%%.insteadOf=*}
+  alias=${pin#*.insteadOf=}
+  shift 4
+  rewritten=()
+  for argument in "$@"; do
+    [[ "$argument" != "$alias" ]] || argument=$target
+    rewritten+=("$argument")
+  done
+  set -- "${rewritten[@]}"
+fi
+if [[ -n "${GIT_TEST_MOVE_HEAD_ON_SECOND_LOOKUP:-}" &&
+  " $* " == *" ls-remote "* &&
+  " $* " == *" refs/heads/feature/open "* ]]; then
+  count=0
+  [[ ! -e "${GIT_TEST_HEAD_LOOKUP_COUNT:?}" ]] ||
+    count=$(<"$GIT_TEST_HEAD_LOOKUP_COUNT")
+  count=$((count + 1))
+  printf '%s\n' "$count" >"$GIT_TEST_HEAD_LOOKUP_COUNT"
+  if ((count == 2)); then
+    old=$(/usr/bin/git rev-parse HEAD)
+    tree=$(/usr/bin/git rev-parse "$old^{tree}")
+    moved=$(printf 'pre-create lookup race\n' |
+      /usr/bin/git commit-tree "$tree" -p "$old")
+    /usr/bin/git push --quiet "$GIT_TEST_MOVE_HEAD_ON_SECOND_LOOKUP" \
+      "$moved:refs/heads/feature/open"
+  fi
+fi
+exec /usr/bin/git "$@"
+EOF
+  chmod +x "$1/git"
 }
 
 echo "=== git pr-open ==="
@@ -112,28 +237,338 @@ _git_remote_repo "$remote" "$seed"
 _clone_feature_repo "$remote" "$repo"
 _write_gh_stub "$bin_dir"
 
-result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-open --title "Open PR" --body "Body" 2>&1)
-_assert_contains "creates PR" "https://example/pr/11" "$result"
+result=$(cd "$repo" && GH_REPO=foreign.test/foreign/repo GH_HOST=foreign.test \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" \
+  --title "Open PR" --body "Body" 2>&1)
+_assert_contains "creates PR" "https://github.test/example/repo/pull/11" "$result"
 _assert_contains "passes base and head" "pr create --base main --head feature/open" "$(<"$log")"
 _assert_contains "passes title and body" "--title Open PR --body Body" "$(<"$log")"
+_assert_contains "create is pinned to the checkout repository" \
+  "repo=github.test/example/repo host=github.test pr create" "$(<"$log")"
+_assert_line "default branch query has a complete pinned argv contract" \
+  'repo=github.test/example/repo host=github.test repo view --repo github.test/example/repo --json defaultBranchRef --jq .defaultBranchRef.name // ""' \
+  "$log"
 _assert_contains "pushes current branch" "feature/open" "$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')"
 
+# A remote head can move after the last push verification but while GitHub is
+# creating the pull request. The command must inspect the created PR and report
+# the actionable inconsistent state rather than returning clean success.
+create_race_remote=$(_tmpdir)/remote.git
+create_race_seed=$(_tmpdir)/seed
+create_race_repo=$(_tmpdir)/repo
+create_race_log=$(_tmpdir)/gh.log
+_git_remote_repo "$create_race_remote" "$create_race_seed"
+_clone_feature_repo "$create_race_remote" "$create_race_repo"
+create_race_expected=$(git -C "$create_race_repo" rev-parse HEAD)
+create_race_rc=0
+create_race_output=$(cd "$create_race_repo" && GH_LOG="$create_race_log" \
+  GH_CREATE_RACE_REMOTE="$create_race_remote" PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-open" --title "Create race" 2>&1) || create_race_rc=$?
+create_race_actual=$(git -C "$create_race_remote" rev-parse refs/heads/feature/open)
+if [[ "$create_race_actual" != "$create_race_expected" ]]; then
+  _pass "create race advances the real remote head"
+else
+  _fail "create race advances the real remote head"
+fi
+if [[ "$create_race_rc" != 0 ]]; then
+  _pass "created PR topology mismatch exits nonzero"
+else
+  _fail "created PR topology mismatch exits nonzero"
+fi
+_assert_contains "created PR topology mismatch is actionable" \
+  "pull request was created but does not match the requested topology" \
+  "$create_race_output"
+
+precreate_race_remote=$(_tmpdir)/remote.git
+precreate_race_seed=$(_tmpdir)/seed
+precreate_race_repo=$(_tmpdir)/repo
+precreate_race_log=$(_tmpdir)/gh.log
+precreate_race_count=$(_tmpdir)/lookup-count
+_git_remote_repo "$precreate_race_remote" "$precreate_race_seed"
+_clone_feature_repo "$precreate_race_remote" "$precreate_race_repo"
+precreate_race_rc=0
+precreate_race_output=$(cd "$precreate_race_repo" &&
+  GH_LOG="$precreate_race_log" \
+    GIT_TEST_MOVE_HEAD_ON_SECOND_LOOKUP="$precreate_race_remote" \
+    GIT_TEST_HEAD_LOOKUP_COUNT="$precreate_race_count" PATH="$bin_dir:$PATH" \
+    "$ROOT/bin/git-pr-open" --title "Pre-create race" 2>&1) ||
+  precreate_race_rc=$?
+if [[ "$precreate_race_rc" != 0 ]]; then
+  _pass "pre-create remote-head race exits nonzero"
+else
+  _fail "pre-create remote-head race exits nonzero"
+fi
+_assert_contains "pre-create remote-head race is diagnosed" \
+  "feature remote head changed before pull request creation" \
+  "$precreate_race_output"
+if [[ -e "$precreate_race_log" ]] &&
+  rg -q 'pr create' "$precreate_race_log"; then
+  _fail "pre-create remote-head race stops before PR creation"
+else
+  _pass "pre-create remote-head race stops before PR creation"
+fi
+
+# A base branch tracking upstream must not choose upstream as the feature push
+# target when the feature branch explicitly selects a fork.
+triangular_remote=$(_tmpdir)/upstream.git
+triangular_seed=$(_tmpdir)/seed
+triangular_repo=$(_tmpdir)/repo
+triangular_fork=$(_tmpdir)/fork.git
+triangular_log=$(_tmpdir)/gh.log
+_git_remote_repo "$triangular_remote" "$triangular_seed"
+_clone_feature_repo "$triangular_remote" "$triangular_repo"
+git init -q --bare --initial-branch=main "$triangular_fork"
+git -C "$triangular_repo" config "url.$triangular_fork.insteadOf" \
+  https://github.test/forker/repo.git
+git -C "$triangular_repo" remote add fork https://github.test/forker/repo.git
+git -C "$triangular_repo" config branch.feature/open.pushRemote fork
+triangular_output=$(cd "$triangular_repo" && GH_LOG="$triangular_log" \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" --title Fork 2>&1)
+_assert_contains "triangular push qualifies the fork head" \
+  "pr create --base main --head forker:feature/open" "$(<"$triangular_log")"
+if git -C "$triangular_fork" show-ref --verify --quiet refs/heads/feature/open; then
+  _pass "triangular push publishes the feature branch to the fork"
+else
+  _fail "triangular push publishes the feature branch to the fork"
+fi
+if git -C "$triangular_remote" show-ref --verify --quiet refs/heads/feature/open; then
+  _fail "triangular push preserves the upstream repository"
+else
+  _pass "triangular push preserves the upstream repository"
+fi
+_assert_contains "triangular push reports the created PR" \
+  "https://github.test/example/repo/pull/11" "$triangular_output"
+
+# The feature transport is captured before push. Mutating the named remote at
+# the push boundary must not redirect data; the command may only report that
+# local tracking could not be installed after the validated push succeeded.
+push_race_remote=$(_tmpdir)/expected.git
+push_race_seed=$(_tmpdir)/seed
+push_race_unrelated=$(_tmpdir)/unrelated.git
+push_race_repo=$(_tmpdir)/repo
+push_race_log=$(_tmpdir)/gh.log
+push_race_marker=$(_tmpdir)/mutated
+_git_remote_repo "$push_race_remote" "$push_race_seed"
+_clone_feature_repo "$push_race_remote" "$push_race_repo"
+git init -q --bare --initial-branch=main "$push_race_unrelated"
+git -C "$push_race_repo" config "url.$push_race_unrelated.insteadOf" \
+  https://github.test/unrelated/repo.git
+# shellcheck disable=SC2015 # Preserve the expected failure's diagnostics.
+push_race_output=$(cd "$push_race_repo" && GH_LOG="$push_race_log" \
+  GIT_TEST_MUTATE_PUSH=1 GIT_TEST_MUTATE_MARKER="$push_race_marker" \
+  GIT_TEST_MUTATED_PUSH_URL=https://github.test/unrelated/repo.git \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" --title Race 2>&1 || true)
+if git -C "$push_race_remote" show-ref --verify --quiet \
+  refs/heads/feature/open; then
+  _pass "pushurl race publishes only to the captured repository"
+else
+  _fail "pushurl race publishes only to the captured repository"
+fi
+if git -C "$push_race_unrelated" show-ref --verify --quiet \
+  refs/heads/feature/open; then
+  _fail "pushurl race preserves the unrelated repository"
+else
+  _pass "pushurl race preserves the unrelated repository"
+fi
+_assert_contains "pushurl race reports tracking incomplete" \
+  "pushed but upstream tracking is incomplete" "$push_race_output"
+if [[ -f "$push_race_log" ]] && rg -q 'pr create' "$push_race_log"; then
+  _fail "tracking race does not create a pull request"
+else
+  _pass "tracking race does not create a pull request"
+fi
+
+# Repository and exact-transport URL parsers reject credential material,
+# query/fragment suffixes, unsafe git-config key bytes, and invalid GitHub path
+# components. Normal scp-style SSH usernames remain supported.
+unsafe_urls=(
+  'https://secret-token@github.test/example/repo.git'
+  'https://github.test/example/repo.git?token=secret-token'
+  'https://github.test/example/repo.git#secret-token'
+  'https://github.test/exam=ple/repo.git'
+  'https://github.test/bad_owner/repo.git'
+  'https://github.test/example/bad~repo.git'
+)
+for unsafe_url in "${unsafe_urls[@]}"; do
+  unsafe_rc=0
+  (ROOT="$ROOT" UNSAFE_URL="$unsafe_url" /bin/bash -c '
+    . "$ROOT/lib/git-tools-pr.sh"
+    gt_github_repo_identity_from_url "$UNSAFE_URL"
+  ') >/dev/null 2>&1 || unsafe_rc=$?
+  if [[ "$unsafe_rc" != 0 ]]; then
+    _pass "rejects unsafe GitHub URL: ${unsafe_url%%secret-token*}"
+  else
+    _fail "rejects unsafe GitHub URL: ${unsafe_url%%secret-token*}"
+  fi
+  exact_unsafe_rc=0
+  (ROOT="$ROOT" UNSAFE_URL="$unsafe_url" /bin/bash -c '
+    . "$ROOT/lib/git-tools-base.sh"
+    gt_find_remote_ref_exact_url "$UNSAFE_URL" refs/heads/main
+  ') >/dev/null 2>&1 || exact_unsafe_rc=$?
+  if [[ "$exact_unsafe_rc" != 0 ]]; then
+    _pass "exact helper rejects unsafe URL: ${unsafe_url%%secret-token*}"
+  else
+    _fail "exact helper rejects unsafe URL: ${unsafe_url%%secret-token*}"
+  fi
+done
+scp_identity=$(ROOT="$ROOT" /bin/bash -c '
+  . "$ROOT/lib/git-tools-pr.sh"
+  gt_github_repo_identity_from_url git@github.test:example/repo.git
+')
+_assert_eq "scp SSH username remains supported" \
+  "github.test/example/repo" "$scp_identity"
+
+secret_repo=$(_tmpdir)/repo
+secret_ps_log=$(_tmpdir)/ps.log
+secret_log=$(_tmpdir)/gh.log
+_clone_feature_repo "$remote" "$secret_repo"
+git -C "$secret_repo" remote set-url origin \
+  https://secret-token@github.test/example/repo.git
+# shellcheck disable=SC2015 # Preserve the expected failure's diagnostics.
+secret_output=$(cd "$secret_repo" && GH_LOG="$secret_log" \
+  GIT_TEST_FORBIDDEN_SECRET=secret-token \
+  GIT_TEST_SECRET_PS_LOG="$secret_ps_log" PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-open" --title Secret --dry-run 2>&1 || true)
+if [[ "$secret_output" == *secret-token* ]]; then
+  _fail "credential URL is absent from diagnostics"
+else
+  _pass "credential URL is absent from diagnostics"
+fi
+if [[ -e "$secret_ps_log" ]]; then
+  _fail "credential URL is rejected before process arguments"
+else
+  _pass "credential URL is rejected before process arguments"
+fi
+
+# Default-branch discovery must be pinned to the validated base repository, not
+# a foreign remote named origin. The base repository deliberately uses trunk
+# while foreign origin uses main.
+pinned_remote=$(_tmpdir)/upstream.git
+pinned_seed=$(_tmpdir)/seed
+pinned_foreign=$(_tmpdir)/foreign.git
+pinned_foreign_seed=$(_tmpdir)/foreign-seed
+pinned_repo=$(_tmpdir)/repo
+pinned_log=$(_tmpdir)/gh.log
+_git_remote_repo "$pinned_remote" "$pinned_seed"
+git -C "$pinned_seed" branch -m main trunk
+git -C "$pinned_seed" push -q origin \
+  refs/heads/trunk:refs/heads/trunk
+git -C "$pinned_remote" symbolic-ref HEAD refs/heads/trunk
+git -C "$pinned_remote" update-ref -d refs/heads/main
+_git_remote_repo "$pinned_foreign" "$pinned_foreign_seed"
+git clone -q "$pinned_remote" "$pinned_repo"
+git -C "$pinned_repo" config user.email test@test.com
+git -C "$pinned_repo" config user.name Test
+git -C "$pinned_repo" config core.hooksPath /dev/null
+git -C "$pinned_repo" remote rename origin upstream
+git -C "$pinned_repo" config "url.$pinned_remote.insteadOf" \
+  https://github.test/example/repo.git
+git -C "$pinned_repo" remote set-url upstream \
+  https://github.test/example/repo.git
+git -C "$pinned_repo" config "url.$pinned_foreign.insteadOf" \
+  https://github.test/foreign/repo.git
+git -C "$pinned_repo" remote add origin \
+  https://github.test/foreign/repo.git
+git -C "$pinned_repo" switch -q -c feature/pinned
+printf 'pinned\n' >"$pinned_repo/pinned.txt"
+git -C "$pinned_repo" add pinned.txt
+git -C "$pinned_repo" commit -m pinned >/dev/null
+git -C "$pinned_repo" config branch.feature/pinned.pushRemote upstream
+pinned_output=$(cd "$pinned_repo" && GH_DEFAULT_BRANCH=trunk \
+  GH_LOG="$pinned_log" PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" \
+  --title Pinned 2>&1)
+_assert_contains "foreign origin cannot choose the base repository default" \
+  "pr create --base trunk" "$(<"$pinned_log")"
+_assert_contains "non-origin base repository is selected by exact identity" \
+  "https://github.test/example/repo/pull/11" "$pinned_output"
+
+# A named remote's fetch refspec must not redirect base validation. Keep local
+# main at decoy while the real remote main advances; a named fetch maps decoy
+# into refs/remotes/origin/main.
+refspec_remote=$(_tmpdir)/remote.git
+refspec_seed=$(_tmpdir)/seed
+refspec_repo=$(_tmpdir)/repo
+refspec_log=$(_tmpdir)/gh.log
+_git_remote_repo "$refspec_remote" "$refspec_seed"
+_clone_feature_repo "$refspec_remote" "$refspec_repo"
+git -C "$refspec_seed" push -q origin main:refs/heads/decoy
+printf 'advanced\n' >>"$refspec_seed/README.md"
+git -C "$refspec_seed" add README.md
+git -C "$refspec_seed" commit -m advanced >/dev/null
+git -C "$refspec_seed" push -q origin main
+git -C "$refspec_seed" tag unrelated-remote-tag
+git -C "$refspec_seed" push -q origin refs/tags/unrelated-remote-tag
+git -C "$refspec_repo" config --unset-all remote.origin.fetch
+git -C "$refspec_repo" config --add remote.origin.fetch \
+  '+refs/heads/decoy:refs/remotes/origin/main'
+# shellcheck disable=SC2015 # Preserve the expected failure's diagnostics.
+refspec_output=$(cd "$refspec_repo" && GH_LOG="$refspec_log" \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" --title Refspec 2>&1 || true)
+_assert_contains "custom fetch refspec cannot hide a stale local base" \
+  "local base branch is stale" "$refspec_output"
+_assert_eq "stale base rejection happens before feature push" "" \
+  "$(git -C "$refspec_remote" for-each-ref --format='%(refname)' \
+    refs/heads/feature/open)"
+_assert_eq "exact base fetch does not import unrelated tags" "" \
+  "$(git -C "$refspec_repo" for-each-ref --format='%(refname)' \
+    refs/tags/unrelated-remote-tag)"
+
+# Tags that collide with short branch and remote-tracking names must not affect
+# comparison of the fully qualified local branch with the exact remote OID.
+tag_remote=$(_tmpdir)/remote.git
+tag_seed=$(_tmpdir)/seed
+tag_repo=$(_tmpdir)/repo
+tag_log=$(_tmpdir)/gh.log
+_git_remote_repo "$tag_remote" "$tag_seed"
+_clone_feature_repo "$tag_remote" "$tag_repo"
+git -C "$tag_repo" tag main refs/heads/feature/open
+git -C "$tag_repo" tag origin/main refs/heads/feature/open
+git -C "$tag_repo" tag upstream/main refs/heads/feature/open
+tag_output=$(cd "$tag_repo" && GH_LOG="$tag_log" PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-open" --title Tags 2>&1)
+_assert_contains "tag collisions cannot redirect base comparison" \
+  "https://github.test/example/repo/pull/11" "$tag_output"
+
+# Invalid explicit refs are rejected before any GitHub query or push.
+invalid_log=$(_tmpdir)/gh.log
+# shellcheck disable=SC2015 # Preserve the expected failure's diagnostics.
+invalid_output=$(cd "$repo" && GH_LOG="$invalid_log" PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-open" --title Invalid --base bad..base 2>&1 || true)
+_assert_contains "invalid base is a usage error" \
+  "base is not a valid branch name" "$invalid_output"
+_assert_eq "invalid base performs no GitHub query" "" \
+  "$(cat "$invalid_log" 2>/dev/null || true)"
+# shellcheck disable=SC2015 # Preserve the expected failure's diagnostics.
+invalid_head_output=$(cd "$repo" && GH_LOG="$invalid_log" \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" --title Invalid \
+  --head bad..head 2>&1 || true)
+_assert_contains "invalid head is a usage error" \
+  "head is not a valid branch name" "$invalid_head_output"
+_assert_eq "invalid head performs no GitHub query" "" \
+  "$(cat "$invalid_log" 2>/dev/null || true)"
+
 : >"$log"
-result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-open --fill --draft --no-maintainer-edit --dry-run 2>&1)
-_assert_contains "dry run prints push" "would run: git push -u origin feature/open" "$result"
+result=$(cd "$repo" && PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" \
+  --fill --draft --no-maintainer-edit --dry-run 2>&1)
+_assert_contains "dry run prints push" \
+  "would run: git push origin refs/heads/feature/open:refs/heads/feature/open" \
+  "$result"
 _assert_contains "dry run passes gh dry-run" "--dry-run --fill" "$result"
 _assert_contains "fill mode skips title requirement" "would run: gh pr create" "$result"
 
 body_file=$(_tmpdir)/body.md
 printf 'from file\n' >"$body_file"
 : >"$log"
-result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-open --title "Body File" --body-file "$body_file" 2>&1)
+result=$(cd "$repo" && PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" \
+  --title "Body File" --body-file "$body_file" 2>&1)
 _assert_contains "passes body file" "--body-file $body_file" "$(<"$log")"
 
 dirty_repo=$(_tmpdir)/dirty
 _clone_feature_repo "$remote" "$dirty_repo"
 printf 'dirty\n' >>"$dirty_repo/feature.txt"
-result=$(PATH="$bin_dir:$PATH" git -C "$dirty_repo" pr-open --title Dirty 2>&1 || true)
+# shellcheck disable=SC2015 # Preserve the expected failure's diagnostics.
+result=$(cd "$dirty_repo" && PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-open" --title Dirty 2>&1 || true)
 _assert_contains "refuses dirty worktree" "worktree must be clean" "$result"
 
 stale_repo=$(_tmpdir)/stale
@@ -142,14 +577,19 @@ printf 'new base\n' >>"$seed/README.md"
 git -C "$seed" add README.md
 git -C "$seed" commit -m update-base >/dev/null
 git -C "$seed" push origin main >/dev/null 2>&1
-result=$(PATH="$bin_dir:$PATH" git -C "$stale_repo" pr-open --title Stale 2>&1 || true)
+# shellcheck disable=SC2015 # Preserve the expected failure's diagnostics.
+result=$(cd "$stale_repo" && PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-open" --title Stale 2>&1 || true)
 _assert_contains "refuses stale local base" "local base branch is stale" "$result"
 
-result=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-open 2>&1 || true)
+# shellcheck disable=SC2015 # Preserve the expected failure's diagnostics.
+result=$(cd "$repo" && PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" 2>&1 || true)
 _assert_contains "requires title without fill" "--title is required" "$result"
 
 outside=$(_tmpdir)
-result=$(PATH="$bin_dir:$PATH" git -C "$outside" pr-open --title Outside 2>&1 || true)
+# shellcheck disable=SC2015 # Preserve the expected failure's diagnostics.
+result=$(cd "$outside" && PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-open" --title Outside 2>&1 || true)
 _assert_contains "requires git repo" "not inside a git repository" "$result"
 
 if ((_failures > 0)); then

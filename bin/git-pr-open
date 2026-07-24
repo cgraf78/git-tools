@@ -21,13 +21,16 @@ _root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
 # END GENERATED LAUNCHER BOOTSTRAP
 # shellcheck disable=SC1091
 . "$_root/lib/git-tools-pr.sh"
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-base.sh"
 
 _usage() {
   cat <<'EOF'
 Usage: git pr-open [options]
 
 Push the current branch with upstream tracking and create a GitHub pull request
-without interactive prompts.
+without interactive prompts. GitHub creation is pinned to the repository and
+host derived from the current checkout.
 
 Options:
   -t, --title <title>       Pull request title.
@@ -156,96 +159,137 @@ done
 [[ -n "$_title" || -n "$_fill" ]] ||
   gt_usage_error "--title is required unless a --fill mode is used"
 
-_run() {
-  if [[ "$_dry_run" == 1 ]]; then
-    printf 'git pr-open: would run:' >&2
-    printf ' %q' "$@" >&2
-    printf '\n' >&2
-    return 0
-  fi
-  "$@"
-}
-
-_default_branch() {
-  local ref
-
-  ref=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)
-  if [[ -n "$ref" ]]; then
-    printf '%s\n' "${ref#origin/}"
-    return 0
-  fi
-
-  for ref in origin/main origin/master origin/trunk; do
-    if git show-ref --verify --quiet "refs/remotes/$ref"; then
-      printf '%s\n' "${ref#origin/}"
-      return 0
-    fi
-  done
-
-  for ref in main master trunk; do
-    if git show-ref --verify --quiet "refs/heads/$ref"; then
-      printf '%s\n' "$ref"
-      return 0
-    fi
-  done
-
-  printf 'main\n'
-}
-
-_remote_for_branch() {
-  local branch="$1"
-  local remote
-
-  remote=$(git config "branch.$branch.remote" 2>/dev/null || true)
-  if [[ -n "$remote" ]]; then
-    printf '%s\n' "$remote"
-    return 0
-  fi
-  printf 'origin\n'
-}
-
-_remote_branch_exists() {
-  git show-ref --verify --quiet "refs/remotes/$1/$2"
-}
-
 _local_branch_exists() {
-  git show-ref --verify --quiet "refs/heads/$1"
+  gt_find_ref_commit "refs/heads/$1"
 }
 
 _ensure_base_current() {
   local remote="$1"
-  local base="$2"
+  local url="$2"
+  local base="$3"
+  local local_oid status=0
 
-  _run git fetch --quiet --prune --tags "$remote"
+  if [[ "$_dry_run" == 1 ]]; then
+    gt_say "would fetch refs/heads/$base from $remote"
+    gt_find_remote_ref_exact_url "$url" "refs/heads/$base" || status=$?
+    case "$status" in
+      0) _base_oid=$GT_REMOTE_REF_OID ;;
+      1) gt_die "base branch does not exist on $remote: $base" ;;
+      *) gt_die "could not inspect base branch on $remote: $base" ;;
+    esac
+  else
+    status=0
+    gt_snapshot_and_fetch_ref_exact_url "$url" "refs/heads/$base" || status=$?
+    case "$status" in
+      0) _base_oid=$GT_EXACT_REF_OID ;;
+      1) gt_die "base branch does not exist on $remote: $base" ;;
+      *) gt_die "could not fetch base branch from $remote: $base" ;;
+    esac
+  fi
 
-  _remote_branch_exists "$remote" "$base" ||
-    gt_die "base branch does not exist on $remote: $base"
-
-  if _local_branch_exists "$base"; then
-    _local=$(git rev-parse "$base")
-    _remote_ref=$(git rev-parse "$remote/$base")
-    [[ "$_local" == "$_remote_ref" ]] ||
+  status=0
+  _local_branch_exists "$base" || status=$?
+  if [[ "$status" == 0 ]]; then
+    local_oid=$GT_REF_OID
+    [[ "$local_oid" == "$_base_oid" ]] ||
       gt_die "local base branch is stale: $base differs from $remote/$base"
+  elif [[ "$status" != 1 ]]; then
+    gt_die "could not inspect local base branch: $base"
   fi
 }
 
 gt_require_repo
+_branch=$(gt_current_branch)
+_head="${_head:-$_branch}"
+git check-ref-format "refs/heads/$_head" >/dev/null 2>&1 ||
+  gt_usage_error "head is not a valid branch name: $_head"
+if [[ -n "$_base" ]]; then
+  git check-ref-format "refs/heads/$_base" >/dev/null 2>&1 ||
+    gt_usage_error "base is not a valid branch name: $_base"
+fi
+
 gt_require_gh
 gt_require_clean_worktree
 
-_branch=$(gt_current_branch)
-_base="${_base:-$(_default_branch)}"
-_head="${_head:-$_branch}"
+_base_remote_status=0
+gt_find_current_repo_fetch_remote || _base_remote_status=$?
+case "$_base_remote_status" in
+  0)
+    _base_remote=$GT_REPO_FETCH_REMOTE
+    _base_remote_url=$GT_REPO_FETCH_REMOTE_URL
+    ;;
+  1) gt_die "could not resolve one exact fetch remote for the base repository" ;;
+  *) gt_die "could not inspect configured fetch remotes for the base repository" ;;
+esac
+if [[ -z "$_base" ]]; then
+  gt_load_current_repo_default_branch ||
+    gt_die "could not resolve the base repository default branch"
+  _base=$GT_CURRENT_REPO_DEFAULT_BRANCH
+fi
+git check-ref-format "refs/heads/$_base" >/dev/null 2>&1 ||
+  gt_die "base repository default is not a valid branch name: $_base"
 
 [[ "$_branch" != "$_base" ]] ||
   gt_usage_error "current branch is the base branch: $_base"
 
-_remote=$(_remote_for_branch "$_base")
-_ensure_base_current "$_remote" "$_base"
+_ensure_base_current "$_base_remote" "$_base_remote_url" "$_base"
 
-_run git push -u "$_remote" "$_branch"
+_head_remote_status=0
+gt_find_branch_push_remote "$_branch" || _head_remote_status=$?
+case "$_head_remote_status" in
+  0)
+    _head_remote=$GT_BRANCH_PUSH_REMOTE
+    _head_repo_identity=$GT_BRANCH_PUSH_REPO_IDENTITY
+    _head_remote_url=$GT_BRANCH_PUSH_REMOTE_URL
+    ;;
+  1) gt_die "could not resolve one exact push remote for feature branch $_branch" ;;
+  *) gt_die "could not inspect configured push remotes for feature branch $_branch" ;;
+esac
+[[ "${_head_repo_identity%%/*}" == "$GT_CURRENT_REPO_HOST" ]] ||
+  gt_die "feature push remote is on a different GitHub host"
 
-_create_args=(pr create --base "$_base" --head "$_head")
+gt_find_ref_commit "refs/heads/$_branch" ||
+  gt_die "could not resolve current feature branch"
+_feature_oid=$GT_REF_OID
+if [[ "$_dry_run" == 1 ]]; then
+  printf 'git pr-open: would run: git push %q %q\n' \
+    "$_head_remote" "refs/heads/$_branch:refs/heads/$_head" >&2
+else
+  gt_push_exact_url "$_head_remote_url" \
+    "$_feature_oid:refs/heads/$_head" ||
+    gt_die "could not push feature branch to the validated repository"
+  _pushed_oid_status=0
+  gt_find_remote_ref_exact_url "$_head_remote_url" "refs/heads/$_head" ||
+    _pushed_oid_status=$?
+  [[ "$_pushed_oid_status" == 0 && "$GT_REMOTE_REF_OID" == "$_feature_oid" ]] ||
+    gt_die "feature branch was pushed but its remote OID could not be verified"
+
+  _tracking_status=0
+  gt_find_branch_push_remote "$_branch" || _tracking_status=$?
+  if [[ "$_tracking_status" != 0 ||
+    "$GT_BRANCH_PUSH_REMOTE" != "$_head_remote" ||
+    "$GT_BRANCH_PUSH_REMOTE_URL" != "$_head_remote_url" ||
+    "$GT_BRANCH_PUSH_REPO_IDENTITY" != "$_head_repo_identity" ]]; then
+    gt_die "feature branch was pushed but upstream tracking is incomplete: remote configuration changed"
+  fi
+  git check-ref-format "refs/remotes/$_head_remote/$_head" >/dev/null 2>&1 ||
+    gt_die "feature branch was pushed but upstream tracking is incomplete: invalid tracking ref"
+  git update-ref "refs/remotes/$_head_remote/$_head" "$_feature_oid" ||
+    gt_die "feature branch was pushed but upstream tracking is incomplete: could not update tracking ref"
+  git config --local "branch.$_branch.merge" "refs/heads/$_head" ||
+    gt_die "feature branch was pushed but upstream tracking is incomplete: could not record merge ref"
+  git config --local "branch.$_branch.remote" "$_head_remote" ||
+    gt_die "feature branch was pushed but upstream tracking is incomplete: could not record remote"
+fi
+
+if [[ "$_head_repo_identity" == "$GT_CURRENT_REPO_IDENTITY" ]]; then
+  _gh_head=$_head
+else
+  _head_name=${_head_repo_identity#*/}
+  _gh_head="${_head_name%%/*}:$_head"
+fi
+
+_create_args=(create --base "$_base" --head "$_gh_head")
 [[ "$_draft" == 0 ]] || _create_args+=(--draft)
 [[ "$_maintainer_edit" == 1 ]] || _create_args+=(--no-maintainer-edit)
 [[ "$_dry_run" == 0 ]] || _create_args+=(--dry-run)
@@ -261,4 +305,40 @@ else
   fi
 fi
 
-_run gh "${_create_args[@]}"
+if [[ "$_dry_run" == 1 ]]; then
+  printf 'git pr-open: would run: gh pr' >&2
+  printf ' %q' "${_create_args[@]}" >&2
+  printf '\n' >&2
+else
+  _create_head_status=0
+  gt_find_remote_ref_exact_url "$_head_remote_url" "refs/heads/$_head" ||
+    _create_head_status=$?
+  [[ "$_create_head_status" == 0 &&
+    "$GT_REMOTE_REF_OID" == "$_feature_oid" ]] ||
+    gt_die "feature remote head changed before pull request creation"
+
+  _created_url=$(gt_gh_pr "${_create_args[@]}") ||
+    gt_die "could not create pull request"
+  gt_validate_pr_url_repository "$_created_url" ||
+    gt_die "created pull request belongs to a different repository"
+  gt_parse_pr_url "$_created_url" ||
+    gt_die "created pull request returned an invalid URL"
+  _created_number=$GT_PR_URL_NUMBER
+  # The pre-create check cannot close GitHub's server-side race, so verify the
+  # created PR before reporting clean success.
+  _created_record=$(gt_pr_view_tsv "$_created_url") ||
+    gt_die "pull request was created but its topology could not be verified: $_created_url"
+  _expected_head_repo=${_head_repo_identity#*/}
+  if [[ "$_head_repo_identity" == "$GT_CURRENT_REPO_IDENTITY" ]]; then
+    _expected_cross_repo=false
+  else
+    _expected_cross_repo=true
+  fi
+  _created_topology=$(gt_pr_topology_tsv "$_created_number" "$_head" \
+    "$_feature_oid" "$_base" "$_expected_head_repo" \
+    "$_expected_cross_repo" "$_created_url") ||
+    gt_die "pull request was created but expected topology is invalid: $_created_url"
+  gt_pr_record_matches_topology "$_created_record" "$_created_topology" ||
+    gt_die "pull request was created but does not match the requested topology: $_created_url"
+  printf '%s\n' "$_created_url"
+fi

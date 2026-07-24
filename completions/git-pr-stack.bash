@@ -11,7 +11,7 @@ _git_pr_stack() {
   cur="${COMP_WORDS[COMP_CWORD]}"
 
   if [[ "$cur" == -* ]]; then
-    COMPREPLY=($(compgen -W "--porcelain -h --help" -- "$cur"))
+    COMPREPLY=($(compgen -W "--porcelain --porcelain=v2 -h --help" -- "$cur"))
     return
   fi
 

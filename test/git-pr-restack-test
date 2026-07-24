@@ -7,22 +7,10 @@ PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
 
 _failures=0
-_temps=()
-
-_tmpdir() {
-  local dir
-  dir=$(mktemp -d)
-  _temps+=("$dir")
-  printf '%s\n' "$dir"
-}
-
-_cleanup() {
-  local dir
-  for dir in "${_temps[@]}"; do
-    rm -rf "$dir"
-  done
-}
-trap _cleanup EXIT
+# shellcheck source=test/lib/test-temp.sh
+. "$ROOT/test/lib/test-temp.sh"
+gt_test_temp_init || exit 1
+_tmpdir() { gt_test_temp_dir; }
 
 _pass() {
   printf 'ok - %s\n' "$1"
@@ -73,6 +61,12 @@ _commit_file() {
   git -C "$repo" commit -m "$message" >/dev/null
 }
 
+_pr_restack() {
+  local repo="$1"
+  shift
+  (cd "$repo" && GH_TEST_REPO="$repo" "$ROOT/bin/git-pr-restack" "$@")
+}
+
 _init_stack_repo() {
   local repo="$1"
   local remote="$2"
@@ -83,7 +77,9 @@ _init_stack_repo() {
   git -C "$repo" config user.name "Test"
   git -C "$repo" config core.hooksPath /dev/null
   _commit_file "$repo" README.md base base
-  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" config "url.$remote.insteadOf" \
+    https://github.test/example/repo.git
+  git -C "$repo" remote add origin https://github.test/example/repo.git
   git -C "$repo" push -u origin main >/dev/null 2>&1
 
   git -C "$repo" switch --quiet -c parent
@@ -113,7 +109,9 @@ _init_squash_repo() {
   git -C "$repo" config user.name "Test"
   git -C "$repo" config core.hooksPath /dev/null
   _commit_file "$repo" README.md base base
-  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" config "url.$remote.insteadOf" \
+    https://github.test/example/repo.git
+  git -C "$repo" remote add origin https://github.test/example/repo.git
   git -C "$repo" push -u origin main >/dev/null 2>&1
 
   git -C "$repo" switch --quiet -c parent
@@ -137,18 +135,71 @@ _write_gh_stub() {
 set -euo pipefail
 
 log="${GH_LOG:?}"
+edit_state="$log.edited"
+
+_head_oid() {
+  local remote oid
+  if [[ -n "${GH_PR_HEAD_OID:-}" ]]; then
+    printf '%s\n' "$GH_PR_HEAD_OID"
+    return 0
+  fi
+  remote=$(git config branch.child.remote 2>/dev/null || printf origin)
+  oid=$(git ls-remote --refs "$remote" refs/heads/child 2>/dev/null |
+    awk 'NR == 1 { print $1 }')
+  [[ -n "$oid" ]] || oid=$(git rev-parse refs/heads/child)
+  printf '%s\n' "$oid"
+}
 
 if [[ "$1 $2" == "auth status" ]]; then
   exit 0
 fi
 
+if [[ "$1 $2" == "repo view" ]]; then
+  if [[ "${GH_REPO:-}" == github.test/foreign/repo ]]; then
+    printf 'foreign/repo\thttps://github.test/foreign/repo\n'
+  else
+    printf 'example/repo\thttps://github.test/example/repo\n'
+  fi
+  exit 0
+fi
+
 if [[ "$1 $2" == "pr view" ]]; then
+  head_oid=$(_head_oid)
+  if [[ "${3:-}" == https://github.test/foreign/repo/pull/2 ||
+    "${GH_REPO:-}" == github.test/foreign/repo ]]; then
+    printf '2\tOPEN\tfalse\tCLEAN\tforeign-child\t%s\tmain\tforeign/repo\tfalse\thttps://github.test/foreign/repo/pull/2\tForeign PR\n' "$head_oid"
+    exit 0
+  fi
   case "${GH_PR_CASE:-open}" in
     open)
-      printf '2\tOPEN\tfalse\tCLEAN\tchild\tparent\thttps://example/pr/2\tChild PR\n'
+      base=parent
+      [[ ! -f "$edit_state" ]] || base=main
+      printf '2\tOPEN\tfalse\tCLEAN\tchild\t%s\t%s\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tChild PR\n' "$head_oid" "$base"
       ;;
     draft)
-      printf '2\tOPEN\ttrue\tCLEAN\tchild\tparent\thttps://example/pr/2\tChild PR\n'
+      printf '2\tOPEN\ttrue\tCLEAN\tchild\t%s\tparent\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tChild PR\n' "$head_oid"
+      ;;
+    fork)
+      printf '2\tOPEN\tfalse\tCLEAN\tchild\t%s\tparent\tforker/repo\ttrue\thttps://github.test/example/repo/pull/2\tFork PR\n' "$head_oid"
+      ;;
+    explicit-target-rebound)
+      printf '3\tOPEN\tfalse\tCLEAN\tchild\t%s\tparent\texample/repo\tfalse\thttps://github.test/example/repo/pull/3\tRebound PR\n' "$head_oid"
+      ;;
+    branch-target-rebound)
+      printf '2\tOPEN\tfalse\tCLEAN\tchild\t%s\tparent\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tWrong branch PR\n' "$head_oid"
+      ;;
+    post-action-rebound)
+      if [[ -f "$edit_state" ]]; then
+        printf '3\tOPEN\tfalse\tCLEAN\tchild\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/3\tRebound PR\n' "$head_oid"
+      else
+        printf '2\tOPEN\tfalse\tCLEAN\tchild\t%s\tparent\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tChild PR\n' "$head_oid"
+      fi
+      ;;
+    wrong-same-repo-head)
+      printf '2\tOPEN\tfalse\tCLEAN\tchild\t%s\tparent\tforeign/repo\tfalse\thttps://github.test/example/repo/pull/2\tWrong head repository\n' "$head_oid"
+      ;;
+    malformed-draft)
+      printf '2\tOPEN\tmaybe\tCLEAN\tchild\t%s\tparent\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tMalformed draft\n' "$head_oid"
       ;;
   esac
   exit 0
@@ -156,6 +207,7 @@ fi
 
 if [[ "$1 $2" == "pr edit" ]]; then
   printf '%s\n' "$*" >>"$log"
+  : >"$edit_state"
   exit 0
 fi
 
@@ -163,6 +215,48 @@ printf 'unexpected gh call: %s\n' "$*" >&2
 exit 99
 EOF
   chmod +x "$bin"
+  cat >"$dir/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-} ${2:-} ${3:-} ${4:-}" == "remote get-url --push --all" &&
+  "${GIT_TEST_REAL_EFFECTIVE_PUSH_URL:-0}" != 1 ]]; then
+  remote=${5:-}
+  url=$(/usr/bin/git config --get-all "remote.$remote.pushurl" 2>/dev/null || true)
+  [[ -n "$url" ]] || url=$(/usr/bin/git config --get-all "remote.$remote.url")
+  printf '%s\n' "$url"
+  exit 0
+fi
+if [[ "${1:-} ${2:-} ${3:-}" == "remote get-url --all" ]]; then
+  /usr/bin/git config --get-all "remote.${4:-}.url"
+  exit $?
+fi
+if [[ "${GIT_TEST_LS_REMOTE_FAIL:-0}" == 1 && "$*" == *" ls-remote "* ]]; then
+  printf 'partial remote output\n'
+  exit 88
+fi
+if [[ "${1:-}" == -c && "${2:-}" == url.*.insteadOf=* &&
+  "${3:-}" == -c && "${4:-}" == url.*.pushInsteadOf=* ]]; then
+  pin=${2#url.}
+  target=${pin%%.insteadOf=*}
+  alias=${pin#*.insteadOf=}
+  shift 4
+  rewritten=()
+  for argument in "$@"; do
+    [[ "$argument" != "$alias" ]] || argument=$target
+    rewritten+=("$argument")
+  done
+  set -- "${rewritten[@]}"
+fi
+if [[ "${GIT_TEST_ADVANCE_BEFORE_PUSH:-0}" == 1 && "${1:-}" == push &&
+  ! -e "${GIT_TEST_ADVANCE_MARKER:?}" ]]; then
+  : >"$GIT_TEST_ADVANCE_MARKER"
+  /usr/bin/git -C "${GIT_TEST_ADVANCE_REPO:?}" push --quiet \
+    "${GIT_TEST_ADVANCE_REMOTE:?}" \
+    "${GIT_TEST_ADVANCE_OID:?}:refs/heads/child"
+fi
+exec /usr/bin/git "$@"
+EOF
+  chmod +x "$dir/git"
 }
 
 echo "=== git pr-restack ==="
@@ -174,17 +268,368 @@ log=$(_tmpdir)/gh.log
 _init_stack_repo "$repo" "$remote"
 _write_gh_stub "$bin_dir"
 
-result=$(GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-restack 2 --base main 2>&1)
+result=$(GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_restack "$repo" 2 --base main 2>&1)
 _assert_contains "rebases onto requested base" "rebasing child onto origin/main" "$result"
 _assert_contains "pushes with lease" "pushing child to origin with --force-with-lease" "$result"
 _assert_eq "leaves child checked out" "child" "$(git -C "$repo" branch --show-current)"
-_assert_eq "updates PR base" "pr edit 2 --base main" "$(cat "$log")"
+_assert_eq "updates PR base" \
+  "pr edit 2 --base main --repo github.test/example/repo" "$(cat "$log")"
+
+repo_stale_pr_oid=$(_tmpdir)
+remote_stale_pr_oid=$(_tmpdir)
+log_stale_pr_oid=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_stale_pr_oid" "$remote_stale_pr_oid"
+stale_pr_oid=$(git -C "$remote_stale_pr_oid" rev-parse refs/heads/child)
+_commit_file "$repo_stale_pr_oid" post-parent.txt advanced "advance main"
+git -C "$repo_stale_pr_oid" push --quiet origin main
+stale_pr_result=$(GH_PR_HEAD_OID="$stale_pr_oid" GH_LOG="$log_stale_pr_oid" \
+  PATH="$bin_dir:$PATH" _pr_restack "$repo_stale_pr_oid" 2 --base main \
+  2>&1 || true)
+_assert_contains "restack requires GitHub to observe the pushed head OID" \
+  "PR #2 head OID did not update after push" "$stale_pr_result"
+_assert_eq "unobserved pushed head OID prevents PR edit" "" \
+  "$(cat "$log_stale_pr_oid" 2>/dev/null || true)"
+
+repo_ambient=$(_tmpdir)
+remote_ambient=$(_tmpdir)
+log_ambient=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_ambient" "$remote_ambient"
+result=$(GH_REPO=github.test/foreign/repo GH_HOST=foreign.test \
+  GH_LOG="$log_ambient" PATH="$bin_dir:$PATH" \
+  _pr_restack "$repo_ambient" 2 --base main 2>&1)
+_assert_contains "ambient routing cannot redirect numeric restack" \
+  "restacked PR #2" "$result"
+_assert_eq "ambient routing still updates the current PR" \
+  "pr edit 2 --base main --repo github.test/example/repo" "$(cat "$log_ambient")"
+
+repo_foreign=$(_tmpdir)
+remote_foreign=$(_tmpdir)
+log_foreign=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_foreign" "$remote_foreign"
+foreign_result=$(GH_LOG="$log_foreign" PATH="$bin_dir:$PATH" \
+  _pr_restack "$repo_foreign" \
+  https://github.test/foreign/repo/pull/2 --base main 2>&1 || true)
+_assert_contains "restack rejects a foreign same-number URL" \
+  "target pull request belongs to a different repository" "$foreign_result"
+_assert_eq "foreign restack performs no GitHub mutation" "" \
+  "$(cat "$log_foreign" 2>/dev/null || true)"
+
+_assert_restack_rejected_before_push() {
+  local case_name="$1"
+  local target="$2"
+  local case_repo case_remote case_log case_before case_after case_rc=0
+
+  case_repo=$(_tmpdir)
+  case_remote=$(_tmpdir)
+  case_log=$(_tmpdir)/gh.log
+  _init_stack_repo "$case_repo" "$case_remote"
+  case_before=$(git -C "$case_remote" rev-parse refs/heads/child)
+  GH_PR_CASE="$case_name" GH_LOG="$case_log" PATH="$bin_dir:$PATH" \
+    _pr_restack "$case_repo" "$target" --base main >/dev/null 2>&1 || case_rc=$?
+  case_after=$(git -C "$case_remote" rev-parse refs/heads/child)
+  if [[ "$case_rc" != 0 && "$case_before" == "$case_after" && ! -e "$case_log" ]]; then
+    _pass "restack rejects malformed PR before push: $case_name"
+  else
+    _fail "restack rejects malformed PR before push: $case_name"
+  fi
+}
+
+_assert_restack_rejected_before_push explicit-target-rebound 2
+_assert_restack_rejected_before_push explicit-target-rebound \
+  https://github.test/example/repo/pull/2
+_assert_restack_rejected_before_push branch-target-rebound expected/child
+_assert_restack_rejected_before_push branch-target-rebound example:child
+_assert_restack_rejected_before_push wrong-same-repo-head 2
+_assert_restack_rejected_before_push malformed-draft 2
+
+repo_expected=$(_tmpdir)
+remote_expected=$(_tmpdir)
+log_expected=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_expected" "$remote_expected"
+expected_before=$(git -C "$remote_expected" rev-parse refs/heads/child)
+expected_rc=0
+GH_LOG="$log_expected" PATH="$bin_dir:$PATH" \
+  _pr_restack "$repo_expected" 2 --base main --fork parent \
+  --expect-topology $'2\tchild\trelease\texample/repo\tfalse\thttps://github.test/example/repo/pull/2' \
+  >/dev/null 2>&1 || expected_rc=$?
+_assert_eq "stale expected restack topology exits nonzero" "1" "$expected_rc"
+_assert_eq "stale expected restack topology preserves remote head" \
+  "$expected_before" "$(git -C "$remote_expected" rev-parse refs/heads/child)"
+_assert_eq "stale expected restack topology causes no PR edit" "" \
+  "$(cat "$log_expected" 2>/dev/null || true)"
+
+post_repo=$(_tmpdir)
+post_remote=$(_tmpdir)
+post_log=$(_tmpdir)/gh.log
+_init_stack_repo "$post_repo" "$post_remote"
+post_rc=0
+GH_PR_CASE=post-action-rebound GH_LOG="$post_log" PATH="$bin_dir:$PATH" \
+  _pr_restack "$post_repo" 2 --base main >/dev/null 2>&1 || post_rc=$?
+_assert_eq "restack rejects post-edit target rebound" "1" "$post_rc"
+_assert_eq "post-edit rebound performs no foreign PR mutation" \
+  "pr edit 2 --base main --repo github.test/example/repo" "$(cat "$post_log")"
+
+repo_multi=$(_tmpdir)
+remote_multi_a=$(_tmpdir)
+remote_multi_b=$(_tmpdir)
+log_multi=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_multi" "$remote_multi_a"
+_commit_file "$repo_multi" later.txt later "advance main"
+git -C "$repo_multi" push --quiet origin main
+git init -q --bare --initial-branch=main "$remote_multi_b"
+git -C "$repo_multi" push --quiet "$remote_multi_b" main child
+multi_a_before=$(git -C "$remote_multi_a" rev-parse refs/heads/child)
+multi_b_before=$(git -C "$remote_multi_b" rev-parse refs/heads/child)
+git -C "$repo_multi" config --add remote.origin.pushurl \
+  https://github.test/example/repo.git
+git -C "$repo_multi" config --add remote.origin.pushurl \
+  ssh://git@github.test/example/repo.git
+git -C "$repo_multi" config "url.$remote_multi_b.insteadOf" \
+  ssh://git@github.test/example/repo.git
+multi_result=$(GH_LOG="$log_multi" PATH="$bin_dir:$PATH" \
+  _pr_restack "$repo_multi" 2 --base main 2>&1 || true)
+_assert_contains "restack rejects multiple push targets" \
+  "could not resolve one exact remote for PR head child" "$multi_result"
+_assert_eq "multiple push targets preserve the first remote" "$multi_a_before" \
+  "$(git -C "$remote_multi_a" rev-parse refs/heads/child)"
+_assert_eq "multiple push targets preserve the second remote" "$multi_b_before" \
+  "$(git -C "$remote_multi_b" rev-parse refs/heads/child)"
+
+git -C "$repo_multi" config --unset-all remote.origin.pushurl
+git -C "$repo_multi" config --add remote.origin.pushurl \
+  ssh://git@github.test/example/repo.git
+git -C "$repo_multi" config --add remote.origin.pushurl \
+  https://github.test/example/repo.git
+multi_reverse_result=$(GH_LOG="$log_multi" PATH="$bin_dir:$PATH" \
+  _pr_restack "$repo_multi" 2 --base main 2>&1 || true)
+_assert_contains "restack rejects reversed multiple push targets" \
+  "could not resolve one exact remote for PR head child" "$multi_reverse_result"
+_assert_eq "reversed push targets preserve the first remote" "$multi_a_before" \
+  "$(git -C "$remote_multi_a" rev-parse refs/heads/child)"
+_assert_eq "reversed push targets preserve the second remote" "$multi_b_before" \
+  "$(git -C "$remote_multi_b" rev-parse refs/heads/child)"
+
+repo_redirect=$(_tmpdir)
+remote_redirect=$(_tmpdir)
+unrelated_redirect=$(_tmpdir)
+log_redirect=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_redirect" "$remote_redirect"
+git init -q --bare --initial-branch=main "$unrelated_redirect"
+git -C "$repo_redirect" push --quiet "$unrelated_redirect" main child
+redirect_expected_before=$(git -C "$remote_redirect" rev-parse refs/heads/child)
+redirect_unrelated_before=$(git -C "$unrelated_redirect" rev-parse refs/heads/child)
+git -C "$repo_redirect" config \
+  "url.$unrelated_redirect.pushInsteadOf" \
+  https://github.test/example/repo.git
+redirect_result=$(GIT_TEST_REAL_EFFECTIVE_PUSH_URL=1 GH_LOG="$log_redirect" \
+  PATH="$bin_dir:$PATH" _pr_restack "$repo_redirect" 2 --base main 2>&1 || true)
+_assert_contains "restack rejects a pushInsteadOf identity mismatch" \
+  "could not resolve one exact remote for PR head child" "$redirect_result"
+_assert_eq "pushInsteadOf mismatch preserves expected remote" \
+  "$redirect_expected_before" \
+  "$(git -C "$remote_redirect" rev-parse refs/heads/child)"
+_assert_eq "pushInsteadOf mismatch preserves unrelated remote" \
+  "$redirect_unrelated_before" \
+  "$(git -C "$unrelated_redirect" rev-parse refs/heads/child)"
+
+repo_absent=$(_tmpdir)
+remote_absent=$(_tmpdir)
+log_absent=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_absent" "$remote_absent"
+git -C "$remote_absent" update-ref -d refs/heads/child
+absent_result=$(GH_LOG="$log_absent" PATH="$bin_dir:$PATH" \
+  _pr_restack "$repo_absent" 2 --base main 2>&1 || true)
+_assert_contains "restack refuses an absent remote PR head" \
+  "remote PR head does not exist" "$absent_result"
+_assert_eq "absent remote head causes no PR edit" "" \
+  "$(cat "$log_absent" 2>/dev/null || true)"
+
+repo_lookup=$(_tmpdir)
+remote_lookup=$(_tmpdir)
+log_lookup=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_lookup" "$remote_lookup"
+lookup_before=$(git -C "$remote_lookup" rev-parse refs/heads/child)
+lookup_result=$(GIT_TEST_LS_REMOTE_FAIL=1 GH_LOG="$log_lookup" \
+  PATH="$bin_dir:$PATH" _pr_restack "$repo_lookup" 2 --base main 2>&1 || true)
+_assert_contains "restack refuses a failed remote snapshot" \
+  "could not snapshot remote PR head" "$lookup_result"
+_assert_eq "failed remote snapshot preserves the remote" "$lookup_before" \
+  "$(git -C "$remote_lookup" rev-parse refs/heads/child)"
+
+repo_fork_map=$(_tmpdir)
+remote_fork_base=$(_tmpdir)
+remote_fork_head=$(_tmpdir)
+log_fork_map=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_fork_map" "$remote_fork_base"
+git init -q --bare --initial-branch=main "$remote_fork_head"
+git -C "$repo_fork_map" push --quiet "$remote_fork_head" main parent child
+git -C "$repo_fork_map" config "url.$remote_fork_head.insteadOf" \
+  https://github.test/forker/repo.git
+git -C "$repo_fork_map" remote add fork https://github.test/forker/repo.git
+git -C "$repo_fork_map" config branch.child.remote fork
+fork_base_before=$(git -C "$remote_fork_base" rev-parse refs/heads/child)
+fork_map_result=$(GH_PR_CASE=fork GH_LOG="$log_fork_map" \
+  PATH="$bin_dir:$PATH" _pr_restack "$repo_fork_map" 2 2>&1)
+_assert_contains "restack resolves a mapped fork head" \
+  "pushing child to fork with --force-with-lease" "$fork_map_result"
+_assert_eq "mapped fork preserves the base-repository collision" \
+  "$fork_base_before" \
+  "$(git -C "$remote_fork_base" rev-parse refs/heads/child)"
+
+repo_triangular=$(_tmpdir)
+remote_triangular_base=$(_tmpdir)
+remote_triangular_head=$(_tmpdir)
+log_triangular=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_triangular" "$remote_triangular_base"
+git init -q --bare --initial-branch=main "$remote_triangular_head"
+triangular_old=$(git -C "$repo_triangular" rev-parse refs/heads/child)
+triangular_tree=$(git -C "$repo_triangular" rev-parse "$triangular_old^{tree}")
+triangular_head=$(printf '%s\n' triangular-fork-head |
+  git -C "$repo_triangular" commit-tree "$triangular_tree" -p "$triangular_old")
+git -C "$repo_triangular" config "url.$remote_triangular_head.insteadOf" \
+  https://github.test/forker/repo.git
+git -C "$repo_triangular" config remote.origin.pushurl \
+  https://github.test/forker/repo.git
+git -C "$repo_triangular" push --quiet origin \
+  "$triangular_head:refs/heads/child"
+git -C "$repo_triangular" branch -D child >/dev/null
+triangular_result=$(GH_PR_CASE=fork GH_PR_HEAD_OID="$triangular_head" \
+  GH_LOG="$log_triangular" PATH="$bin_dir:$PATH" \
+  _pr_restack "$repo_triangular" 2 --base main 2>&1)
+_assert_contains "triangular remote fetches the fork head from its push URL" \
+  "pushing child to origin with --force-with-lease" "$triangular_result"
+
+repo_split_remotes=$(_tmpdir)
+remote_split_base=$(_tmpdir)
+remote_split_head=$(_tmpdir)
+updater_split=$(_tmpdir)
+log_split_remotes=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_split_remotes" "$remote_split_base"
+git clone -q "$remote_split_base" "$updater_split"
+git -C "$updater_split" config user.email test@test.com
+git -C "$updater_split" config user.name Test
+git -C "$updater_split" config core.hooksPath /dev/null
+_commit_file "$updater_split" base-advance.txt advanced "advance base"
+git -C "$updater_split" push --quiet origin main
+split_base_oid=$(git -C "$remote_split_base" rev-parse refs/heads/main)
+git init -q --bare --initial-branch=main "$remote_split_head"
+git -C "$repo_split_remotes" config "url.$remote_split_head.insteadOf" \
+  https://github.test/forker/repo.git
+git -C "$repo_split_remotes" remote add fork \
+  https://github.test/forker/repo.git
+git -C "$repo_split_remotes" push --quiet fork child
+git -C "$repo_split_remotes" config branch.child.remote fork
+split_result=$(GH_PR_CASE=fork GH_LOG="$log_split_remotes" \
+  PATH="$bin_dir:$PATH" _pr_restack "$repo_split_remotes" 2 --base main \
+  2>&1)
+_assert_contains "restack fetches the base repository separately from the fork" \
+  "pushing child to fork with --force-with-lease" "$split_result"
+if git -C "$repo_split_remotes" merge-base --is-ancestor \
+  "$split_base_oid" child; then
+  _pass "fork PR is rebased onto the current base-repository OID"
+else
+  _fail "fork PR is rebased onto the current base-repository OID"
+fi
+
+# A validated remote name is still unsafe as a fetch primitive because its
+# configured fetch refspec can redirect the ordinary tracking ref. Resolve the
+# exact base URL and requested source ref instead, despite colliding short tags.
+repo_fetch_refspec=$(_tmpdir)
+remote_fetch_refspec=$(_tmpdir)
+updater_fetch_refspec=$(_tmpdir)
+log_fetch_refspec=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_fetch_refspec" "$remote_fetch_refspec"
+git -C "$repo_fetch_refspec" push -q origin \
+  refs/heads/main:refs/heads/decoy
+git clone -q "$remote_fetch_refspec" "$updater_fetch_refspec"
+git -C "$updater_fetch_refspec" config user.email test@test.com
+git -C "$updater_fetch_refspec" config user.name Test
+git -C "$updater_fetch_refspec" config core.hooksPath /dev/null
+_commit_file "$updater_fetch_refspec" exact-base.txt exact "advance exact base"
+git -C "$updater_fetch_refspec" push -q origin main
+fetch_refspec_main=$(git -C "$remote_fetch_refspec" rev-parse refs/heads/main)
+git -C "$repo_fetch_refspec" config --unset-all remote.origin.fetch
+git -C "$repo_fetch_refspec" config --add remote.origin.fetch \
+  '+refs/heads/decoy:refs/remotes/origin/main'
+git -C "$repo_fetch_refspec" tag main refs/heads/child
+git -C "$repo_fetch_refspec" tag origin/main refs/heads/child
+git -C "$repo_fetch_refspec" tag upstream/main refs/heads/child
+fetch_refspec_output=$(GH_LOG="$log_fetch_refspec" PATH="$bin_dir:$PATH" \
+  _pr_restack "$repo_fetch_refspec" 2 --base main 2>&1)
+_assert_contains "restack survives base refspec and tag collisions" \
+  "restacked PR #2" "$fetch_refspec_output"
+if git -C "$repo_fetch_refspec" merge-base --is-ancestor \
+  "$fetch_refspec_main" refs/heads/child; then
+  _pass "restack uses the exact remote main OID"
+else
+  _fail "restack uses the exact remote main OID"
+fi
+
+# A post-checkout hook can mutate the just-checked-out branch after the initial
+# PR/remote validation. The injected commit is clean and a descendant of the
+# expected head, so only exact post-checkout revalidation prevents its push.
+repo_checkout_race=$(_tmpdir)
+remote_checkout_race=$(_tmpdir)
+hooks_checkout_race=$(_tmpdir)
+log_checkout_race=$(_tmpdir)/gh.log
+marker_checkout_race=$(_tmpdir)/injected
+_init_stack_repo "$repo_checkout_race" "$remote_checkout_race"
+checkout_expected=$(git -C "$repo_checkout_race" rev-parse refs/heads/child)
+checkout_tree=$(git -C "$repo_checkout_race" rev-parse \
+  "refs/heads/child^{tree}")
+checkout_injected=$(printf '%s\n' injected-checkout |
+  git -C "$repo_checkout_race" commit-tree "$checkout_tree" \
+    -p "$checkout_expected")
+cat >"$hooks_checkout_race/post-checkout" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${GIT_TEST_CHECKOUT_INJECT:-0}" == 1 ]] || exit 0
+[[ ! -e "${GIT_TEST_CHECKOUT_MARKER:?}" ]] || exit 0
+: >"$GIT_TEST_CHECKOUT_MARKER"
+git reset --hard "${GIT_TEST_CHECKOUT_OID:?}" >/dev/null
+EOF
+chmod +x "$hooks_checkout_race/post-checkout"
+git -C "$repo_checkout_race" config core.hooksPath "$hooks_checkout_race"
+checkout_race_output=$(GIT_TEST_CHECKOUT_INJECT=1 \
+  GIT_TEST_CHECKOUT_MARKER="$marker_checkout_race" \
+  GIT_TEST_CHECKOUT_OID="$checkout_injected" GH_LOG="$log_checkout_race" \
+  PATH="$bin_dir:$PATH" _pr_restack "$repo_checkout_race" 2 --base main \
+  2>&1 || true)
+_assert_contains "restack rejects a post-checkout local head race" \
+  "local PR head changed during checkout" "$checkout_race_output"
+_assert_eq "post-checkout injected commit is never force-pushed" \
+  "$checkout_expected" \
+  "$(git -C "$remote_checkout_race" rev-parse refs/heads/child)"
+
+repo_concurrent=$(_tmpdir)
+remote_concurrent=$(_tmpdir)
+log_concurrent=$(_tmpdir)/gh.log
+advance_marker=$(_tmpdir)/advanced
+_init_stack_repo "$repo_concurrent" "$remote_concurrent"
+old_concurrent=$(git -C "$repo_concurrent" rev-parse refs/heads/child)
+tree_concurrent=$(git -C "$repo_concurrent" rev-parse "$old_concurrent^{tree}")
+new_concurrent=$(printf '%s\n' concurrent-restack |
+  git -C "$repo_concurrent" commit-tree "$tree_concurrent" -p "$old_concurrent")
+concurrent_result=$(GIT_TEST_ADVANCE_BEFORE_PUSH=1 \
+  GIT_TEST_ADVANCE_MARKER="$advance_marker" \
+  GIT_TEST_ADVANCE_REPO="$repo_concurrent" \
+  GIT_TEST_ADVANCE_REMOTE="$remote_concurrent" \
+  GIT_TEST_ADVANCE_OID="$new_concurrent" \
+  GH_LOG="$log_concurrent" PATH="$bin_dir:$PATH" \
+  _pr_restack "$repo_concurrent" 2 --base main 2>&1 || true)
+_assert_contains "concurrent restack push is rejected by the exact lease" \
+  "stale info" "$concurrent_result"
+_assert_eq "concurrent restack preserves the newer remote head" \
+  "$new_concurrent" \
+  "$(git -C "$remote_concurrent" rev-parse refs/heads/child)"
+_assert_eq "failed leased push does not edit the PR base" "" \
+  "$(cat "$log_concurrent" 2>/dev/null || true)"
 
 repo_no_push=$(_tmpdir)
 remote_no_push=$(_tmpdir)
 log_no_push=$(_tmpdir)/gh.log
 _init_stack_repo "$repo_no_push" "$remote_no_push"
-result=$(GH_LOG="$log_no_push" PATH="$bin_dir:$PATH" git -C "$repo_no_push" pr-restack 2 --base main --no-push 2>&1)
+result=$(GH_LOG="$log_no_push" PATH="$bin_dir:$PATH" _pr_restack "$repo_no_push" 2 --base main --no-push 2>&1)
 _assert_contains "supports no-push mode" "push skipped" "$result"
 _assert_contains "no-push skips remote PR edits" "PR base update skipped" "$result"
 if [[ -f "$log_no_push" ]]; then
@@ -197,8 +642,9 @@ repo_dry=$(_tmpdir)
 remote_dry=$(_tmpdir)
 log_dry=$(_tmpdir)/gh.log
 _init_stack_repo "$repo_dry" "$remote_dry"
-result=$(GH_LOG="$log_dry" PATH="$bin_dir:$PATH" git -C "$repo_dry" pr-restack 2 --base main --dry-run 2>&1)
-_assert_contains "dry run prints fetch" "would run: git fetch" "$result"
+result=$(GH_LOG="$log_dry" PATH="$bin_dir:$PATH" _pr_restack "$repo_dry" 2 --base main --dry-run 2>&1)
+_assert_contains "dry run prints exact fetch" \
+  "would fetch refs/heads/main from origin" "$result"
 _assert_eq "dry run does not switch branches" "main" "$(git -C "$repo_dry" branch --show-current)"
 
 repo_dirty=$(_tmpdir)
@@ -206,17 +652,17 @@ remote_dirty=$(_tmpdir)
 log_dirty=$(_tmpdir)/gh.log
 _init_stack_repo "$repo_dirty" "$remote_dirty"
 printf 'dirty\n' >"$repo_dirty/dirty.txt"
-result=$(GH_LOG="$log_dirty" PATH="$bin_dir:$PATH" git -C "$repo_dirty" pr-restack 2 --base main 2>&1 || true)
+result=$(GH_LOG="$log_dirty" PATH="$bin_dir:$PATH" _pr_restack "$repo_dirty" 2 --base main 2>&1 || true)
 _assert_contains "refuses dirty worktrees" "worktree must be clean" "$result"
 
-result=$(GH_PR_CASE=draft GH_LOG="$log" PATH="$bin_dir:$PATH" git -C "$repo" pr-restack 2 --base main 2>&1 || true)
+result=$(GH_PR_CASE=draft GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_restack "$repo" 2 --base main 2>&1 || true)
 _assert_contains "refuses draft PRs" "PR #2 is a draft" "$result"
 
 repo_fork=$(_tmpdir)
 remote_fork=$(_tmpdir)
 log_fork=$(_tmpdir)/gh.log
 _init_squash_repo "$repo_fork" "$remote_fork"
-result=$(GH_LOG="$log_fork" PATH="$bin_dir:$PATH" git -C "$repo_fork" pr-restack 2 --base main --fork parent 2>&1)
+result=$(GH_LOG="$log_fork" PATH="$bin_dir:$PATH" _pr_restack "$repo_fork" 2 --base main --fork parent 2>&1)
 _assert_contains "fork rebases with --onto from the old base" "dropping commits up to origin/parent" "$result"
 _assert_eq "fork drops the squash-merged parent commit" "squashed" "$(git -C "$repo_fork" show child:parent.txt)"
 _assert_eq "fork keeps the child's own change" "child" "$(git -C "$repo_fork" show child:child.txt)"
@@ -226,12 +672,72 @@ else
   _fail "fork rebases the child onto the squashed base"
 fi
 
+repo_same_name_fork=$(_tmpdir)
+remote_same_name_base=$(_tmpdir)
+remote_same_name_head=$(_tmpdir)
+log_same_name_fork=$(_tmpdir)/gh.log
+_init_squash_repo "$repo_same_name_fork" "$remote_same_name_base"
+git init -q --bare --initial-branch=main "$remote_same_name_head"
+git -C "$repo_same_name_fork" config \
+  "url.$remote_same_name_head.insteadOf" \
+  https://github.test/forker/repo.git
+git -C "$repo_same_name_fork" remote add fork \
+  https://github.test/forker/repo.git
+git -C "$repo_same_name_fork" push --quiet fork child parent
+git -C "$repo_same_name_fork" push --quiet \
+  fork main:refs/heads/tmp-main
+git -C "$remote_same_name_head" update-ref refs/heads/parent \
+  "$(git -C "$repo_same_name_fork" rev-parse main)"
+git -C "$remote_same_name_head" update-ref -d refs/heads/tmp-main
+git -C "$repo_same_name_fork" config branch.child.remote fork
+same_name_result=$(GH_PR_CASE=fork GH_LOG="$log_same_name_fork" \
+  PATH="$bin_dir:$PATH" _pr_restack "$repo_same_name_fork" 2 \
+  --base main --fork parent 2>&1)
+_assert_contains "fork boundary comes from the base repository" \
+  "dropping commits up to" "$same_name_result"
+_assert_eq "same-named fork ref cannot reintroduce the parent change" \
+  "squashed" "$(git -C "$repo_same_name_fork" show child:parent.txt)"
+_assert_eq "base-repository fork boundary preserves the child change" \
+  "child" "$(git -C "$repo_same_name_fork" show child:child.txt)"
+
 repo_badfork=$(_tmpdir)
 remote_badfork=$(_tmpdir)
 log_badfork=$(_tmpdir)/gh.log
 _init_squash_repo "$repo_badfork" "$remote_badfork"
-result=$(GH_LOG="$log_badfork" PATH="$bin_dir:$PATH" git -C "$repo_badfork" pr-restack 2 --base main --fork nope 2>&1 || true)
-_assert_contains "rejects an unknown fork ref" "fork is not a local or origin branch: nope" "$result"
+result=$(GH_LOG="$log_badfork" PATH="$bin_dir:$PATH" _pr_restack "$repo_badfork" 2 --base main --fork nope 2>&1 || true)
+_assert_contains "rejects an unknown fork ref" \
+  "fork is not a branch on base repository remote origin: nope" "$result"
+
+# Branch namespaces remain branches even when their names look like object IDs;
+# internal object handoffs require an explicit oid: prefix.
+repo_hex_base=$(_tmpdir)
+remote_hex_base=$(_tmpdir)
+log_hex_base=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_hex_base" "$remote_hex_base"
+hex_base=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+git -C "$repo_hex_base" branch "$hex_base" main
+git -C "$repo_hex_base" push -q origin "$hex_base"
+hex_output=$(GH_LOG="$log_hex_base" PATH="$bin_dir:$PATH" \
+  _pr_restack "$repo_hex_base" 2 --base "$hex_base" --no-push 2>&1)
+_assert_contains "hex-looking base resolves as an exact remote branch" \
+  "onto origin/$hex_base" "$hex_output"
+
+repo_raw_oid=$(_tmpdir)
+remote_raw_oid=$(_tmpdir)
+log_raw_oid=$(_tmpdir)/gh.log
+_init_stack_repo "$repo_raw_oid" "$remote_raw_oid"
+raw_fork_oid=$(git -C "$repo_raw_oid" rev-parse parent)
+raw_oid_output=$(GH_LOG="$log_raw_oid" PATH="$bin_dir:$PATH" \
+  _pr_restack "$repo_raw_oid" 2 --base main --fork "$raw_fork_oid" \
+  --no-push 2>&1 || true)
+_assert_contains "raw fork OID requires an explicit namespace" \
+  "fork is not a branch on base repository remote origin" "$raw_oid_output"
+
+base_oid_output=$(GH_LOG="$log_raw_oid" PATH="$bin_dir:$PATH" \
+  _pr_restack "$repo_raw_oid" 2 --base main --base-oid "$raw_fork_oid" \
+  2>&1 || true)
+_assert_contains "internal base OID cannot be pushed" \
+  "--base-oid requires --no-push" "$base_oid_output"
 
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2

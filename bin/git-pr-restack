@@ -21,17 +21,21 @@ _root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
 # END GENERATED LAUNCHER BOOTSTRAP
 # shellcheck disable=SC1091
 . "$_root/lib/git-tools-pr.sh"
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-base.sh"
 
 _usage() {
   cat <<'EOF'
 Usage: git pr-restack [options] <number|url|branch>
 
 Rebase one open PR's head branch onto a base branch and push it with
---force-with-lease. By default, the base is the PR's current base branch.
+--force-with-lease. The push requires one exact mapped remote and uses an
+explicit lease against its live head OID. By default, the base is the PR's
+current base branch.
 
 Options:
   -b, --base <branch>   Rebase onto this branch and update the PR base.
-      --fork <ref>      Replay only commits after <ref> (git rebase --onto). Use
+      --fork <branch>   Replay only commits after <branch> (git rebase --onto). Use
                         this when the previous base was squash-merged, so its
                         commits are dropped instead of re-applied.
       --no-push         Rebase locally without pushing or editing the PR base.
@@ -47,9 +51,11 @@ EOF
 
 _target=""
 _base_override=""
+_base_oid_override=""
 _fork=""
 _push=1
 _dry_run=0
+_expected_topology=""
 
 _run() {
   if [[ "$_dry_run" == 1 ]]; then
@@ -75,6 +81,19 @@ while (($#)); do
       [[ -n "$_base_override" ]] || gt_usage_error "--base requires a value"
       shift
       ;;
+    # Private handoff for local-only stack orchestration. Keeping commit OIDs in
+    # a distinct option prevents branch names from being reinterpreted as OIDs.
+    --base-oid)
+      shift
+      (($#)) || gt_usage_error "--base-oid requires a value"
+      _base_oid_override="$1"
+      shift
+      ;;
+    --base-oid=*)
+      _base_oid_override="${1#--base-oid=}"
+      [[ -n "$_base_oid_override" ]] || gt_usage_error "--base-oid requires a value"
+      shift
+      ;;
     --fork)
       _opt="$1"
       shift
@@ -89,6 +108,20 @@ while (($#)); do
       ;;
     --no-push)
       _push=0
+      shift
+      ;;
+    # Private handoff used by bundled stack orchestrators, not a stable CLI
+    # serialization format.
+    --expect-topology)
+      shift
+      (($#)) || gt_usage_error "--expect-topology requires a value"
+      _expected_topology="$1"
+      shift
+      ;;
+    --expect-topology=*)
+      _expected_topology="${1#--expect-topology=}"
+      [[ -n "$_expected_topology" ]] ||
+        gt_usage_error "--expect-topology requires a value"
       shift
       ;;
     -n | --dry-run)
@@ -117,60 +150,108 @@ while (($#)); do
 done
 
 [[ -n "$_target" ]] || gt_usage_error "expected exactly one target"
-
-_remote_for_branch() {
-  local branch="$1"
-  local remote
-
-  remote=$(git config "branch.$branch.remote" 2>/dev/null || true)
-  if [[ -n "$remote" ]]; then
-    printf '%s\n' "$remote"
-    return 0
-  fi
-  printf 'origin\n'
-}
-
-_remote_branch_exists() {
-  local remote="$1"
-  local branch="$2"
-  git show-ref --verify --quiet "refs/remotes/$remote/$branch"
-}
+[[ -z "$_base_oid_override" || "$_push" == 0 ]] ||
+  gt_usage_error "--base-oid requires --no-push"
+if [[ -n "$_base_override" ]]; then
+  git check-ref-format "refs/heads/$_base_override" >/dev/null 2>&1 ||
+    gt_usage_error "base is not a valid branch name: $_base_override"
+fi
+case "$_fork" in
+  '' | oid:*) ;;
+  *)
+    git check-ref-format "refs/heads/$_fork" >/dev/null 2>&1 ||
+      gt_usage_error "fork is not a valid branch name: $_fork"
+    ;;
+esac
 
 _local_branch_exists() {
   git show-ref --verify --quiet "refs/heads/$1"
 }
 
 _checkout_head() {
-  local remote="$1"
-  local branch="$2"
+  local branch="$1"
+  local oid="$2"
 
   if _local_branch_exists "$branch"; then
     _run git switch --quiet "$branch"
     return 0
   fi
 
-  if _remote_branch_exists "$remote" "$branch"; then
-    _run git switch --quiet -c "$branch" --track "$remote/$branch"
-    return 0
-  fi
-
-  gt_die "PR head branch does not exist locally or on $remote: $branch"
+  _run git switch --quiet -c "$branch" "$oid"
 }
 
-# Resolve a branch name or commit-ish to a rebase target, preferring the
-# remote-tracking branch so a stale local copy never shadows the remote.
-_resolve_ref() {
-  local remote="$1"
-  local ref="$2"
-  local label="$3"
+# Resolve a base-repository branch to an immutable commit. Branch names never
+# fall back to a same-named local or fork ref, including hex-looking names.
+_resolve_base_branch_oid() {
+  local remote="$1" url="$2" ref="$3" label="$4" status=0 oid
 
-  if _remote_branch_exists "$remote" "$ref"; then
-    printf '%s/%s\n' "$remote" "$ref"
-    return 0
+  git check-ref-format "refs/heads/$ref" >/dev/null 2>&1 ||
+    gt_die "$label is not a valid branch name: $ref"
+  if [[ "$_dry_run" == 1 ]]; then
+    gt_say "would fetch refs/heads/$ref from $remote"
+    gt_find_remote_ref_exact_url "$url" "refs/heads/$ref" || status=$?
+    case "$status" in
+      0) oid=$GT_REMOTE_REF_OID ;;
+      1) gt_die "$label is not a branch on base repository remote $remote: $ref" ;;
+      *) gt_die "could not inspect $label on base repository remote $remote: $ref" ;;
+    esac
+  else
+    gt_snapshot_and_fetch_ref_exact_url "$url" "refs/heads/$ref" || status=$?
+    case "$status" in
+      0) oid=$GT_EXACT_REF_OID ;;
+      1) gt_die "$label is not a branch on base repository remote $remote: $ref" ;;
+      *) gt_die "could not fetch $label from base repository remote $remote: $ref" ;;
+    esac
   fi
-  git rev-parse --verify --quiet "$ref^{commit}" >/dev/null ||
-    gt_die "$label is not a local or $remote branch: $ref"
-  printf '%s\n' "$ref"
+  printf '%s\n' "$oid"
+}
+
+_resolve_internal_oid() {
+  local value="$1" label="$2" oid
+
+  [[ "$value" == oid:* ]] ||
+    gt_die "$label commit OID must use the oid:<hex> namespace"
+  value=${value#oid:}
+  [[ "$value" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] ||
+    gt_die "$label commit OID is malformed"
+  oid=$(git rev-parse --verify --quiet "$value^{commit}") ||
+    gt_die "$label commit does not exist locally: $value"
+  printf '%s\n' "$oid"
+}
+
+_resolve_fork_oid() {
+  local remote="$1" url="$2" ref="$3"
+
+  case "$ref" in
+    oid:*) _resolve_internal_oid "$ref" fork ;;
+    *) _resolve_base_branch_oid "$remote" "$url" "$ref" fork ;;
+  esac
+}
+
+_require_local_head_state() {
+  local expected_oid="$1" context="$2" head_oid branch_oid status
+
+  [[ "$(git symbolic-ref -q HEAD 2>/dev/null)" == "refs/heads/$_head" ]] ||
+    gt_die "local PR head changed during $context"
+  head_oid=$(git rev-parse --verify "HEAD^{commit}" 2>/dev/null) ||
+    gt_die "could not inspect local PR head during $context"
+  branch_oid=$(git rev-parse --verify "refs/heads/$_head^{commit}" 2>/dev/null) ||
+    gt_die "could not inspect local PR branch during $context"
+  [[ "$head_oid" == "$expected_oid" && "$branch_oid" == "$expected_oid" ]] ||
+    gt_die "local PR head changed during $context"
+  status=$(git status --porcelain) ||
+    gt_die "could not inspect worktree status during $context"
+  [[ -z "$status" ]] || gt_die "worktree changed during $context"
+}
+
+_require_expected_topology() {
+  local view
+
+  [[ -n "$_expected_topology" ]] || return 0
+  view=$(gt_pr_view_tsv "$_url") ||
+    gt_die "could not revalidate PR #$_number topology"
+  gt_pr_record_matches_topology "$view" "$_expected_topology" ||
+    gt_die "PR #$_number topology changed since stack discovery"
 }
 
 gt_require_repo
@@ -179,37 +260,161 @@ if [[ "$_dry_run" != 1 ]]; then
   gt_require_clean_worktree
 fi
 
+_target_repo_status=0
+gt_validate_pr_target_repository "$_target" || _target_repo_status=$?
+case "$_target_repo_status" in
+  0) ;;
+  1) gt_die "target pull request belongs to a different repository" ;;
+  *) gt_die "could not resolve the current GitHub repository" ;;
+esac
+
 _view=$(gt_pr_view_tsv "$_target") || gt_die "could not read pull request"
-IFS=$'\t' read -r _number _state _draft _merge_state _head _current_base _url _title <<<"$_view"
+IFS=$'\t' read -r _number _state _draft _merge_state _head _head_oid _current_base \
+  _head_repo _cross_repo _url _title <<<"$_view"
+if [[ -n "$_expected_topology" ]] &&
+  ! gt_pr_record_matches_topology "$_view" "$_expected_topology"; then
+  gt_die "PR #$_number topology changed since stack discovery"
+fi
+if [[ -z "$_expected_topology" ]]; then
+  _expected_topology=$(gt_pr_record_topology_tsv "$_view") ||
+    gt_die "could not snapshot PR #$_number topology"
+fi
 
 [[ "$_state" == "OPEN" ]] || gt_die "PR #$_number is not open"
 gt_bool "$_draft" && gt_die "PR #$_number is a draft"
 
 _new_base="${_base_override:-$_current_base}"
-_remote=$(_remote_for_branch "$_head")
+git check-ref-format "refs/heads/$_new_base" >/dev/null 2>&1 ||
+  gt_die "base is not a valid branch name: $_new_base"
 
-_run git fetch --quiet --prune --tags "$_remote"
-_checkout_head "$_remote" "$_head"
-_onto=$(_resolve_ref "$_remote" "$_new_base" "base")
+_head_remote_url=""
+_remote_head_oid=""
+_head_remote_status=0
+gt_find_pr_head_remote "$_head" "$_head_repo" "$_url" ||
+  _head_remote_status=$?
+case "$_head_remote_status" in
+  0)
+    _head_remote=$GT_PR_HEAD_REMOTE
+    _head_remote_url=$GT_PR_HEAD_REMOTE_URL
+    ;;
+  1) gt_die "could not resolve one exact remote for PR head $_head" ;;
+  *) gt_die "could not inspect configured remotes for PR head $_head" ;;
+esac
+
+_base_remote_status=0
+gt_find_current_repo_fetch_remote || _base_remote_status=$?
+case "$_base_remote_status" in
+  0)
+    _base_remote=$GT_REPO_FETCH_REMOTE
+    _base_remote_url=$GT_REPO_FETCH_REMOTE_URL
+    ;;
+  1) gt_die "could not resolve one exact fetch remote for the base repository" ;;
+  *) gt_die "could not inspect configured fetch remotes for the base repository" ;;
+esac
+
+_remote_head_status=0
+gt_find_remote_ref_exact_url "$_head_remote_url" "refs/heads/$_head" ||
+  _remote_head_status=$?
+case "$_remote_head_status" in
+  0) _remote_head_oid=$GT_REMOTE_REF_OID ;;
+  1) gt_die "remote PR head does not exist: $_head_remote/$_head" ;;
+  *) gt_die "could not snapshot remote PR head: $_head_remote/$_head" ;;
+esac
+[[ "$_remote_head_oid" == "$_head_oid" ]] ||
+  gt_die "remote PR head does not match pull request head OID"
+
+if [[ "$_dry_run" != 1 ]]; then
+  gt_fetch_ref_exact_url "$_head_remote_url" "refs/heads/$_head" ||
+    gt_die "could not fetch remote PR head: $_head_remote/$_head"
+  [[ "$GT_FETCHED_REF_OID" == "$_head_oid" ]] ||
+    gt_die "fetched PR head does not match pull request head OID"
+fi
+if _local_branch_exists "$_head"; then
+  _checkout_head_oid=$(git rev-parse --verify "refs/heads/$_head^{commit}")
+elif [[ "$_dry_run" == 1 ]]; then
+  _checkout_head_oid=$_head_oid
+else
+  _checkout_head_oid=$(git rev-parse --verify "$_head_oid^{commit}")
+fi
+[[ "$_checkout_head_oid" == "$_head_oid" ]] ||
+  gt_die "local PR head does not match pull request head OID"
+_checkout_head "$_head" "$_head_oid"
+if [[ "$_dry_run" != 1 ]]; then
+  _require_local_head_state "$_head_oid" checkout
+fi
+if [[ -n "$_base_oid_override" ]]; then
+  _onto_oid=$(_resolve_internal_oid "oid:$_base_oid_override" base)
+  _onto_display=$_onto_oid
+else
+  _onto_oid=$(_resolve_base_branch_oid \
+    "$_base_remote" "$_base_remote_url" "$_new_base" base)
+  _onto_display="$_base_remote/$_new_base"
+fi
+_require_expected_topology
 
 # Without --fork, a plain rebase replays everything since the merge base, which
 # re-applies a squash-merged parent's commits and conflicts. --fork names the
 # old base so its commits are dropped via git rebase --onto.
 if [[ -n "$_fork" ]]; then
-  _fork_ref=$(_resolve_ref "$_remote" "$_fork" "fork")
-  gt_say "rebasing $_head onto $_onto, dropping commits up to $_fork_ref"
-  _run git rebase --onto "$_onto" "$_fork_ref"
+  _fork_oid=$(_resolve_fork_oid \
+    "$_base_remote" "$_base_remote_url" "$_fork")
+  case "$_fork" in
+    oid:*) _fork_display=$_fork_oid ;;
+    *) _fork_display="$_base_remote/$_fork" ;;
+  esac
+  gt_say "rebasing $_head onto $_onto_display ($_onto_oid)," \
+    "dropping commits up to $_fork_display ($_fork_oid)"
+  if [[ "$_dry_run" != 1 ]]; then
+    _require_local_head_state "$_head_oid" rebase
+  fi
+  _run git rebase --onto "$_onto_oid" "$_fork_oid"
 else
-  gt_say "rebasing $_head onto $_onto"
-  _run git rebase "$_onto"
+  gt_say "rebasing $_head onto $_onto_display ($_onto_oid)"
+  if [[ "$_dry_run" != 1 ]]; then
+    _require_local_head_state "$_head_oid" rebase
+  fi
+  _run git rebase "$_onto_oid"
+fi
+
+if [[ "$_dry_run" == 1 ]]; then
+  _new_head_oid=$_head_oid
+else
+  _new_head_oid=$(git rev-parse --verify HEAD)
 fi
 
 if [[ "$_push" == 1 ]]; then
-  gt_say "pushing $_head to $_remote with --force-with-lease"
-  _run git push --force-with-lease "$_remote" "$_head"
+  _require_expected_topology
+  if [[ "$_dry_run" != 1 ]]; then
+    _require_local_head_state "$_new_head_oid" push
+  fi
+  gt_say "pushing $_head to $_head_remote with --force-with-lease"
+  _run gt_push_exact_url "$_head_remote_url" \
+    "--force-with-lease=refs/heads/$_head:$_remote_head_oid" \
+    "$_new_head_oid:refs/heads/$_head"
+  if [[ "$_dry_run" != 1 ]]; then
+    _post_push_topology=$(gt_pr_topology_tsv "$_number" "$_head" \
+      "$_new_head_oid" "$_current_base" "$_head_repo" "$_cross_repo" \
+      "$_url") || gt_die "could not construct post-push topology for PR #$_number"
+    _post_push_view=$(gt_pr_view_tsv "$_url") ||
+      gt_die "could not verify PR #$_number after push"
+    gt_pr_record_matches_topology "$_post_push_view" "$_post_push_topology" ||
+      gt_die "PR #$_number head OID did not update after push"
+  fi
   if [[ -n "$_base_override" && "$_base_override" != "$_current_base" ]]; then
     gt_say "updating PR #$_number base to $_base_override"
-    _run gh pr edit "$_number" --base "$_base_override"
+    _run gt_gh_pr edit "$_number" --base "$_base_override"
+    if [[ "$_dry_run" != 1 ]]; then
+      _after_view=$(gt_pr_view_tsv "$_url") ||
+        gt_die "could not verify PR #$_number after base update"
+      _after_topology=$(gt_pr_topology_tsv "$_number" "$_head" "$_new_head_oid" \
+        "$_base_override" "$_head_repo" "$_cross_repo" "$_url") ||
+        gt_die "could not construct expected topology for PR #$_number"
+      gt_pr_record_matches_topology "$_after_view" "$_after_topology" ||
+        gt_die "PR #$_number topology changed after base update"
+      IFS=$'\t' read -r _ _ _ _ _ _ _after_base _ <<<"$_after_view"
+      [[ "$_after_base" == "$_base_override" ]] ||
+        gt_die "PR #$_number base was not updated to $_base_override"
+    fi
   fi
 else
   gt_say "push skipped"

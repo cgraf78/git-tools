@@ -13,6 +13,36 @@ By default, the base is the pull request's current base branch.
 .PP
 When a new base is given and the push succeeds, the command updates the GitHub
 pull request base.
+.PP
+The target and every GitHub query or edit are pinned to the repository derived
+from the current checkout. Before rebasing, the command separately resolves one
+fetch URL for the checkout/base repository and one uniquely mapped push
+remote with one effective target matching the structured pull request head
+repository. It requires that target's live head OID to equal the PR record.
+Named base and fork branches are fetched as exact refs/heads sources through the
+validated base-repository URL, without named-remote refspecs or tags, and are
+converted to immutable commit OIDs before rebase. Internal commit handoffs use
+an explicit
+.B oid:
+namespace, so hex-looking branch names remain branches. The pull request head is
+fetched directly from the validated head URL and must yield the same OID before
+checkout. The effective push URL is
+pinned against further insteadOf and pushInsteadOf rewrites and uses an exact
+lease. Missing heads, ambiguous remotes, multiple push URLs, rewrite mismatches,
+and concurrent updates fail closed. After push, the command requires GitHub's
+PR head OID to equal the rewritten local branch before editing the PR base.
+Stack orchestration additionally binds the discovered pull request number, head,
+head OID, base, head repository, cross-repository state, and canonical URL at
+each rebase, push, and base-edit boundary.
+.PP
+After checkout and immediately before rebase and push, the command requires
+HEAD, the fully qualified local head ref, worktree cleanliness, and the expected
+OID to agree. The force-push source is the captured immutable OID, so checkout
+hooks or concurrent local ref changes cannot inject another commit.
+.PP
+Credential-bearing HTTP URLs, query or fragment suffixes, unsafe git-config key
+bytes, and invalid GitHub owner or repository components are rejected before
+exact transport helpers run. Normal SSH usernames remain supported.
 .SH OPTIONS
 .TP
 .BR \-b ", " \-\-base " " \fIbranch\fR

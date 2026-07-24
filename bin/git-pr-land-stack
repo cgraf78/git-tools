@@ -57,7 +57,9 @@ _usage() {
 Usage: git pr-land-stack [options] <number|url|branch>
 
 Land a linear stack of ready GitHub PRs from parent to child. The command is a
-thin orchestrator over git pr-stack, git pr-land, and git pr-restack.
+thin orchestrator over git pr-stack, git pr-land, and git pr-restack. Local and
+remote PR heads are reported for manual cleanup and are never deleted
+automatically.
 
 Options:
   -m, --method <method>   Merge method: squash, merge, or rebase (default: squash).
@@ -93,99 +95,26 @@ _run_tool() {
   "$@"
 }
 
-# Run a raw command that has no dry-run mode of its own (e.g. git branch -D in
-# _delete_landed_head). Unlike _run_tool, this MUST NOT fall through in dry-run —
-# otherwise a dry run would force-delete stack branches locally and remotely.
-_run_local() {
-  if [[ "$_dry_run" == 1 ]]; then
-    printf 'git pr-land-stack: would run:' >&2
-    printf ' %q' "$@" >&2
-    printf '\n' >&2
-    return 0
-  fi
-  "$@"
-}
-
-_remote_for_branch() {
-  local branch="$1"
-  local remote
-
-  remote=$(git config "branch.$branch.remote" 2>/dev/null || true)
-  if [[ -n "$remote" ]]; then
-    printf '%s\n' "$remote"
-    return 0
-  fi
-  printf 'origin\n'
-}
-
-_local_branch_exists() {
-  git show-ref --verify --quiet "refs/heads/$1"
-}
-
-_remote_branch_exists() {
-  local remote="$1"
-  local branch="$2"
-  git show-ref --verify --quiet "refs/remotes/$remote/$branch"
-}
-
-_delete_landed_head() {
-  local head="$1"
-  local remote worktree
-
-  [[ "$_keep_branch" == 0 ]] || return 0
-
-  # In a stack, a parent PR branch is still the next PR's base until after that
-  # child has been restacked. Deleting it as part of the merge makes GitHub close
-  # the child PR. Clean it up only once the child no longer points at it.
-  worktree=$(gt_worktree_reserving_branch "$head")
-  [[ -z "$worktree" ]] ||
-    gt_die "cannot delete $head; branch is checked out or reserved in $worktree"
-  # Branch deletion also removes branch.<name>.remote; retain the destination
-  # before local cleanup so a non-origin stack cannot drift to another remote.
-  remote=$(_remote_for_branch "$head")
-  # Delete locally before crossing the network boundary. A concurrent checkout
-  # can no longer make the ordinary local cleanup fail after remote deletion.
-  if _local_branch_exists "$head"; then
-    _run_local git branch -D "$head"
-  fi
-  if _remote_branch_exists "$remote" "$head"; then
-    _run_local git push "$remote" --delete "$head"
-  fi
-  [[ "$_dry_run" == 0 ]] || return 0
-  if _local_branch_exists "$head"; then
-    worktree=$(gt_worktree_reserving_branch "$head")
-    gt_die "remote branch $remote/$head was deleted but the local branch was recreated${worktree:+ in $worktree}"
-  fi
-}
-
 _preflight_stack_topology() {
-  local current base_worktree final_will_be_current head_worktree index last_index
+  local current head_worktree index operation
 
-  current=$(git rev-parse --show-toplevel) || gt_die "could not resolve current worktree"
+  gt_find_current_worktree || gt_die "could not resolve current worktree"
+  current=$GT_WORKTREE_PATH
+  operation=$(gt_worktree_operation "$current") ||
+    gt_die "could not inspect current worktree operation"
+  [[ -z "$operation" ]] ||
+    gt_die "current worktree has $operation in progress: $current"
   for index in "${!_heads[@]}"; do
-    # Every child head will be checked out for restacking. Intermediate heads
-    # will also be deleted unless branch preservation was requested.
-    if ((index == 0)) && [[ "$_keep_branch" == 1 ]]; then
-      continue
-    fi
-    head_worktree=$(gt_worktree_reserving_branch "${_heads[$index]}")
-    if [[ -n "$head_worktree" && "$head_worktree" != "$current" ]]; then
-      gt_die "stack branch ${_heads[$index]} is checked out or reserved in another worktree: $head_worktree"
+    # Every child after the root will be checked out for restacking.
+    if ((index > 0)); then
+      gt_find_worktree_reserving_branch "${_heads[$index]}" ||
+        gt_die "could not inspect worktrees"
+      head_worktree=$GT_WORKTREE_PATH
+      if [[ -n "$head_worktree" && "$head_worktree" != "$current" ]]; then
+        gt_die "stack branch ${_heads[$index]} is checked out or reserved in another worktree: $head_worktree"
+      fi
     fi
   done
-
-  [[ "$_keep_branch" == 0 ]] || return 0
-  last_index=$((${#_heads[@]} - 1))
-  base_worktree=$(gt_worktree_reserving_branch "${_bases[0]}")
-  head_worktree=$(gt_worktree_reserving_branch "${_heads[$last_index]}")
-  final_will_be_current=0
-  if ((${#_heads[@]} > 1)) || [[ "$head_worktree" == "$current" ]]; then
-    final_will_be_current=1
-  fi
-  if [[ "$final_will_be_current" == 1 &&
-    -n "$base_worktree" && "$base_worktree" != "$current" ]]; then
-    gt_die "cannot delete ${_heads[$last_index]} while ${_bases[0]} is checked out or reserved in $base_worktree"
-  fi
 }
 
 _require_positive_integer() {
@@ -204,6 +133,8 @@ _require_positive_integer() {
 
 _wait_for_ready_pr() {
   local target="$1"
+  local number="$2"
+  local expected_topology="$3"
   local elapsed=0
   local checks checks_state view
   local state draft merge_state
@@ -212,21 +143,23 @@ _wait_for_ready_pr() {
 
   while :; do
     view=$(gt_pr_view_tsv "$target") ||
-      gt_die "could not read PR #$target after restack"
-    IFS=$'\t' read -r _ state draft merge_state _ _ _ _ <<<"$view"
+      gt_die "could not read PR #$number after restack"
+    gt_pr_record_matches_topology "$view" "$expected_topology" ||
+      gt_die "PR #$number topology changed after restack"
+    IFS=$'\t' read -r _ state draft merge_state _ _ _ _ _ <<<"$view"
 
     checks=$(gt_pr_checks_status "$target") ||
-      gt_die "could not read checks for PR #$target"
+      gt_die "could not read checks for PR #$number"
     checks_state=$(gt_checks_ready_state "$checks")
 
     if [[ "$state" != "OPEN" ]]; then
-      gt_die "PR #$target is no longer open after restack"
+      gt_die "PR #$number is no longer open after restack"
     elif gt_bool "$draft"; then
-      gt_die "PR #$target is a draft after restack"
+      gt_die "PR #$number is a draft after restack"
     elif [[ "$checks_state" == "fail" ]]; then
-      gt_die "PR #$target checks failed after restack"
+      gt_die "PR #$number checks failed after restack"
     elif [[ "$merge_state" == "CLEAN" && "$checks_state" == "pass" ]]; then
-      gt_say "PR #$target is ready after restack"
+      gt_say "PR #$number is ready after restack"
       return 0
     fi
 
@@ -234,7 +167,7 @@ _wait_for_ready_pr() {
       none | pending | pass)
         ;;
       *)
-        gt_die "unexpected checks state for PR #$target: $checks_state"
+        gt_die "unexpected checks state for PR #$number: $checks_state"
         ;;
     esac
 
@@ -242,17 +175,56 @@ _wait_for_ready_pr() {
       BLOCKED | CLEAN | DIRTY | HAS_HOOKS | UNKNOWN | UNSTABLE)
         ;;
       *)
-        gt_die "unexpected merge state for PR #$target after restack: $merge_state"
+        gt_die "unexpected merge state for PR #$number after restack: $merge_state"
         ;;
     esac
 
     if ((elapsed >= _check_timeout)); then
-      gt_die "timed out waiting for PR #$target after restack: merge $merge_state, checks $checks_state"
+      gt_die "timed out waiting for PR #$number after restack: merge $merge_state, checks $checks_state"
     fi
-    gt_say "waiting for PR #$target after restack: merge $merge_state, checks $checks_state"
+    gt_say "waiting for PR #$number after restack: merge $merge_state, checks $checks_state"
     sleep "$_check_interval"
     elapsed=$((elapsed + _check_interval))
   done
+}
+
+_stack_topology() {
+  local index="$1" base="$2"
+
+  gt_pr_topology_tsv "${_numbers[$index]}" "${_heads[$index]}" \
+    "${_expected_head_oids[$index]}" "$base" \
+    "${_head_repos[$index]}" "${_head_cross_repos[$index]}" \
+    "${_head_urls[$index]}"
+}
+
+_require_stack_topology() {
+  local index="$1" expected_topology="$2" view
+
+  view=$(gt_pr_view_tsv "${_head_urls[$index]}") ||
+    gt_die "could not revalidate PR #${_numbers[$index]} topology"
+  gt_pr_record_matches_topology "$view" "$expected_topology" ||
+    gt_die "PR #${_numbers[$index]} topology changed since stack discovery"
+}
+
+_refresh_restacked_topology() {
+  local index="$1" base="$2" local_oid view live_oid expected
+
+  gt_find_ref_commit "refs/heads/${_heads[$index]}" ||
+    gt_die "could not read local head for PR #${_numbers[$index]} after restack"
+  local_oid=$GT_REF_OID
+  view=$(gt_pr_view_tsv "${_head_urls[$index]}") ||
+    gt_die "could not read PR #${_numbers[$index]} after restack"
+  IFS=$'\t' read -r _ _ _ _ _ live_oid _ _ _ _ _ <<<"$view"
+  expected=$(gt_pr_topology_tsv "${_numbers[$index]}" \
+    "${_heads[$index]}" "$live_oid" "$base" "${_head_repos[$index]}" \
+    "${_head_cross_repos[$index]}" "${_head_urls[$index]}") ||
+    gt_die "could not validate restacked topology for PR #${_numbers[$index]}"
+  gt_pr_record_matches_topology "$view" "$expected" ||
+    gt_die "PR #${_numbers[$index]} topology changed after restack"
+  [[ "$live_oid" == "$local_oid" ]] ||
+    gt_die "PR #${_numbers[$index]} head OID does not match the restacked branch"
+  _expected_head_oids[index]=$live_oid
+  _expected_bases[index]=$base
 }
 
 while (($#)); do
@@ -336,7 +308,15 @@ if [[ "$_dry_run" != 1 ]]; then
   gt_require_clean_worktree
 fi
 
-_stack_output=$("$_tool_dir/git-pr-stack" "$_target" --porcelain) ||
+_target_repo_status=0
+gt_validate_pr_target_repository "$_target" || _target_repo_status=$?
+case "$_target_repo_status" in
+  0) ;;
+  1) gt_die "target pull request belongs to a different repository" ;;
+  *) gt_die "could not resolve the current GitHub repository" ;;
+esac
+
+_stack_output=$("$_tool_dir/git-pr-stack" "$_target" --porcelain=v2) ||
   gt_die "could not discover stack"
 
 _records=()
@@ -350,17 +330,41 @@ done <<<"$_stack_output"
 _numbers=()
 _bases=()
 _heads=()
+_original_head_oids=()
+_expected_head_oids=()
+_head_repos=()
+_head_cross_repos=()
+_head_urls=()
+_expected_bases=()
 _ready=()
 _reasons=()
 
 for _record in "${_records[@]}"; do
-  IFS=$'\t' read -r _kind _index _number _base _head _is_ready _reason _checks _url <<<"$_record"
+  IFS=$'\t' read -r _kind _index _number _base _head _is_ready _reason _checks \
+    _url _head_oid _head_repo _head_cross_repo <<<"$_record"
   [[ "$_kind" == "pr" ]] || gt_die "unexpected pr-stack record: $_record"
+  case "$_head_cross_repo" in
+    true | false) ;;
+    *) gt_die "unexpected pr-stack head repository state: $_record" ;;
+  esac
   _numbers+=("$_number")
   _bases+=("$_base")
   _heads+=("$_head")
+  _original_head_oids+=("$_head_oid")
+  _expected_head_oids+=("$_head_oid")
+  _head_repos+=("$_head_repo")
+  _head_cross_repos+=("$_head_cross_repo")
+  _head_urls+=("$_url")
+  _expected_bases+=("$_base")
   _ready+=("$_is_ready")
   _reasons+=("$_reason")
+  _record_repo_status=0
+  gt_validate_pr_url_repository "$_url" || _record_repo_status=$?
+  case "$_record_repo_status" in
+    0) ;;
+    1) gt_die "stack PR #$_number belongs to a different repository" ;;
+    *) gt_die "could not resolve the current GitHub repository" ;;
+  esac
 done
 
 for _i in "${!_numbers[@]}"; do
@@ -380,30 +384,45 @@ _land_base="${_bases[0]}"
 for _i in "${!_numbers[@]}"; do
   _number="${_numbers[$_i]}"
   _next_index=$((_i + 1))
+  _expected_topology=$(_stack_topology "$_i" "${_expected_bases[$_i]}") ||
+    gt_die "could not validate expected topology for PR #$_number"
 
-  _land_args=("$_tool_dir/git-pr-land" "$_number" --method "$_method")
+  _require_stack_topology "$_i" "$_expected_topology"
+
+  _land_args=("$_tool_dir/git-pr-land" "${_head_urls[$_i]}" --method "$_method")
   if [[ "$_keep_branch" == 1 || $_next_index -lt ${#_numbers[@]} ]]; then
     _land_args+=(--keep-branch)
   fi
   if [[ "$_dry_run" == 1 ]]; then
     _land_args+=(--dry-run)
   fi
+  _land_args+=(--expect-topology "$_expected_topology")
 
   _run_tool "${_land_args[@]}"
 
   if ((_next_index < ${#_numbers[@]})); then
     _child="${_numbers[$_next_index]}"
+    _child_url="${_head_urls[$_next_index]}"
+    _child_topology=$(_stack_topology "$_next_index" \
+      "${_expected_bases[$_next_index]}") ||
+      gt_die "could not validate expected topology for PR #$_child"
+    _require_stack_topology "$_next_index" "$_child_topology"
     # The just-landed parent's head is the child's old base. Pass it as the fork
     # point so the parent's commits drop out of the child instead of being
-    # re-applied onto the root base (which conflicts after a squash merge). The
-    # parent branch still exists here; _delete_landed_head removes it below.
-    _restack_args=("$_tool_dir/git-pr-restack" "$_child" --base "$_land_base" --fork "${_heads[$_i]}")
+    # re-applied onto the root base (which conflicts after a squash merge).
+    _restack_args=("$_tool_dir/git-pr-restack" "$_child_url" --base "$_land_base" --fork "oid:${_original_head_oids[$_i]}")
     if [[ "$_dry_run" == 1 ]]; then
       _restack_args+=(--dry-run)
     fi
+    _restack_args+=(--expect-topology "$_child_topology")
     _run_tool "${_restack_args[@]}"
-    _wait_for_ready_pr "$_child"
-    _delete_landed_head "${_heads[$_i]}"
+    if [[ "$_dry_run" == 0 ]]; then
+      _refresh_restacked_topology "$_next_index" "$_land_base"
+      _child_topology=$(_stack_topology "$_next_index" "$_land_base") ||
+        gt_die "could not validate restacked topology for PR #$_child"
+      _wait_for_ready_pr "$_child_url" "$_child" "$_child_topology"
+      _require_stack_topology "$_next_index" "$_child_topology"
+    fi
   fi
 done
 

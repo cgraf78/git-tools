@@ -57,9 +57,27 @@ git pr-open --title "Add thing" --draft
 git pr-open --fill --dry-run
 ```
 
-The command refuses dirty worktrees, refuses to open from the base branch, fetches
-the base remote, and rejects a stale local base branch when it differs from its
-remote-tracking branch.
+The command refuses dirty worktrees, refuses to open from the base branch, and
+rejects a stale local base branch when it differs from the exact remote base OID.
+Pull request creation and structured default-branch discovery are pinned to the
+host and owner/repository derived from the current checkout. Ambient `GH_REPO`
+and `GH_HOST` values, a foreign remote named `origin`, and local remote-HEAD
+configuration cannot redirect them. The base fetch remote is validated against
+that checkout repository, then the exact `refs/heads/<base>` source is fetched
+through its validated URL without applying the remote's fetch refspecs or
+importing tags. The feature push target is resolved independently;
+fork heads are qualified as `owner:branch`, so a base branch tracking upstream
+cannot redirect the feature push upstream.
+The feature branch is pushed by immutable OID through the captured validated
+URL, then its remote OID is verified. Upstream tracking is written locally only
+after the named remote is revalidated against that captured URL; a concurrent
+configuration change leaves the pushed branch intact but aborts PR creation
+with a tracking-incomplete diagnostic.
+The remote head is checked again immediately before creation. After GitHub
+returns, the created PR's canonical repository, head and base refs, head
+repository, cross-repository state, and head OID must match the requested
+topology. A PR created during a server-side race is reported with its URL as an
+actionable nonzero state instead of clean success.
 
 ### `git repo-state`
 
@@ -74,7 +92,8 @@ git repo-state --json
 ```
 
 The command does not require GitHub access. If `gh` is unavailable or
-unauthenticated, local repository state is still reported.
+unauthenticated, local repository state is still reported. When PR data is
+available, lookup is pinned to the checkout repository.
 
 ### `git pr-stack`
 
@@ -87,14 +106,30 @@ git pr-stack 123
 git pr-stack feature/my-branch
 ```
 
-Use `--porcelain` for tab-separated records that other scripts can compose:
+Use `--porcelain` for the original tab-separated schema-v1 records that other
+scripts can compose. Its nine columns remain fixed as `kind`, `index`, `number`,
+`base`, `head`, `ready`, `reason`, `checks`, and `url`. Use `--porcelain=v2`
+when exact-operation metadata is required; v2 appends `head_oid`,
+`head_repository`, and `cross_repository`.
 
 ```sh
 git pr-stack --porcelain
+git pr-stack --porcelain=v2
 ```
 
-If a stack branches into multiple child PRs, the command stops instead of
-guessing a landing order.
+If a stack branches, contains a cycle, or has multiple same-repository PRs for
+one parent head, the command stops instead of guessing a landing order. URL
+targets must belong to the current GitHub repository. Discovery fetches one
+sentinel beyond its 200-PR safety cap and fails closed instead of returning a
+truncated stack. Repository identity is derived with ambient GitHub CLI routing
+removed, and every list, view, and checks request is pinned to that identity.
+Structured records must keep their number, canonical URL, draft/cross-repository
+flags, canonical 40- or 64-digit lowercase hexadecimal head OID, head
+repository, and head/base refs internally consistent. Explicit
+numeric and URL targets must resolve back to the same pull request number;
+branch targets must resolve back to that exact head branch.
+The target's independently viewed topology must also match its inventory record;
+a concurrent retarget stops discovery instead of yielding a stale stack.
 
 ### `git pr-sync-stack`
 
@@ -108,7 +143,12 @@ git pr-sync-stack 123 --base main --no-push
 
 The command composes `git pr-stack` and `git pr-restack`. Use `--base` to
 override only the root PR's base; child PRs continue to rebase onto their parent
-heads.
+heads. Qualified PR URLs and expected topology are preserved between discovery
+and every restack. Each child uses its parent's original head OID as the
+immutable fork boundary, and every pushed rewrite must match both the local
+branch and a fresh GitHub PR record before the next restack begins. In
+`--no-push` mode, each rewritten local parent OID becomes the child's exact
+local base instead of falling back to a stale remote parent branch.
 
 ### `git pr-restack`
 
@@ -125,6 +165,32 @@ Use `--base` when a parent PR landed and the child should now target the landed
 base branch. The command updates the PR base after the local rebase succeeds.
 With `--no-push`, it rebases locally and skips remote PR base edits.
 
+Before rebasing, the command separately resolves one fetch URL for the
+checkout/base repository and one push remote whose sole effective push URL
+matches the structured PR head repository. It requires the live head OID from
+that exact push URL to equal the PR record. Named base and fork branches are
+fetched as exact `refs/heads/*` sources through the validated base-repository
+URL, without named-remote refspecs or tags, and converted to immutable commit
+OIDs before rebase. Internal commit handoffs use an explicit `oid:<hex>`
+namespace, so hex-looking branch names remain unambiguous branches. The PR head
+is fetched directly from the validated head URL and must yield the same OID
+before checkout. The push transport is pinned against further Git URL
+rewrites and uses an explicit lease. Missing heads, multiple push URLs,
+ambiguous remotes, rewrite mismatches, and concurrent updates fail closed.
+After pushing, GitHub must report the exact local rewritten OID before the
+command edits the PR base.
+The checked-out PR branch, `HEAD`, worktree cleanliness, and expected OID are
+revalidated after checkout and immediately before rebase and push. The push
+source is the captured immutable OID, so checkout hooks or concurrent local ref
+updates cannot inject another commit into the force-push.
+Credential-bearing HTTP URLs, query/fragment suffixes, unsafe git-config key
+bytes, and invalid GitHub owner/repository components are rejected before exact
+transport helpers run. SSH usernames in normal `user@host:path` remotes remain
+supported.
+When called by stack orchestration, the command binds the discovered PR number,
+head, head OID, base, head repository, cross-repository state, and canonical URL
+at every rebase, push, and base-edit boundary.
+
 A plain rebase replays everything since the merge base, which re-applies a
 squash-merged parent's commits and conflicts. Use `--fork <ref>` to name the old
 base so its commits are dropped instead (`git rebase --onto <base> <ref>`):
@@ -135,8 +201,8 @@ git pr-restack 123 --base main --fork parent-branch
 
 ### `git pr-land`
 
-Verifies and merges one ready GitHub PR, then syncs the base branch locally and
-deletes the local PR branch.
+Verifies and merges one ready GitHub PR and syncs the base branch locally. Local
+and remote PR heads are retained and reported with exact OIDs for manual cleanup.
 
 ```sh
 git pr-land 123
@@ -145,12 +211,32 @@ git pr-land 123 --keep-branch
 ```
 
 The default merge method is `squash`. The command refuses draft PRs, merge
-conflicts, non-passing checks, local base branches that cannot fast-forward, and
-linked-worktree layouts that would prevent requested cleanup. With
-`--keep-branch`, an already-checked-out base is synchronized in its owning
-worktree. If GitHub reports an error after completing the server-side merge,
+conflicts, non-passing checks, and local base branches that cannot fast-forward.
+URL targets are repository-qualified before PR lookup, so a same-number PR URL
+from another repository cannot redirect the merge. Numeric and branch targets,
+checks, merge, and post-merge verification are also pinned to the checkout
+repository regardless of ambient GitHub CLI routing.
+Returned structured data must bind the requested number to its canonical URL
+and describe a coherent same-repository or fork head before any merge begins.
+The base fetch URL is validated against the checkout repository before the
+irreversible merge. Preflight and post-merge synchronization fetch only the
+exact `refs/heads/<base>` source and merge its captured OID; named-remote
+refspecs, tracking refs, and colliding tags are not trusted. Stack-driven
+landing revalidates the discovered topology
+immediately before merging, and post-merge verification remains bound to that
+same PR number and topology. The merge request is pinned with GitHub's
+`--match-head-commit`, and an exactly mapped live remote head must equal the
+structured PR head OID.
+An already-checked-out base is synchronized in its owning worktree. If GitHub
+reports an error after completing the server-side merge,
 the command rechecks structured PR state and identifies any remaining work as
 incomplete cleanup instead of incorrectly reporting that the merge failed.
+Local deletion is intentionally manual because Git has no portable primitive
+that serializes branch deletion with a checkout that already resolved the ref
+but has not yet updated its worktree `HEAD`. Remote deletion is also manual: a
+repository-scoped open-PR query cannot prove that a fork head is unused by PRs
+targeting another base repository, and a new consumer can appear after any
+query. `--keep-branch` remains accepted for compatibility; all branches are kept.
 
 ### `git pr-land-stack`
 
@@ -163,11 +249,24 @@ git pr-land-stack 123 --dry-run
 ```
 
 The command composes `git pr-stack`, `git pr-land`, and `git pr-restack`. It
-refuses the whole stack before merging anything if any PR is not ready. As each
-parent lands, the next child is restacked onto the root base branch before it is
-landed. The restack passes the just-landed parent's head as `git pr-restack
---fork`, so squash-merged parent commits drop out cleanly instead of conflicting
+refuses the whole stack before merging anything if any PR is not ready. URL
+targets and every discovered PR must belong to the current GitHub repository.
+Qualified URLs are retained across stack, land, restack, and readiness polling
+handoffs.
+As each parent lands, the next child is restacked onto the root base branch
+before it is landed. The restack passes the just-landed parent's original head
+OID as `git pr-restack --fork`, so squash-merged parent commits drop out cleanly
+instead of conflicting
 when they are replayed onto the root base. This works for every merge method.
+After each restack, the next expected topology accepts the rewritten head OID
+only when it matches both the local branch and a fresh GitHub PR record.
+Local and remote heads are retained for manual cleanup. Stack topology uses
+repository identity as well as branch names, so a same-named fork head cannot
+be mistaken for a base-repository parent. Cycles and ambiguous parents fail
+closed.
+Every land and restack handoff re-reads the live PR and requires its
+mutation-relevant topology to match the expected stack state. Retargeting during
+discovery, a parent action, or readiness polling stops before the next mutation.
 
 ### `git branch-audit`
 

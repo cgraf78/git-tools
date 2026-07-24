@@ -7,22 +7,23 @@ PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
 
 _failures=0
-_temps=()
+_suite_tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/git-branch-audit-test.XXXXXX") ||
+  exit 1
 
 _tmpdir() {
-  local dir
-  dir=$(mktemp -d)
-  _temps+=("$dir")
-  printf '%s\n' "$dir"
+  mktemp -d "$_suite_tmp_root/fixture.XXXXXX"
 }
 
 _cleanup() {
-  local dir
-  for dir in "${_temps[@]}"; do
-    rm -rf "$dir"
-  done
+  local status=$?
+  trap - EXIT HUP INT TERM
+  rm -rf -- "$_suite_tmp_root" || status=1
+  exit "$status"
 }
 trap _cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 _pass() {
   printf 'ok - %s\n' "$1"
@@ -90,6 +91,21 @@ _commit_file() {
   git -C "$repo" commit -q -m "$message"
 }
 
+_object_ids() {
+  git -C "$1" cat-file --batch-all-objects --batch-check='%(objectname)' |
+    LC_ALL=C sort
+}
+
+_tool_artifacts() {
+  local artifact
+  for artifact in \
+    "$1"/git-tools-patch.* \
+    "$1"/git-cleanup-repo-dry.*; do
+    [[ -e "$artifact" ]] || continue
+    printf '%s\n' "$artifact"
+  done
+}
+
 _write_gh_stub() {
   cat >"$1/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -114,6 +130,20 @@ printf 'unexpected gh call: %s\n' "$*" >&2
 exit 99
 EOF
   chmod +x "$1/gh"
+}
+
+_write_partial_ref_enumeration_failure_git() {
+  cat >"$1/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == for-each-ref && "$*" == *"%(objectname)"* &&
+  "$*" == *"refs/heads"* ]]; then
+  "$GIT_PARTIAL_REF_REAL" "$@" | sed -n '1p'
+  exit 88
+fi
+exec "$GIT_PARTIAL_REF_REAL" "$@"
+EOF
+  chmod +x "$1/git"
 }
 
 # Build a repo with a merged branch, an ahead branch, and a branch whose
@@ -172,31 +202,34 @@ _write_unauthenticated_gh_stub "$unauth"
 result=$(PATH="$unauth:$PATH" git -C "$repo" branch-audit --porcelain 2>&1)
 _assert_contains "lists branches without authenticated gh" $'branch\tahead\tfalse\t1\t0\t\t' "$result"
 
-# Destructive path.
+# Candidate reporting remains confirmation-gated for compatibility.
 result=$(git -C "$repo" branch-audit --drop-merged 2>&1 || true)
 _assert_contains "drop requires confirmation" "--drop-merged requires --yes or --dry-run" "$result"
 
 result=$(git -C "$repo" branch-audit --drop-merged --dry-run 2>&1)
-_assert_contains "dry run reports merged deletion" "would delete merged (merged)" "$result"
+_assert_contains "dry run reports exact merged candidate" \
+  "preserving local cleanup candidate merged at " "$result"
 _assert_eq "dry run keeps all branches" "ahead gone main merged" \
   "$(git -C "$repo" branch --format='%(refname:short)' | sort | tr '\n' ' ' | sed 's/ $//')"
 
 result=$(git -C "$repo" branch-audit --drop-merged --yes 2>&1)
-_assert_contains "drops merged branch" "deleted merged (merged)" "$result"
-_assert_eq "only merged branch removed" "ahead gone main" \
+_assert_contains "reports merged branch candidate" \
+  "preserving local cleanup candidate merged at " "$result"
+_assert_eq "candidate reporting preserves every branch" "ahead gone main merged" \
   "$(git -C "$repo" branch --format='%(refname:short)' | sort | tr '\n' ' ' | sed 's/ $//')"
 
-# The current branch is never deleted even when merged.
+# The current branch is also reported without mutation.
 git -C "$repo" switch -q -c merged2
 _commit_file "$repo" merged2.txt merged2 "merged2 work"
 git -C "$repo" switch -q main
 git -C "$repo" merge -q --no-ff merged2 -m "merge merged2"
 git -C "$repo" switch -q merged2
 result=$(git -C "$repo" branch-audit --drop-merged --yes 2>&1)
-_assert_contains "skips the current branch" "skipping merged2; current branch" "$result"
+_assert_contains "reports the current branch candidate" \
+  "preserving local cleanup candidate merged2 at " "$result"
 
 # Squash and rebase merges are recognized by patch-id, not just ancestry, so
-# branches landed via squash/rebase PRs are reported merged and dropped.
+# branches landed via squash/rebase PRs are reported as cleanup candidates.
 squash_repo=$(_tmpdir)
 _git_init "$squash_repo"
 _commit_file "$squash_repo" README.md base base
@@ -220,16 +253,195 @@ git -C "$squash_repo" commit -q -m "feature (#1)"
 # Rebase-merge rebased: replay each commit as a new commit on main.
 git -C "$squash_repo" cherry-pick rebased~1 rebased >/dev/null 2>&1
 
-result=$(PATH="$unauth:$PATH" git -C "$squash_repo" branch-audit --porcelain 2>&1)
+audit_tmp=$(_tmpdir)
+_assert_eq "audit TMPDIR starts without proof artifacts" "" \
+  "$(_tool_artifacts "$audit_tmp")"
+result=$(PATH="$unauth:$PATH" TMPDIR="$audit_tmp" \
+  git -C "$squash_repo" branch-audit --porcelain 2>&1)
 _assert_contains "porcelain marks squash-merged branch as merged" \
   $'branch\tfeature\ttrue\t' "$result"
 _assert_contains "porcelain marks rebase-merged branch as merged" \
   $'branch\trebased\ttrue\t' "$result"
+_assert_eq "audit removes all proof artifacts" "" \
+  "$(_tool_artifacts "$audit_tmp")"
 result=$(git -C "$squash_repo" branch-audit --drop-merged --yes 2>&1)
-_assert_contains "drops squash-merged branch" "deleted feature (merged)" "$result"
-_assert_contains "drops rebase-merged branch" "deleted rebased (merged)" "$result"
-_assert_eq "squash- and rebase-merged branches removed" "main" \
+_assert_contains "reports squash-merged branch" \
+  "preserving local cleanup candidate feature at " "$result"
+_assert_contains "reports rebase-merged branch" \
+  "preserving local cleanup candidate rebased at " "$result"
+_assert_eq "squash- and rebase-merged branches remain" "feature main rebased" \
   "$(git -C "$squash_repo" branch --format='%(refname:short)' | sort | tr '\n' ' ' | sed 's/ $//')"
+
+# Classification is read-only: it needs neither commit identity nor writable
+# object storage, and ordinary audit must not leave synthetic objects behind.
+objects_before=$(_object_ids "$squash_repo")
+identity_name=$(git -C "$squash_repo" config user.name)
+identity_email=$(git -C "$squash_repo" config user.email)
+git -C "$squash_repo" config --unset user.name
+git -C "$squash_repo" config --unset user.email
+identity_output=$(PATH="$unauth:$PATH" git -C "$squash_repo" branch-audit --porcelain 2>&1)
+_assert_contains "audit classifies squash merge without commit identity" \
+  $'branch\tfeature\ttrue\t' "$identity_output"
+git -C "$squash_repo" config user.name "$identity_name"
+git -C "$squash_repo" config user.email "$identity_email"
+objects_after=$(_object_ids "$squash_repo")
+_assert_eq "ordinary audit creates no Git objects" "$objects_before" "$objects_after"
+
+readonly_objects=$(_tmpdir)
+chmod 500 "$readonly_objects"
+source_objects=$(git -C "$squash_repo" rev-parse --absolute-git-dir)/objects
+readonly_output=$(
+  PATH="$unauth:$PATH" GIT_OBJECT_DIRECTORY="$readonly_objects" \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES="$source_objects" \
+    git -C "$squash_repo" branch-audit --base main --drop-merged --dry-run 2>&1
+)
+chmod 700 "$readonly_objects"
+_assert_contains "candidate audit works with read-only object storage" \
+  "preserving local cleanup candidate feature at " "$readonly_output"
+
+# Short ref names become ambiguous when branches and tags collide. Enumeration
+# and base resolution must stay in refs/heads and never report the base itself.
+collision_repo=$(_tmpdir)
+_git_init "$collision_repo"
+_commit_file "$collision_repo" README.md base base
+git -C "$collision_repo" tag main
+git -C "$collision_repo" switch -q -c feature
+_commit_file "$collision_repo" collision.txt feature feature
+git -C "$collision_repo" tag feature
+git -C "$collision_repo" symbolic-ref HEAD refs/heads/main
+git -C "$collision_repo" reset -q --hard refs/heads/main
+git -C "$collision_repo" merge -q --no-ff refs/heads/feature -m "merge feature"
+collision_output=$(git -C "$collision_repo" branch-audit --base main --porcelain 2>&1)
+_assert_contains "collision audit reports genuinely merged feature" \
+  $'branch\tfeature\ttrue\t' "$collision_output"
+_assert_not_contains "collision audit never reports the base branch" \
+  $'branch\tmain\t' "$collision_output"
+_assert_not_contains "collision audit never leaks disambiguated ref spelling" \
+  $'branch\theads/' "$collision_output"
+collision_drop=$(git -C "$collision_repo" branch-audit --base main --drop-merged --yes 2>&1)
+_assert_contains "collision cleanup reports exact feature branch" \
+  "cleanup candidate feature at " "$collision_drop"
+_assert_not_contains "collision cleanup never reports main" \
+  "cleanup candidate main at " "$collision_drop"
+
+invalid_base_rc=0
+invalid_base_output=$(git -C "$collision_repo" branch-audit \
+  --base 'main^{commit}' 2>&1) || invalid_base_rc=$?
+_assert_eq "audit rejects revision syntax as a branch name" "2" "$invalid_base_rc"
+_assert_contains "audit diagnoses an invalid base branch name" \
+  "invalid base branch name" "$invalid_base_output"
+
+ancestor_failure_bin=$(_tmpdir)
+cat >"$ancestor_failure_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == merge-base && "${2:-}" == --is-ancestor ]]; then
+  exit 88
+fi
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$ancestor_failure_bin/git"
+ancestor_failure_output=$(cd "$squash_repo" &&
+  PATH="$ancestor_failure_bin:/usr/bin:/bin" \
+    "$ROOT/bin/git-branch-audit" --base main --drop-merged --yes 2>&1)
+_assert_not_contains "ancestor lookup failure is not accepted as merged" \
+  "cleanup candidate feature" "$ancestor_failure_output"
+_assert_eq "ancestor lookup failure preserves all branches" \
+  "feature main rebased" \
+  "$(git -C "$squash_repo" branch --format='%(refname:short)' | sort | tr '\n' ' ' | sed 's/ $//')"
+
+# Patch IDs ignore whitespace. Exact tree comparison must keep byte-distinct
+# branches even when their history looks replayed.
+whitespace_repo=$(_tmpdir)
+_git_init "$whitespace_repo"
+_commit_file "$whitespace_repo" README.md base base
+git -C "$whitespace_repo" switch -q -c whitespace-distinct
+printf 'alpha beta\n' >"$whitespace_repo/whitespace.txt"
+git -C "$whitespace_repo" add whitespace.txt
+git -C "$whitespace_repo" commit -q -m "branch whitespace"
+whitespace_oid=$(git -C "$whitespace_repo" rev-parse whitespace-distinct)
+git -C "$whitespace_repo" switch -q main
+printf 'alpha    beta\n' >"$whitespace_repo/whitespace.txt"
+git -C "$whitespace_repo" add whitespace.txt
+git -C "$whitespace_repo" commit -q -m "main whitespace"
+result=$(git -C "$whitespace_repo" branch-audit --drop-merged --yes 2>&1)
+_assert_not_contains "does not report patch-equivalent byte-distinct content" \
+  "cleanup candidate whitespace-distinct" "$result"
+_assert_eq "byte-distinct branch object is preserved" "$whitespace_oid" \
+  "$(git -C "$whitespace_repo" rev-parse refs/heads/whitespace-distinct)"
+
+# Never act on a valid-looking prefix from a failed inventory producer.
+partial_repo=$(_tmpdir)
+_git_init "$partial_repo"
+_commit_file "$partial_repo" README.md base base
+git -C "$partial_repo" branch aaa-partial
+partial_bin=$(_tmpdir)
+partial_real=$(PATH=/usr/local/bin:/usr/bin:/bin command -v git)
+_write_partial_ref_enumeration_failure_git "$partial_bin"
+partial_rc=0
+partial_output=$(cd "$partial_repo" &&
+  PATH="$partial_bin:/usr/bin:/bin" GIT_PARTIAL_REF_REAL="$partial_real" \
+    "$ROOT/bin/git-branch-audit" --base main --drop-merged --yes 2>&1) ||
+  partial_rc=$?
+_assert_eq "partial branch inventory fails candidate reporting" "1" "$partial_rc"
+_assert_contains "partial branch inventory is diagnosed" \
+  "could not enumerate branches" "$partial_output"
+_assert_eq "partial inventory preserves branch" "aaa-partial" \
+  "$(git -C "$partial_repo" branch --format='%(refname:short)' --list aaa-partial)"
+
+# Candidate output must use the repository's native full object ID.
+sha256_repo=$(_tmpdir)
+git init -q --object-format=sha256 --initial-branch=main "$sha256_repo"
+git -C "$sha256_repo" config user.email test@test.com
+git -C "$sha256_repo" config user.name Test
+git -C "$sha256_repo" config core.hooksPath /dev/null
+_commit_file "$sha256_repo" README.md base base
+git -C "$sha256_repo" branch sha256-merged
+git -C "$sha256_repo" switch -q -c sha256-squashed
+_commit_file "$sha256_repo" sha256.txt one "sha256 step 1"
+_commit_file "$sha256_repo" sha256.txt two "sha256 step 2"
+sha256_squashed_oid=$(git -C "$sha256_repo" rev-parse sha256-squashed)
+git -C "$sha256_repo" switch -q main
+printf '%s\n' two >"$sha256_repo/sha256.txt"
+git -C "$sha256_repo" add sha256.txt
+git -C "$sha256_repo" commit -q -m "squash sha256 branch"
+sha256_oid=$(git -C "$sha256_repo" rev-parse sha256-merged)
+sha256_output=$(git -C "$sha256_repo" branch-audit --drop-merged --yes 2>&1)
+_assert_contains "reports full SHA-256 cleanup candidate" \
+  "preserving local cleanup candidate sha256-merged at $sha256_oid (merged)" \
+  "$sha256_output"
+_assert_contains "reports a replayed full SHA-256 cleanup candidate" \
+  "preserving local cleanup candidate sha256-squashed at $sha256_squashed_oid (merged)" \
+  "$sha256_output"
+_assert_eq "SHA-256 branch is preserved" "$sha256_oid" \
+  "$(git -C "$sha256_repo" rev-parse refs/heads/sha256-merged)"
+_assert_eq "replayed SHA-256 branch is preserved" "$sha256_squashed_oid" \
+  "$(git -C "$sha256_repo" rev-parse refs/heads/sha256-squashed)"
+
+# Internally well-formed SHA-1-width patch records are not native in a SHA-256
+# repository. Reject them as an operational proof failure before cherry fallback.
+cross_format_bin=$(_tmpdir)
+cross_format_log=$(_tmpdir)/git-invocations
+cat >"$cross_format_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == patch-id ]]; then
+  cat >/dev/null
+  printf '1111111111111111111111111111111111111111 2222222222222222222222222222222222222222\n'
+  exit 0
+fi
+if [[ "${1:-}" == cherry ]]; then
+  printf '%s\n' cherry >>"$GIT_CROSS_FORMAT_LOG"
+fi
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$cross_format_bin/git"
+cross_format_output=$(cd "$sha256_repo" &&
+  PATH="$cross_format_bin:/usr/bin:/bin" \
+    GIT_CROSS_FORMAT_LOG="$cross_format_log" \
+    "$ROOT/bin/git-branch-audit" --base main --drop-merged --yes 2>&1)
+_assert_not_contains "SHA-1-width proof is rejected in SHA-256 repository" \
+  "cleanup candidate sha256-squashed at " "$cross_format_output"
+_assert_eq "cross-format proof fails before cherry fallback" "" \
+  "$(if [[ -e "$cross_format_log" ]]; then printf invoked; fi)"
 
 outside=$(_tmpdir)
 result=$(git -C "$outside" branch-audit 2>&1 || true)

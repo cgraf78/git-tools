@@ -5,7 +5,8 @@
 [![Bash Version](https://img.shields.io/badge/bash-%3E%3D3.2-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
 
-Small Git workflow tools.
+Small Git workflow tools. Runtime support requires Bash 3.2 or newer and Git
+2.29 or newer.
 
 ## Commands
 
@@ -188,14 +189,19 @@ upstreams) that other scripts can filter.
 PR lookup is best-effort: when `gh` is missing or unauthenticated, the audit
 still reports local branch state and omits PR numbers.
 
-A branch counts as merged when its tip is an ancestor of the default branch or
-when its collapsed diff is already present there by patch-id. The patch-id check
-recognizes squash- and rebase-merged branches that a plain ancestor test would
-report as unmerged; it applies to both the `merged` column and `--drop-merged`.
+A branch counts as merged when its pinned tip is an ancestor of a pinned default
+branch snapshot, or when patch IDs identify a replay and the branch's exact net
+tree delta is present in that snapshot. The delta includes full object IDs,
+types, modes, paths, and deletions. This recognizes squash-, rebase-, and
+cherry-pick-merged branches without treating patch-ID-equivalent but
+byte-distinct content as merged. If the default branch later changes one of the
+same paths, the branch is kept conservatively.
 
-Use `--drop-merged` to delete branches already merged into the default branch.
-The current branch and branches checked out in a worktree are skipped. The
-deletion requires `--yes` unless `--dry-run` is also given:
+Use `--drop-merged` to report exact local cleanup candidates, including each
+branch's current OID. It intentionally does not delete branches: worktree
+inventory and lock observations cannot prove that another Git process has not
+already resolved a branch for checkout. The compatibility option remains
+confirmation-gated with `--yes` unless `--dry-run` is also given:
 
 ```sh
 git branch-audit --drop-merged --dry-run
@@ -204,30 +210,48 @@ git branch-audit --drop-merged --yes
 
 ### `git cleanup-repo`
 
-Fetches and prunes the remote, updates the repository's default branch, then
-removes stale local branches.
+Resolves the remote's fetch endpoint, fetches the exact default-branch ref, then
+reports stale local branch candidates with their exact OIDs.
 
 ```sh
 git cleanup-repo
 ```
 
-By default the command deletes only local branches that are already merged into
-the base branch. This includes squash- and rebase-merged branches: their
-collapsed diff is compared against the base by patch-id, so a clean squash merge
-is recognized as merged even though its commits are not ancestors of the base —
-no `--all` needed. Use `--gone` to also delete local branches whose upstream
-branch was removed.
+By default the command reports local branches that are already merged into the
+base branch. This includes squash-, rebase-, and cherry-pick-merged branches:
+patch IDs identify candidate matches, and the exact net tree delta must also be
+present in a pinned base snapshot. A clean squash merge is therefore recognized
+even though its commits are not ancestors of the base, while byte-, mode-, or
+later same-path differences are excluded. Branch and upstream-state enumeration
+must complete before any candidates are reported. No local branch or worktree is
+deleted automatically because an already-resolved checkout cannot be serialized
+portably with ref deletion. Use `--gone` to also report branches whose existing
+upstream-tracking state is gone. The command deliberately does not run configured
+fetch or prune mappings; refresh other remote-tracking state separately when
+needed.
 
-Use `--all` to delete every local branch except the base branch regardless of
-merge state (for example, to reset a checkout with abandoned work you no longer
-need):
+Base updates do not depend on configured fetch refspecs or short ref names. The
+command pins exactly `refs/heads/<base>` from the resolved endpoint, fetches it
+without tags or remote-tracking ref updates, validates its native SHA-1 or
+SHA-256 object ID, and checks the local fast-forward relationship before
+switching branches. It then creates or
+fast-forwards the base using that same OID. A divergent base fails before the
+current branch or local base is changed. Dry-run uses isolated temporary object
+storage, so it leaves no permanent objects or refs behind. The command retains
+the single raw configured fetch URL for both remote inspection and fetch, which
+lets Git apply any `insteadOf` rewrite exactly once per operation. Remotes with
+zero or multiple fetch URLs are rejected because there is no single endpoint to
+pin.
+
+Use `--all` to report every local branch except the base branch regardless of
+merge state:
 
 ```sh
 git cleanup-repo --all
 ```
 
-If a branch is checked out in a linked worktree, the command skips it by
-default. To remove clean linked worktrees for branches being deleted:
+The legacy `--remove-worktrees` option remains accepted for compatibility but
+does not remove worktrees or branches:
 
 ```sh
 git cleanup-repo --all --remove-worktrees

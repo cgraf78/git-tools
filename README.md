@@ -439,8 +439,8 @@ git absorb-and-rebase
 By default the command derives the branch base from, in order:
 
 - the branch upstream
-- remote default branches such as `origin/HEAD`, `origin/main`, or
-  `origin/master`
+- remote default branches such as `origin/HEAD`, `origin/main`,
+  `origin/master`, or `origin/trunk`
 - local default branches such as `main`, `master`, or `trunk`
 
 Pass an explicit base when the branch point is ambiguous:

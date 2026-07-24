@@ -219,32 +219,94 @@ gt_merge_base() {
   printf '%s\n' "$base"
 }
 
-# @brief Print the branch point of HEAD relative to the given ref.
-# fork-point handles the common case where an upstream branch was rebased and
-# Git's reflog can identify the original branch point more accurately than a
-# plain graph merge-base. Fall back to merge-base for repos without reflogs.
+# @brief Print HEAD's branch point relative to one exact ref snapshot.
+# fork-point handles rebased upstreams more accurately than a graph merge-base.
+# Validate the ref after consulting its reflog; when no fork point exists, bind
+# the graph calculation to the commit captured before lookup. Returns 1 for an
+# absent ref or unrelated history and 2 for lookup failures or concurrent ref
+# movement.
 gt_branch_base() {
-  git merge-base --fork-point "$1" HEAD 2>/dev/null ||
-    gt_merge_base "$1"
+  local ref="$1" expected_oid head_oid base status=0 ref_status=0
+
+  gt_find_ref_commit "$ref" || ref_status=$?
+  case "$ref_status" in
+    0) expected_oid=$GT_REF_OID ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+  head_oid=$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || return 2
+
+  base=$(git merge-base --fork-point "$ref" "$head_oid" 2>/dev/null) ||
+    status=$?
+  case "$status" in
+    0)
+      ref_status=0
+      gt_find_ref_commit "$ref" || ref_status=$?
+      [[ "$ref_status" == 0 && "$GT_REF_OID" == "$expected_oid" ]] ||
+        return 2
+      ;;
+    1)
+      status=0
+      base=$(git merge-base "$head_oid" "$expected_oid" 2>/dev/null) ||
+        status=$?
+      case "$status" in
+        0) ;;
+        1) return 1 ;;
+        *) return 2 ;;
+      esac
+      ;;
+    *) return 2 ;;
+  esac
+  [[ -n "$base" ]] || return 2
+  printf '%s\n' "$base"
+}
+
+# @brief Set GT_UPSTREAM_REF to HEAD's configured full upstream ref.
+# An empty result is a valid branch without an upstream. Returns 1 for detached
+# HEAD and 2 when Git cannot inventory the current branch.
+_gt_find_head_upstream() {
+  local head_ref records record_ref upstream extra found=0 status=0
+
+  GT_UPSTREAM_REF=""
+  head_ref=$(git symbolic-ref -q HEAD 2>/dev/null) || status=$?
+  case "$status" in
+    0) ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+  records=$(git for-each-ref \
+    --format='%(refname)%09%(upstream)' "$head_ref" 2>/dev/null) || return 2
+  while IFS=$'\t' read -r record_ref upstream extra; do
+    [[ "$record_ref" == "$head_ref" ]] || continue
+    [[ "$found" == 0 && -z "$extra" ]] || return 2
+    GT_UPSTREAM_REF=$upstream
+    found=1
+  done <<<"$records"
+  [[ "$found" == 1 ]] || return 2
 }
 
 # @brief Print candidate refs for the remote default branch, most specific
 # first. Output may contain duplicates; callers dedupe.
 gt_remote_default_candidates() {
-  local remote ref
+  local remote ref refs remotes
 
-  printf '%s\n' origin/HEAD
+  printf '%s\n' refs/remotes/origin/HEAD
+  refs=$(git for-each-ref --format='%(refname)' refs/remotes 2>/dev/null) ||
+    return 1
   while IFS= read -r ref; do
     case "$ref" in
-      */HEAD) printf '%s\n' "$ref" ;;
+      refs/remotes/*/HEAD) printf '%s\n' "$ref" ;;
     esac
-  done < <(git for-each-ref --format='%(refname:short)' refs/remotes 2>/dev/null)
+  done <<<"$refs"
 
-  printf '%s\n' origin/main origin/master
+  printf '%s\n' refs/remotes/origin/main refs/remotes/origin/master \
+    refs/remotes/origin/trunk
+  remotes=$(git remote 2>/dev/null) || return 1
   while IFS= read -r remote; do
     [[ -n "$remote" ]] || continue
-    printf '%s\n' "$remote/main" "$remote/master"
-  done < <(git remote 2>/dev/null)
+    printf '%s\n' "refs/remotes/$remote/main" \
+      "refs/remotes/$remote/master" "refs/remotes/$remote/trunk"
+  done <<<"$remotes"
 }
 
 # @brief Resolve the branch point of HEAD.
@@ -254,33 +316,59 @@ gt_remote_default_candidates() {
 # then a remote default branch, then a local default branch. Returns 1 when no
 # base can be determined.
 gt_resolve_base() {
-  local ref base candidate seen=$'\n'
+  local ref base candidate display candidates base_status
+  local seen=$'\n'
 
-  ref=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
-  if [[ -n "$ref" ]] && base=$(gt_branch_base "$ref"); then
-    printf '%s\t%s\n' "$ref" "$base"
-    return 0
+  _gt_find_head_upstream || return 1
+  ref=$GT_UPSTREAM_REF
+  if [[ -n "$ref" ]]; then
+    base_status=0
+    base=$(gt_branch_base "$ref") || base_status=$?
+    case "$base_status" in
+      0)
+        display="$ref"
+        display=${display#refs/remotes/}
+        display=${display#refs/heads/}
+        printf '%s\t%s\n' "$display" "$base"
+        return 0
+        ;;
+      1) ;;
+      *) return 1 ;;
+    esac
   fi
 
+  candidates=$(gt_remote_default_candidates) || return 1
   while IFS= read -r candidate; do
     [[ -n "$candidate" ]] || continue
     case "$seen" in
       *$'\n'"$candidate"$'\n'*) continue ;;
     esac
     seen="${seen}${candidate}"$'\n'
-    gt_commit "$candidate" >/dev/null || continue
-    if base=$(gt_branch_base "$candidate"); then
-      printf '%s\t%s\n' "$candidate" "$base"
-      return 0
-    fi
-  done < <(gt_remote_default_candidates)
+    base_status=0
+    base=$(gt_branch_base "$candidate") || base_status=$?
+    case "$base_status" in
+      0)
+        display=${candidate#refs/remotes/}
+        printf '%s\t%s\n' "$display" "$base"
+        return 0
+        ;;
+      1) continue ;;
+      *) return 1 ;;
+    esac
+  done <<<"$candidates"
 
   for candidate in main master trunk; do
-    gt_commit "$candidate" >/dev/null || continue
-    if base=$(gt_branch_base "$candidate"); then
-      printf '%s\t%s\n' "$candidate" "$base"
-      return 0
-    fi
+    ref="refs/heads/$candidate"
+    base_status=0
+    base=$(gt_branch_base "$ref") || base_status=$?
+    case "$base_status" in
+      0)
+        printf '%s\t%s\n' "$candidate" "$base"
+        return 0
+        ;;
+      1) continue ;;
+      *) return 1 ;;
+    esac
   done
 
   return 1

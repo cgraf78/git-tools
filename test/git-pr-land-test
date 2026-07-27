@@ -5,6 +5,9 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
+GT_TEST_SYSTEM_PATH=$(printf '%s:%s' \
+  "$(dirname "$(type -a -p bash | tail -n 1)")" \
+  "$(dirname "$(command -v dirname)")")
 
 _failures=0
 # shellcheck source=test/lib/test-temp.sh
@@ -916,7 +919,7 @@ _write_worktree_list_failure_git "$enumeration_bin"
 rc=0
 result=$(cd "$repo_enumeration" &&
   GH_LOG="$log_enumeration" \
-    PATH="$enumeration_bin:$bin_dir:$ROOT/bin:/usr/bin:/bin" \
+    PATH="$enumeration_bin:$bin_dir:$ROOT/bin:$GT_TEST_SYSTEM_PATH" \
     "$ROOT/bin/git-pr-land" 4 2>&1) || rc=$?
 _assert_eq "worktree enumeration failure: refuses before merge" "1" "$rc"
 _assert_contains "worktree enumeration failure: reports preflight failure" \
@@ -1011,7 +1014,7 @@ repo_newline="$newline_parent/current"$'\n'
 remote_newline=$(_tmpdir)
 log_newline=$(_tmpdir)/gh.log
 _init_repo "$repo_newline" "$remote_newline"
-result=$(GH_LOG="$log_newline" PATH="$bin_dir:$ROOT/bin:/usr/bin:/bin" \
+result=$(GH_LOG="$log_newline" PATH="$bin_dir:$ROOT/bin:$GT_TEST_SYSTEM_PATH" \
   _pr_land "$repo_newline" 4 2>&1)
 rc=$?
 _assert_eq "terminal-newline current worktree lands successfully" "0" "$rc"
@@ -1033,7 +1036,7 @@ for current_operation in rebase bisect; do
   fi
   _assert_eq "terminal-newline $current_operation fixture remains clean" "" \
     "$(git -C "$operation_repo" status --porcelain)"
-  result=$(GH_LOG="$operation_log" PATH="$bin_dir:$ROOT/bin:/usr/bin:/bin" \
+  result=$(GH_LOG="$operation_log" PATH="$bin_dir:$ROOT/bin:$GT_TEST_SYSTEM_PATH" \
     _pr_land "$operation_repo" 4 --keep-branch 2>&1)
   rc=$?
   _assert_eq "terminal-newline current $current_operation refuses before merge" "1" "$rc"
@@ -1156,7 +1159,7 @@ remote_lookup_failure_rc=0
 remote_lookup_failure_output=$(cd "$repo_remote_lookup_failure" &&
   GH_LOG="$log_remote_lookup_failure" \
     GIT_TEST_PROXY="$bin_dir/git" \
-    PATH="$remote_lookup_failure_bin:$bin_dir:$ROOT/bin:/usr/bin:/bin" \
+    PATH="$remote_lookup_failure_bin:$bin_dir:$ROOT/bin:$GT_TEST_SYSTEM_PATH" \
     "$ROOT/bin/git-pr-land" 4 2>&1) || remote_lookup_failure_rc=$?
 _assert_eq "remote lookup failure: refuses before merge" \
   "1" "$remote_lookup_failure_rc"
@@ -1183,7 +1186,7 @@ EOF
 chmod +x "$status_failure_bin/git"
 result=$(cd "$repo_status_failure" && GH_LOG="$log_status_failure" \
   GIT_TEST_PROXY="$bin_dir/git" \
-  PATH="$status_failure_bin:$bin_dir:$ROOT/bin:/usr/bin:/bin" \
+  PATH="$status_failure_bin:$bin_dir:$ROOT/bin:$GT_TEST_SYSTEM_PATH" \
   "$ROOT/bin/git-pr-land" 4 2>&1)
 rc=$?
 _assert_eq "status failure: refuses before merge" "1" "$rc"
@@ -1219,7 +1222,7 @@ EOF
 chmod +x "$operation_failure_bin/git"
 result=$(cd "$repo_operation_failure" && GH_LOG="$log_operation_failure" \
   GIT_TEST_PROXY="$bin_dir/git" \
-  PATH="$operation_failure_bin:$bin_dir:$ROOT/bin:/usr/bin:/bin" \
+  PATH="$operation_failure_bin:$bin_dir:$ROOT/bin:$GT_TEST_SYSTEM_PATH" \
   "$ROOT/bin/git-pr-land" 4 2>&1)
 rc=$?
 _assert_eq "operation probe failure: refuses before merge" "1" "$rc"
@@ -1235,7 +1238,7 @@ fi
 # producer failure, and an unterminated NUL record must all fail without
 # clobbering descriptors owned by the caller.
 fd_open_rc=0
-PATH=/usr/bin:/bin bash -c '
+PATH="$GT_TEST_SYSTEM_PATH" bash -c '
   . "'"$ROOT"'/lib/git-tools-base.sh"
   eval() { return 88; }
   (exit 0) &
@@ -1244,7 +1247,7 @@ PATH=/usr/bin:/bin bash -c '
 _assert_eq "failed worktree descriptor open fails inventory" "1" "$fd_open_rc"
 
 fd_preserve_rc=0
-(cd "$repo" && PATH=/usr/bin:/bin ROOT="$ROOT" bash -c '
+(cd "$repo" && PATH="$GT_TEST_SYSTEM_PATH" ROOT="$ROOT" bash -c '
   . "$ROOT/lib/git-tools-base.sh"
   exec 9</dev/null
   count=0
@@ -1258,7 +1261,7 @@ _assert_eq "repeated worktree inventories preserve caller descriptors" \
   "0" "$fd_preserve_rc"
 
 nonwaitable_process_rc=0
-(cd "$repo" && PATH=/usr/bin:/bin ROOT="$ROOT" bash -c '
+(cd "$repo" && PATH="$GT_TEST_SYSTEM_PATH" ROOT="$ROOT" bash -c '
   . "$ROOT/lib/git-tools-base.sh"
   wait() { return 127; }
   _gt_materialize_worktree_list || exit 91
@@ -1268,7 +1271,7 @@ _assert_eq "worktree inventory does not require a waitable process substitution"
   "0" "$nonwaitable_process_rc"
 
 fd_exhaust_rc=0
-(cd "$repo" && PATH=/usr/bin:/bin ROOT="$ROOT" bash -c '
+(cd "$repo" && PATH="$GT_TEST_SYSTEM_PATH" ROOT="$ROOT" bash -c '
   . "$ROOT/lib/git-tools-base.sh"
   for fd in 3 4 5 6 7 8 9; do eval "exec $fd</dev/null"; done
   ! _gt_materialize_worktree_list || exit 91
@@ -1304,7 +1307,7 @@ chmod +x "$inventory_bin/git"
 for inventory_case in partial spoofed-completion leaked-completion unterminated; do
   inventory_rc=0
   (cd "$repo" && GT_INVENTORY_CASE="$inventory_case" \
-    PATH="$inventory_bin:/usr/bin:/bin" ROOT="$ROOT" bash -c '
+    PATH="$inventory_bin:$GT_TEST_SYSTEM_PATH" ROOT="$ROOT" bash -c '
       export _gt_worktree_completion=caller-value
       . "$ROOT/lib/git-tools-base.sh"
       _gt_materialize_worktree_list
@@ -1320,7 +1323,7 @@ exit 88
 EOF
 chmod +x "$failing_od_bin/od"
 failing_od_rc=0
-(cd "$repo" && PATH="$failing_od_bin:/usr/bin:/bin" ROOT="$ROOT" bash -c '
+(cd "$repo" && PATH="$failing_od_bin:$GT_TEST_SYSTEM_PATH" ROOT="$ROOT" bash -c '
   . "$ROOT/lib/git-tools-base.sh"
   _gt_materialize_worktree_list
 ') >/dev/null 2>&1 || failing_od_rc=$?

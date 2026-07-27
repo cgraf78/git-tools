@@ -366,11 +366,11 @@ _git_init "$partial_repo"
 _commit_file "$partial_repo" README.md base base
 git -C "$partial_repo" branch aaa-partial
 partial_bin=$(_tmpdir)
-partial_real=$(PATH=/usr/local/bin:/usr/bin:/bin command -v git)
+partial_real=$(type -a -p git | tail -n 1)
 _write_partial_ref_enumeration_failure_git "$partial_bin"
 partial_rc=0
 partial_output=$(cd "$partial_repo" &&
-  PATH="$partial_bin:/usr/bin:/bin" GIT_PARTIAL_REF_REAL="$partial_real" \
+  PATH="$partial_bin:$PATH" GIT_PARTIAL_REF_REAL="$partial_real" \
     "$ROOT/bin/git-branch-audit" --base main --drop-merged --yes 2>&1) ||
   partial_rc=$?
 _assert_eq "partial branch inventory fails candidate reporting" "1" "$partial_rc"

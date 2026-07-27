@@ -5,6 +5,9 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
+GIT_TOOLS_TEST_REAL_GIT=$(type -a -p git | tail -n 1)
+GIT_TOOLS_TEST_REAL_GREP=$(type -a -p grep | tail -n 1)
+export GIT_TOOLS_TEST_REAL_GIT GIT_TOOLS_TEST_REAL_GREP
 
 _failures=0
 _suite_tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/git-cleanup-repo-test.XXXXXX") ||
@@ -246,11 +249,11 @@ echo "=== git cleanup-repo ==="
 partial_ref_repo=$(_clone_remote)
 git -C "$partial_ref_repo" branch aaa-partial
 partial_ref_bin=$(_tmpdir)
-partial_ref_real=$(PATH=/usr/local/bin:/usr/bin:/bin command -v git)
+partial_ref_real=$GIT_TOOLS_TEST_REAL_GIT
 _write_partial_ref_enumeration_failure_git "$partial_ref_bin"
 partial_ref_rc=0
 partial_ref_output=$(cd "$partial_ref_repo" &&
-  PATH="$partial_ref_bin:/usr/bin:/bin" \
+  PATH="$partial_ref_bin:$PATH" \
     GIT_PARTIAL_REF_REAL="$partial_ref_real" \
     "$ROOT/bin/git-cleanup-repo" --base main 2>&1) || partial_ref_rc=$?
 _assert_eq "partial branch inventory fails cleanup" "2" "$partial_ref_rc"
@@ -423,12 +426,12 @@ fi
 if [[ "${1:-}" == fetch ]]; then
   printf '%s\n' "$*" >>"$GIT_REMOTE_OID_LOG"
 fi
-exec /usr/bin/git "$@"
+exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
 EOF
 chmod +x "$remote_oid_bin/git"
 remote_oid_rc=0
 remote_oid_output=$(cd "$remote_oid_repo" &&
-  PATH="$remote_oid_bin:/usr/bin:/bin" \
+  PATH="$remote_oid_bin:$PATH" \
     GIT_REMOTE_OID_LOG="$remote_oid_log" \
     "$ROOT/bin/git-cleanup-repo" --base main 2>&1) || remote_oid_rc=$?
 _assert_eq "malformed remote OID fails cleanup" "2" "$remote_oid_rc"
@@ -453,12 +456,12 @@ if [[ "${1:-}" == fetch ]]; then
   printf '%s\n' "$*" >>"$GIT_EXACT_FETCH_LOG"
   exit 88
 fi
-exec /usr/bin/git "$@"
+exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
 EOF
 chmod +x "$fetch_failure_bin/git"
 fetch_failure_rc=0
 fetch_failure_output=$(cd "$fetch_failure_repo" &&
-  PATH="$fetch_failure_bin:/usr/bin:/bin" \
+  PATH="$fetch_failure_bin:$PATH" \
     GIT_EXACT_FETCH_LOG="$fetch_failure_log" \
     "$ROOT/bin/git-cleanup-repo" --base main 2>&1) || fetch_failure_rc=$?
 _assert_eq "exact remote fetch failure aborts cleanup" "2" "$fetch_failure_rc"
@@ -758,7 +761,7 @@ _assert_eq "shallow dry run preserves worktree" \
 # Git 2.29 predates rev-parse --path-format. The isolated-object path must remain
 # usable at the documented baseline.
 legacy_git_bin=$(_tmpdir)
-legacy_git_real=$(PATH=/usr/local/bin:/usr/bin:/bin command -v git)
+legacy_git_real=$GIT_TOOLS_TEST_REAL_GIT
 cat >"$legacy_git_bin/git" <<'EOF'
 #!/usr/bin/env bash
 for argument in "$@"; do
@@ -771,7 +774,7 @@ EOF
 chmod +x "$legacy_git_bin/git"
 legacy_git_rc=0
 legacy_git_output=$(cd "$isolated_dry_repo" &&
-  PATH="$legacy_git_bin:/usr/bin:/bin" GIT_LEGACY_REAL="$legacy_git_real" \
+  PATH="$legacy_git_bin:$PATH" GIT_LEGACY_REAL="$legacy_git_real" \
     "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1) ||
   legacy_git_rc=$?
 _assert_eq "Git 2.29-compatible dry run avoids rev-parse path-format" \
@@ -979,9 +982,9 @@ for failure_side in base branch; do
     base) diff_failure_target=$whitespace_base_oid ;;
   esac
   diff_failure_output=$(cd "$whitespace_repo" &&
-    PATH="$diff_failure_bin:/usr/bin:/bin" \
+    PATH="$diff_failure_bin:$PATH" \
       GIT_DIFF_TREE_FAIL_TARGET="$diff_failure_target" \
-      GIT_DIFF_TREE_REAL=/usr/bin/git \
+      GIT_DIFF_TREE_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
       "$ROOT/bin/git-cleanup-repo" 2>&1)
   _assert_contains "keeps branch after $failure_side delta producer failure" \
     "keeping whitespace-distinct; not merged" "$diff_failure_output"
@@ -1100,11 +1103,11 @@ for proof_failure in diff log patch-id; do
 if [[ "${1:-}" == "$GIT_SQUASH_PROOF_FAILURE" ]]; then
   exit 88
 fi
-exec /usr/bin/git "$@"
+exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
 EOF
   chmod +x "$proof_bin/git"
   proof_output=$(cd "$readonly_repo" &&
-    PATH="$proof_bin:/usr/bin:/bin" \
+    PATH="$proof_bin:$PATH" \
       TMPDIR="$proof_tmp" \
       GIT_SQUASH_PROOF_FAILURE="$proof_failure" \
       "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1)
@@ -1128,7 +1131,7 @@ if [[ "${1:-}" == patch-id ]]; then
     exit 0
   fi
   if [[ "$input" == commit\ * ]]; then
-    valid=$(printf '%s\n' "$input" | /usr/bin/git "$@") || exit $?
+    valid=$(printf '%s\n' "$input" | "$GIT_TOOLS_TEST_REAL_GIT" "$@") || exit $?
     patch_id=${valid%% *}
     source_id=${valid#* }
     case "$GIT_MALFORMED_PROOF_MODE" in
@@ -1140,19 +1143,19 @@ if [[ "${1:-}" == patch-id ]]; then
     esac
     exit 0
   fi
-  printf '%s\n' "$input" | /usr/bin/git "$@"
+  printf '%s\n' "$input" | "$GIT_TOOLS_TEST_REAL_GIT" "$@"
   exit $?
 fi
 if [[ "${1:-}" == cherry ]]; then
   printf '%s\n' cherry >>"$GIT_MALFORMED_PROOF_LOG"
 fi
-exec /usr/bin/git "$@"
+exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
 EOF
 chmod +x "$malformed_bin/git"
 for malformed_mode in one-char mixed-width extra unterminated foreign-width; do
   malformed_log=$(_tmpdir)/git-invocations
   malformed_output=$(cd "$readonly_repo" &&
-    PATH="$malformed_bin:/usr/bin:/bin" \
+    PATH="$malformed_bin:$PATH" \
       GIT_MALFORMED_PROOF_LOG="$malformed_log" \
       GIT_MALFORMED_PROOF_MODE="$malformed_mode" \
       "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1)
@@ -1180,7 +1183,7 @@ _assert_eq "successful squash proof removes private workspace" "" \
 
 # Workspace creation is mandatory. Failure must classify conservatively.
 mktemp_failure_bin=$(_tmpdir)
-mktemp_failure_real=$(PATH=/usr/local/bin:/usr/bin:/bin command -v mktemp)
+mktemp_failure_real=$(command -v mktemp)
 cat >"$mktemp_failure_bin/mktemp" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
@@ -1190,7 +1193,7 @@ exec "$GIT_PATCH_REAL_MKTEMP" "$@"
 EOF
 chmod +x "$mktemp_failure_bin/mktemp"
 mktemp_failure_output=$(cd "$readonly_repo" &&
-  PATH="$mktemp_failure_bin:/usr/bin:/bin" \
+  PATH="$mktemp_failure_bin:$PATH" \
     GIT_PATCH_REAL_MKTEMP="$mktemp_failure_real" \
     "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1)
 _assert_contains "mktemp failure is not accepted as a squash proof" \
@@ -1200,7 +1203,7 @@ _assert_contains "mktemp failure is not accepted as a squash proof" \
 # enough to verify restrictive directory and file modes under umask 000.
 cleanup_tmp=$(_tmpdir)
 cleanup_failure_bin=$(_tmpdir)
-cleanup_real_rm=$(PATH=/usr/local/bin:/usr/bin:/bin command -v rm)
+cleanup_real_rm=$(command -v rm)
 cat >"$cleanup_failure_bin/rm" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
@@ -1213,7 +1216,7 @@ cleanup_failure_output=$(cd "$readonly_repo" &&
   (
     umask 000
     TMPDIR="$cleanup_tmp" \
-      PATH="$cleanup_failure_bin:/usr/bin:/bin" \
+      PATH="$cleanup_failure_bin:$PATH" \
       GIT_PATCH_REAL_RM="$cleanup_real_rm" \
       "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1
   ))
@@ -1322,7 +1325,7 @@ exit 88
 EOF
   chmod +x "$proof_bin/$proof_failure"
   proof_output=$(cd "$exact_repo" &&
-    PATH="$proof_bin:/usr/bin:/bin" "$ROOT/bin/git-cleanup-repo" 2>&1)
+    PATH="$proof_bin:$PATH" "$ROOT/bin/git-cleanup-repo" 2>&1)
   _assert_contains "$proof_failure failure is not accepted as merged" \
     "keeping exact-tree; not merged" "$proof_output"
   _assert_eq "$proof_failure failure preserves branch" \
@@ -1338,12 +1341,12 @@ if [[ "${1:-}" == merge-base && "${2:-}" == --is-ancestor &&
   "${3:-}" == "$GIT_ANCESTOR_FAIL_TARGET" ]]; then
   exit 88
 fi
-exec /usr/bin/git "$@"
+exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
 EOF
 chmod +x "$ancestor_bin/git"
 exact_branch_oid=$(git -C "$exact_repo" rev-parse refs/heads/exact-tree)
 ancestor_output=$(cd "$exact_repo" &&
-  PATH="$ancestor_bin:/usr/bin:/bin" \
+  PATH="$ancestor_bin:$PATH" \
     GIT_ANCESTOR_FAIL_TARGET="$exact_branch_oid" \
     "$ROOT/bin/git-cleanup-repo" 2>&1)
 _assert_contains "ancestry failure is not accepted as merged" \
@@ -1365,11 +1368,11 @@ if [[ "${1:-}" == cherry ]]; then
   printf '%s\n' '- partial-proof'
   exit 88
 fi
-exec /usr/bin/git "$@"
+exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
 EOF
 chmod +x "$cherry_bin/git"
 cherry_output=$(cd "$rebase_repo" &&
-  PATH="$cherry_bin:/usr/bin:/bin" \
+  PATH="$cherry_bin:$PATH" \
     GIT_CHERRY_PROOF_LOG="$cherry_log" \
     "$ROOT/bin/git-cleanup-repo" 2>&1)
 _assert_contains "cherry failure is not accepted as merged" \
@@ -1388,11 +1391,11 @@ cat >"$grep_failure_bin/grep" <<'EOF'
 if [[ "${1:-}" == -q && "${2:-}" == '^+' ]]; then
   exit 88
 fi
-exec /usr/bin/grep "$@"
+exec "$GIT_TOOLS_TEST_REAL_GREP" "$@"
 EOF
 chmod +x "$grep_failure_bin/grep"
 grep_failure_output=$(cd "$rebase_repo" &&
-  PATH="$grep_failure_bin:/usr/bin:/bin" "$ROOT/bin/git-cleanup-repo" 2>&1)
+  PATH="$grep_failure_bin:$PATH" "$ROOT/bin/git-cleanup-repo" 2>&1)
 _assert_contains "grep failure is not accepted as merged" \
   "keeping rebased; not merged" "$grep_failure_output"
 _assert_eq "grep failure preserves branch" \

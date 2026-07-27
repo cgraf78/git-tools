@@ -5,7 +5,9 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
-GT_TEST_SYSTEM_PATH=$(dirname "$(type -a -p bash | tail -n 1)")
+GT_TEST_SYSTEM_PATH=$(printf '%s:%s' \
+  "$(dirname "$(type -a -p bash | tail -n 1)")" \
+  "$(dirname "$(command -v dirname)")")
 
 _failures=0
 # shellcheck source=test/lib/test-temp.sh

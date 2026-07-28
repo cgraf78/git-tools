@@ -21,6 +21,20 @@ _fail() {
   _failures=$((_failures + 1))
 }
 
+_assert_eq() {
+  local name="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %q\n' "$expected" >&2
+    printf '  actual:   %q\n' "$actual" >&2
+  fi
+}
+
 _assert_contains() {
   local name="$1"
   local needle="$2"
@@ -98,13 +112,65 @@ repo_git_dir=$(git -C "$repo" rev-parse --absolute-git-dir)
 bin_dir=$(_tmpdir)
 _write_gh_stub "$bin_dir"
 
+# Cache Git's documented local-environment inventory across repeated calls,
+# while rejecting inherited private cache state before the first safe probe.
+helper_bin=$(_tmpdir)
+helper_log="$helper_bin/git.log"
+helper_real_git=$(type -a -p git | tail -n 1)
+cat >"$helper_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == "rev-parse --local-env-vars" ]]; then
+  printf '%s\n' "$*" >>"$GT_HELPER_GIT_LOG"
+fi
+exec "$GT_HELPER_REAL_GIT" "$@"
+EOF
+chmod +x "$helper_bin/git"
+: >"$helper_log"
+helper_output=$(
+  GIT_DIR=/nonexistent GIT_WORK_TREE=/nonexistent \
+    _GT_GIT_LOCAL_ENV_VARS_READY=1 _GT_GIT_LOCAL_ENV_VARS='' \
+    GT_HELPER_GIT_LOG="$helper_log" GT_HELPER_REAL_GIT="$helper_real_git" \
+    PATH="$helper_bin:$PATH" ROOT="$ROOT" REPO="$repo" bash -c '
+      source "$ROOT/lib/git-tools-base.sh"
+      gt_git_without_local_env -C "$REPO" rev-parse --show-toplevel
+      gt_git_without_local_env -C "$REPO" rev-parse --show-toplevel
+    '
+)
+helper_expected=$(printf '%s\n%s' "$repo" "$repo")
+_assert_eq "local Git environment cache rejects inherited state" \
+  "$helper_expected" "$helper_output"
+helper_local_env_calls=$(grep -c '^rev-parse --local-env-vars$' "$helper_log" || true)
+_assert_eq "local Git environment inventory runs once per process" \
+  "1" "$helper_local_env_calls"
+
 feature_dir=$(_tmpdir)
 rm -rf "$feature_dir"
 git -C "$repo" worktree add -q -b feature "$feature_dir" >/dev/null
 
-result=$(PATH="$bin_dir:$PATH" git -C "$repo" worktree-audit --porcelain 2>&1)
+audit_git_log="$bin_dir/git.log"
+audit_real_git=$(type -a -p git | tail -n 1)
+cat >"$bin_dir/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == show && "${2:-}" == -s ]]; then
+  printf '%s\n' "$*" >>"$GT_AUDIT_GIT_LOG"
+  case "$*" in
+    *'--format=%cr%x09%ct'*) printf 'deterministic age\t1234567890\n'; exit 0 ;;
+    *'--format=%cr'*) printf 'deterministic age\n'; exit 0 ;;
+    *'--format=%ct'*) printf '1234567890\n'; exit 0 ;;
+  esac
+fi
+exec "$GT_AUDIT_REAL_GIT" "$@"
+EOF
+chmod +x "$bin_dir/git"
+: >"$audit_git_log"
+export GT_AUDIT_GIT_LOG="$audit_git_log" GT_AUDIT_REAL_GIT="$audit_real_git"
+result=$(cd "$repo" && PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-worktree-audit" --porcelain 2>&1)
 _assert_contains "porcelain reports the main worktree" $'\tmain\tfalse\tfalse\t\t' "$result"
 _assert_contains "porcelain reports the feature worktree with PR" $'\tfeature\tfalse\tfalse\t202\t' "$result"
+_assert_contains "porcelain preserves the commit timestamp" $'\t1234567890' "$result"
+audit_show_calls=$(grep -c '^show ' "$audit_git_log" || true)
+_assert_eq "porcelain resolves commit age once per live worktree" "2" "$audit_show_calls"
 
 # A dirty linked worktree is reported as dirty.
 printf 'edit\n' >>"$feature_dir/README.md"
@@ -114,9 +180,13 @@ result=$(
 )
 _assert_contains "porcelain reflects a dirty worktree" $'\tfeature\ttrue\tfalse\t202\t' "$result"
 
-result=$(PATH="$bin_dir:$PATH" git -C "$repo" worktree-audit 2>&1)
+: >"$audit_git_log"
+result=$(cd "$repo" && PATH="$bin_dir:$PATH" "$ROOT/bin/git-worktree-audit" 2>&1)
 _assert_contains "human reports the feature worktree" "branch=feature dirty=true orphan=false" "$result"
 _assert_contains "human reports the PR number" "pr=#202" "$result"
+_assert_contains "human preserves the relative commit age" "(deterministic age)" "$result"
+audit_show_calls=$(grep -c '^show ' "$audit_git_log" || true)
+_assert_eq "human resolves commit age once per live worktree" "2" "$audit_show_calls"
 
 # PR lookup is best-effort: still lists worktrees when gh is unauthenticated.
 unauth=$(_tmpdir)

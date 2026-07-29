@@ -160,9 +160,14 @@ _list() {
       gt_die "could not compare branch to default: $name"
     read -r behind ahead <<<"$counts"
     merged=false
-    # Squash/rebase merges are recognized too, so the merged flag is not stuck
-    # on "false" for branches landed via a squash PR.
-    gt_branch_merged "$oid" "$_default_oid" && merged=true
+    # A zero right-side count already proves the branch is an ancestor of the
+    # default. Avoid repeating that graph walk for the common ordinary-merge
+    # case; content-based detection remains necessary for squash/rebase merges.
+    if [[ "$ahead" == 0 ]]; then
+      merged=true
+    elif gt_branch_merged "$oid" "$_default_oid"; then
+      merged=true
+    fi
     gone=false
     [[ "$track" == "[gone]" ]] && gone=true
     pr=$(gt_pr_number_for_branch "$name" || true)

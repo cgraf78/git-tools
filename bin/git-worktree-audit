@@ -112,7 +112,7 @@ _dirty_state() {
 _emit() {
   [[ -n "$_wt_path" ]] || return 0
 
-  local branch dirty orphan pr rel unix
+  local branch dirty orphan pr rel unix age
   branch=$(_branch_label)
 
   orphan=false
@@ -133,8 +133,8 @@ _emit() {
   rel=""
   unix=""
   if [[ -n "$_wt_head" ]]; then
-    rel=$(git show -s --format=%cr "$_wt_head" 2>/dev/null || true)
-    unix=$(git show -s --format=%ct "$_wt_head" 2>/dev/null || true)
+    age=$(git show -s --format='%cr%x09%ct' "$_wt_head" 2>/dev/null || true)
+    IFS=$'\t' read -r rel unix <<<"$age"
   fi
 
   if [[ "$_porcelain" == 1 ]]; then

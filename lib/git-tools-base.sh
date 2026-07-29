@@ -8,6 +8,12 @@
 # (repo-state). Keeping them side-effect free lets both lib-sourcing commands
 # and standalone scripts compose them.
 
+# Cache Git's documented repository-local environment inventory within this
+# library load. Reset on source so inherited/exported private state cannot skip
+# the safety probe or retain GIT_DIR/GIT_WORK_TREE across repositories.
+_GT_GIT_LOCAL_ENV_VARS_READY=0
+_GT_GIT_LOCAL_ENV_VARS=""
+
 # @brief Print the repository's default branch short name.
 # @param remote Remote to consult for the default head (defaults to origin).
 # Resolution order: <remote>/HEAD symbolic ref, then <remote>/{main,master,trunk}
@@ -589,7 +595,12 @@ gt_git_without_local_env() {
   local name local_vars
   local -a env_args=()
 
-  local_vars=$(git rev-parse --local-env-vars) || return 1
+  # Resolve lazily so commands that never cross repositories pay nothing.
+  if [[ "${_GT_GIT_LOCAL_ENV_VARS_READY:-}" != 1 ]]; then
+    _GT_GIT_LOCAL_ENV_VARS=$(git rev-parse --local-env-vars) || return 1
+    _GT_GIT_LOCAL_ENV_VARS_READY=1
+  fi
+  local_vars=${_GT_GIT_LOCAL_ENV_VARS:-}
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     env_args+=("-u" "$name")

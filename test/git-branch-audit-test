@@ -179,6 +179,31 @@ _assert_contains "porcelain reports ahead branch with PR" $'branch\tahead\tfalse
 _assert_contains "porcelain reports merged branch" $'branch\tmerged\ttrue\t0\t1\t\t' "$result"
 _assert_not_contains "porcelain omits the default branch" $'branch\tmain\t' "$result"
 
+# The ahead/behind query already proves ordinary ancestry when ahead is zero.
+# Keep that common path to one graph walk instead of re-running merge-base for
+# every merged local branch.
+graph_probe_bin=$(_tmpdir)
+graph_probe_log="$graph_probe_bin/merge-base.log"
+cat >"$graph_probe_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == merge-base ]]; then
+  printf '%s\n' "$*" >>"${GIT_GRAPH_PROBE_LOG:?}"
+fi
+exec "${GIT_GRAPH_PROBE_REAL:?}" "$@"
+EOF
+chmod +x "$graph_probe_bin/git"
+_write_unauthenticated_gh_stub "$graph_probe_bin"
+: >"$graph_probe_log"
+merged_oid=$(git -C "$repo" rev-parse refs/heads/merged)
+graph_probe_real=$(type -a -p git | tail -n 1)
+(cd "$repo" &&
+  PATH="$graph_probe_bin:$PATH" \
+    GIT_GRAPH_PROBE_LOG="$graph_probe_log" \
+    GIT_GRAPH_PROBE_REAL="$graph_probe_real" \
+    "$ROOT/bin/git-branch-audit" --base main --porcelain >/dev/null)
+_assert_not_contains "ordinary merge does not repeat ancestry graph walk" \
+  "$merged_oid" "$(cat "$graph_probe_log")"
+
 gone_line=$(printf '%s\n' "$result" | grep -F $'branch\tgone\t')
 _assert_contains "porcelain reports gone branch counts" $'branch\tgone\tfalse\t1\t0\t\t' "$gone_line"
 _assert_eq "gone branch flags a deleted upstream" "true" "$(printf '%s' "$gone_line" | awk -F'\t' '{print $NF}')"
@@ -247,6 +272,15 @@ git -C "$squash_repo" cherry-pick rebased~1 rebased >/dev/null 2>&1
 audit_tmp=$(_tmpdir)
 _assert_eq "audit TMPDIR starts without proof artifacts" "" \
   "$(_tool_artifacts "$audit_tmp")"
+: >"$graph_probe_log"
+feature_oid=$(git -C "$squash_repo" rev-parse refs/heads/feature)
+(cd "$squash_repo" &&
+  PATH="$graph_probe_bin:$PATH" \
+    GIT_GRAPH_PROBE_LOG="$graph_probe_log" \
+    GIT_GRAPH_PROBE_REAL="$graph_probe_real" \
+    "$ROOT/bin/git-branch-audit" --base main --porcelain >/dev/null)
+_assert_contains "squash merge still runs content-aware classification" \
+  "$feature_oid" "$(cat "$graph_probe_log")"
 result=$(PATH="$unauth:$PATH" TMPDIR="$audit_tmp" \
   git -C "$squash_repo" branch-audit --porcelain 2>&1)
 _assert_contains "porcelain marks squash-merged branch as merged" \

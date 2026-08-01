@@ -14,7 +14,10 @@ _suite_tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/git-cleanup-repo-test.XXXXXX") ||
   exit 1
 
 _tmpdir() {
-  mktemp -d "$_suite_tmp_root/fixture.XXXXXX"
+  local path
+
+  path=$(mktemp -d "$_suite_tmp_root/fixture.XXXXXX") || return 1
+  (cd -P -- "$path" && pwd -P)
 }
 
 _cleanup() {

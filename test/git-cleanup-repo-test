@@ -14,7 +14,10 @@ _suite_tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/git-cleanup-repo-test.XXXXXX") ||
   exit 1
 
 _tmpdir() {
-  mktemp -d "$_suite_tmp_root/fixture.XXXXXX"
+  local path
+
+  path=$(mktemp -d "$_suite_tmp_root/fixture.XXXXXX") || return 1
+  (cd -P -- "$path" && pwd -P)
 }
 
 _cleanup() {
@@ -262,6 +265,41 @@ _assert_contains "partial branch inventory is diagnosed" \
 _assert_eq "partial inventory preserves branch" "aaa-partial" \
   "$(git -C "$partial_ref_repo" branch --format='%(refname:short)' --list aaa-partial)"
 
+# A complete-looking inventory with one malformed later record must also abort
+# before an earlier valid cleanup candidate is deleted.
+malformed_inventory_repo=$(_clone_remote)
+git -C "$malformed_inventory_repo" switch --quiet -c aaa-merged
+_commit_file "$malformed_inventory_repo" aaa.txt merged "add early merged branch"
+git -C "$malformed_inventory_repo" switch --quiet main
+git -C "$malformed_inventory_repo" merge --quiet --no-ff aaa-merged \
+  -m "merge early branch"
+git -C "$malformed_inventory_repo" branch zzz-malformed
+malformed_inventory_bin=$(_tmpdir)
+cat >"$malformed_inventory_bin/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == for-each-ref && "$*" == *"%(objectname)"* &&
+  "$*" == *"refs/heads"* ]]; then
+  "$GIT_MALFORMED_INVENTORY_REAL" "$@" |
+    awk -F '\t' 'BEGIN { OFS = "\t" }
+      $1 == "refs/heads/zzz-malformed" { $2 = "not-an-oid" }
+      { print }'
+  exit 0
+fi
+exec "$GIT_MALFORMED_INVENTORY_REAL" "$@"
+EOF
+chmod +x "$malformed_inventory_bin/git"
+malformed_inventory_rc=0
+malformed_inventory_output=$(cd "$malformed_inventory_repo" &&
+  PATH="$malformed_inventory_bin:$PATH" \
+    GIT_MALFORMED_INVENTORY_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
+    "$ROOT/bin/git-cleanup-repo" --base main 2>&1) || malformed_inventory_rc=$?
+_assert_eq "malformed late inventory fails cleanup" "2" "$malformed_inventory_rc"
+_assert_contains "malformed late inventory is diagnosed" \
+  "invalid branch object ID in inventory" "$malformed_inventory_output"
+_assert_eq "malformed late inventory preserves earlier candidate" aaa-merged \
+  "$(git -C "$malformed_inventory_repo" branch --format='%(refname:short)' --list aaa-merged)"
+
 repo=$(_clone_remote)
 git -C "$repo" switch --quiet -c merged
 _commit_file "$repo" merged.txt merged "add merged"
@@ -280,16 +318,16 @@ git -C "$repo" push -u origin keep >/dev/null 2>&1
 git -C "$repo" switch --quiet main
 
 result=$(git -C "$repo" cleanup-repo 2>&1)
-_assert_contains "reports exact merged cleanup candidate" \
-  "preserving local cleanup candidate merged at " "$result"
-_assert_contains "reports candidate summary without deletion" \
-  "reported 1 local cleanup candidate(s), skipped 2; no local branches deleted" "$result"
-expected="$(printf 'gone\nkeep\nmain\nmerged')"
-_assert_eq "default cleanup preserves every local branch" "$expected" "$(_branches "$repo")"
+_assert_contains "deletes exact merged branch" "deleting merged (merged)" "$result"
+_assert_contains "reports deletion summary" \
+  "deleted 1 local branch(es), skipped 2" "$result"
+expected="$(printf 'gone\nkeep\nmain')"
+_assert_eq "default cleanup deletes merged branch" "$expected" "$(_branches "$repo")"
 result=$(git -C "$repo" cleanup-repo --gone 2>&1)
-_assert_contains "gone reports removed-upstream candidates" \
-  "preserving local cleanup candidate gone at " "$result"
-_assert_eq "gone mode preserves every local branch" "$expected" "$(_branches "$repo")"
+_assert_contains "gone deletes removed-upstream branches" \
+  "deleting gone (upstream gone)" "$result"
+_assert_eq "gone mode deletes gone branch" \
+  "$(printf 'keep\nmain')" "$(_branches "$repo")"
 
 squash_repo=$(_clone_remote)
 git -C "$squash_repo" switch --quiet -c squashed
@@ -303,10 +341,9 @@ printf '%s\n' two >"$squash_repo/squashed.txt"
 git -C "$squash_repo" add squashed.txt
 git -C "$squash_repo" commit --quiet -m "squashed (#1)" >/dev/null
 result=$(git -C "$squash_repo" cleanup-repo 2>&1)
-_assert_contains "default reports squash-merged branches" \
-  "preserving local cleanup candidate squashed at " "$result"
-_assert_eq "squash-merged branch remains" \
-  "$(printf 'main\nsquashed')" "$(_branches "$squash_repo")"
+_assert_contains "default deletes squash-merged branches" \
+  "deleting squashed (content-merged)" "$result"
+_assert_eq "squash-merged branch is deleted" "main" "$(_branches "$squash_repo")"
 
 # Dry-run classification is read-only and cannot depend on author identity or
 # writable object storage.
@@ -329,7 +366,7 @@ readonly_result=$(
 )
 chmod 700 "$readonly_object_dir"
 _assert_contains "cleanup dry-run works with read-only object storage" \
-  "cleanup candidate readonly-squash at " "$readonly_result"
+  "would delete readonly-squash at " "$readonly_result"
 
 objects_before=$(_object_ids "$readonly_repo")
 result=$(git -C "$readonly_repo" cleanup-repo --base main --dry-run 2>&1)
@@ -337,14 +374,18 @@ objects_after=$(_object_ids "$readonly_repo")
 readonly_remote_main_oid=$(git -C "$readonly_repo" ls-remote origin \
   refs/heads/main | awk '{ print $1 }')
 _assert_contains "cleanup dry-run reports squash candidate" \
-  "cleanup candidate readonly-squash at " "$result"
+  "would delete readonly-squash at " "$result"
 _assert_contains "ahead dry run pins exact remote OID" \
   "git merge --quiet --ff-only $readonly_remote_main_oid" "$result"
 _assert_eq "cleanup dry-run creates no Git objects" "$objects_before" "$objects_after"
 readonly_main_oid=$(git -C "$readonly_repo" rev-parse refs/heads/main)
+readonly_squash_oid=$(git -C "$readonly_repo" rev-parse refs/heads/readonly-squash)
 git -C "$readonly_repo" cleanup-repo --base main >/dev/null 2>&1
 _assert_eq "ahead real run preserves the preflighted local base" \
   "$readonly_main_oid" "$(git -C "$readonly_repo" rev-parse refs/heads/main)"
+_assert_eq "ahead real run deletes the squash-merged branch" "" \
+  "$(git -C "$readonly_repo" branch --list readonly-squash)"
+git -C "$readonly_repo" branch readonly-squash "$readonly_squash_oid"
 
 identity_name=$(git -C "$readonly_repo" config user.name)
 identity_email=$(git -C "$readonly_repo" config user.email)
@@ -352,7 +393,7 @@ git -C "$readonly_repo" config --unset user.name
 git -C "$readonly_repo" config --unset user.email
 identity_result=$(git -C "$readonly_repo" cleanup-repo --base main --dry-run 2>&1)
 _assert_contains "cleanup classifies squash merge without commit identity" \
-  "cleanup candidate readonly-squash at " "$identity_result"
+  "would delete readonly-squash at " "$identity_result"
 git -C "$readonly_repo" config user.name "$identity_name"
 git -C "$readonly_repo" config user.email "$identity_email"
 
@@ -395,14 +436,14 @@ git -C "$collision_repo" reset --quiet --hard refs/heads/main
 git -C "$collision_repo" merge --quiet --no-ff refs/heads/feature -m \
   "merge collision feature" >/dev/null
 collision_result=$(git -C "$collision_repo" cleanup-repo --base main 2>&1)
-_assert_contains "collision cleanup reports genuinely merged feature" \
-  "cleanup candidate feature at " "$collision_result"
+_assert_contains "collision cleanup deletes genuinely merged feature" \
+  "deleting feature (merged)" "$collision_result"
 _assert_not_contains "collision cleanup never reports the base branch" \
-  "cleanup candidate main at " "$collision_result"
+  "deleting main " "$collision_result"
 _assert_not_contains "collision cleanup never leaks disambiguated ref spelling" \
-  "cleanup candidate heads/" "$collision_result"
-_assert_eq "collision cleanup preserves exact local branches" \
-  "$(printf 'feature\nmain')" "$(_branches "$collision_repo")"
+  "deleting heads/" "$collision_result"
+_assert_eq "collision cleanup deletes only the exact feature ref" \
+  "main" "$(_branches "$collision_repo")"
 
 invalid_base_rc=0
 invalid_base_output=$(git -C "$collision_repo" cleanup-repo \
@@ -504,7 +545,7 @@ git -C "$remote_collision_repo" tag -d main >/dev/null
 remote_dry_result=$(git -C "$remote_collision_repo" cleanup-repo \
   --base main --dry-run 2>&1)
 _assert_contains "remote-only dry run uses exact remote base" \
-  "cleanup candidate remote-merged at " "$remote_dry_result"
+  "would delete remote-merged at " "$remote_dry_result"
 _assert_contains "remote-only dry run pins the exact remote branch OID" \
   "git merge --quiet --ff-only $remote_main_oid" "$remote_dry_result"
 _assert_eq "remote-only dry run does not create a local base" "" \
@@ -618,7 +659,7 @@ git -C "$excluded_refspec_repo" branch -D main >/dev/null
 excluded_dry_result=$(git -C "$excluded_refspec_repo" cleanup-repo \
   --base main --dry-run 2>&1)
 _assert_contains "excluded refspec dry run uses real remote main" \
-  "cleanup candidate excluded-merged at " "$excluded_dry_result"
+  "would delete excluded-merged at " "$excluded_dry_result"
 git -C "$excluded_refspec_repo" cleanup-repo --base main >/dev/null 2>&1
 _assert_eq "excluded refspec real run creates exact remote main" \
   "$excluded_main_oid" \
@@ -677,7 +718,7 @@ git -C "$behind_base_repo" switch --quiet -c behind-runner "$behind_old_oid"
 behind_dry_result=$(git -C "$behind_base_repo" cleanup-repo \
   --base main --dry-run 2>&1)
 _assert_contains "behind dry run classifies against pinned remote base" \
-  "cleanup candidate behind-merged at " "$behind_dry_result"
+  "would delete behind-merged at " "$behind_dry_result"
 _assert_contains "behind dry run prints pinned ff-only merge" \
   "git merge --quiet --ff-only $behind_remote_oid" "$behind_dry_result"
 git -C "$behind_base_repo" cleanup-repo --base main >/dev/null 2>&1
@@ -900,11 +941,12 @@ _commit_file "$rebase_repo" mainline.txt main "unrelated mainline commit"
 # The collapsed-diff probe will not match, but every commit's patch-id is
 # present, which the per-commit check detects.
 git -C "$rebase_repo" cherry-pick rebased~1 rebased >/dev/null 2>&1
+rebased_oid=$(git -C "$rebase_repo" rev-parse refs/heads/rebased)
 result=$(git -C "$rebase_repo" cleanup-repo 2>&1)
-_assert_contains "default reports multi-commit rebase-merged branches" \
-  "preserving local cleanup candidate rebased at " "$result"
-_assert_eq "rebase-merged branch remains" \
-  "$(printf 'main\nrebased')" "$(_branches "$rebase_repo")"
+_assert_contains "default deletes multi-commit rebase-merged branches" \
+  "deleting rebased (content-merged)" "$result"
+_assert_eq "rebase-merged branch is deleted" "main" "$(_branches "$rebase_repo")"
+git -C "$rebase_repo" branch rebased "$rebased_oid"
 
 unmerged_repo=$(_clone_remote)
 git -C "$unmerged_repo" switch --quiet -c partial
@@ -1049,11 +1091,12 @@ printf '%s\n' pathspec >"$exact_repo/$exact_weird"
 printf '%s\n' second >"$exact_repo/exact-step2.txt"
 git -C "$exact_repo" add --all
 git -C "$exact_repo" commit --quiet -m "squash exact branch tree"
+exact_tree_oid=$(git -C "$exact_repo" rev-parse refs/heads/exact-tree)
 result=$(git -C "$exact_repo" cleanup-repo 2>&1)
-_assert_contains "reports exact rich-tree squash merge" \
-  "preserving local cleanup candidate exact-tree at " "$result"
-_assert_eq "exact rich-tree branch remains" \
-  "$(printf 'exact-tree\nmain')" "$(_branches "$exact_repo")"
+_assert_contains "deletes exact rich-tree squash merge" \
+  "deleting exact-tree (content-merged)" "$result"
+_assert_eq "exact rich-tree branch is deleted" "main" "$(_branches "$exact_repo")"
+git -C "$exact_repo" branch exact-tree "$exact_tree_oid"
 
 # Gitlinks participate in the same exact raw-tree proof. An identical target
 # is accepted, while a different commit at the same path is not.
@@ -1071,8 +1114,9 @@ git -C "$gitlink_repo" update-index --add \
 git -C "$gitlink_repo" commit --quiet -m "squash exact gitlink"
 mkdir "$gitlink_repo/vendor-link"
 gitlink_output=$(git -C "$gitlink_repo" cleanup-repo 2>&1)
-_assert_contains "reports exact gitlink squash merge" \
-  "cleanup candidate exact-gitlink at " "$gitlink_output"
+_assert_contains "deletes exact gitlink squash merge" \
+  "deleting exact-gitlink (content-merged)" "$gitlink_output"
+_assert_eq "exact gitlink branch is deleted" "main" "$(_branches "$gitlink_repo")"
 
 gitlink_distinct_repo=$(_clone_remote)
 gitlink_distinct_tree=$(printf '' | git -C "$gitlink_distinct_repo" mktree)
@@ -1177,7 +1221,7 @@ stream_output=$(cd "$readonly_repo" &&
       --base main --dry-run 2>&1
   ))
 _assert_contains "streamed squash proof still reports exact merge" \
-  "cleanup candidate readonly-squash at " "$stream_output"
+  "would delete readonly-squash at " "$stream_output"
 _assert_eq "successful squash proof removes private workspace" "" \
   "$(_tool_artifacts "$stream_tmp")"
 
@@ -1407,10 +1451,9 @@ _commit_file "$all_repo" unmerged.txt unmerged "add unmerged"
 git -C "$all_repo" push -u origin unmerged >/dev/null 2>&1
 git -C "$all_repo" switch --quiet main
 result=$(git -C "$all_repo" cleanup-repo --all 2>&1)
-_assert_contains "all reports unmerged local candidates" \
-  "preserving local cleanup candidate unmerged at " "$result"
-_assert_eq "all preserves local branches" \
-  "$(printf 'main\nunmerged')" "$(_branches "$all_repo")"
+_assert_contains "all deletes unmerged local branches" \
+  "deleting unmerged (all)" "$result"
+_assert_eq "all preserves only the base branch" "main" "$(_branches "$all_repo")"
 
 worktree_repo=$(_clone_remote)
 git -C "$worktree_repo" switch --quiet -c work
@@ -1420,17 +1463,104 @@ worktree_dir=$(_tmpdir)
 rm -rf "$worktree_dir"
 git -C "$worktree_repo" worktree add "$worktree_dir" work >/dev/null 2>&1
 result=$(git -C "$worktree_repo" cleanup-repo --all 2>&1)
-_assert_contains "reports checked-out branches without worktree mutation" \
-  "preserving local cleanup candidate work at " "$result"
+_assert_contains "skips checked-out branches without worktree opt-in" \
+  "skipping work; checked out in worktree $worktree_dir" "$result"
 expected="$(printf 'main\nwork')"
 _assert_eq "branch remains while worktree is kept" "$expected" "$(_branches "$worktree_repo")"
 result=$(git -C "$worktree_repo" cleanup-repo --all --remove-worktrees 2>&1)
-_assert_contains "remove-worktrees remains non-destructive" \
-  "preserving local cleanup candidate work at " "$result"
-_assert_eq "remove-worktrees preserves worktree branch" "$expected" \
+_assert_contains "remove-worktrees deletes clean checked-out branch" \
+  "deleting work (all)" "$result"
+_assert_eq "remove-worktrees deletes worktree branch" "main" \
   "$(_branches "$worktree_repo")"
-_assert_eq "remove-worktrees preserves linked checkout" "work" \
-  "$(git -C "$worktree_dir" branch --show-current)"
+_assert_eq "remove-worktrees removes linked checkout" "missing" \
+  "$(if [[ -e "$worktree_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
+
+# Expected-old-OID deletion must preserve a branch that advances after
+# classification but before the ref transaction.
+ref_race_repo=$(_clone_remote)
+git -C "$ref_race_repo" switch --quiet -c ref-race
+_commit_file "$ref_race_repo" race.txt merged "add raced branch"
+git -C "$ref_race_repo" switch --quiet main
+git -C "$ref_race_repo" merge --quiet --no-ff ref-race -m "merge raced branch"
+ref_race_old=$(git -C "$ref_race_repo" rev-parse refs/heads/ref-race)
+ref_race_bin=$(_tmpdir)
+cat >"$ref_race_bin/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == update-ref && "${2:-}" == -d &&
+  "${3:-}" == refs/heads/ref-race ]]; then
+  old=$4
+  tree=$("$GIT_REF_RACE_REAL" rev-parse "$old^{tree}")
+  new=$(printf 'advance raced branch\n' |
+    "$GIT_REF_RACE_REAL" commit-tree "$tree" -p "$old")
+  "$GIT_REF_RACE_REAL" update-ref "$3" "$new" "$old"
+fi
+exec "$GIT_REF_RACE_REAL" "$@"
+EOF
+chmod +x "$ref_race_bin/git"
+ref_race_output=$(cd "$ref_race_repo" &&
+  PATH="$ref_race_bin:$PATH" \
+    GIT_REF_RACE_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
+    "$ROOT/bin/git-cleanup-repo" --base main 2>&1)
+ref_race_new=$(git -C "$ref_race_repo" rev-parse refs/heads/ref-race)
+_assert_contains "ref advancement makes exact deletion fail closed" \
+  "exact ref deletion failed" "$ref_race_output"
+if [[ "$ref_race_new" != "$ref_race_old" ]]; then
+  _pass "ref advancement preserves the newer branch tip"
+else
+  _fail "ref advancement preserves the newer branch tip"
+fi
+
+# A clean worktree with an active operation is not safe to remove.
+operation_repo=$(_clone_remote)
+git -C "$operation_repo" switch --quiet -c bisect-work
+_commit_file "$operation_repo" bisect.txt work "add bisect work"
+git -C "$operation_repo" switch --quiet main
+operation_dir=$(_tmpdir)
+rm -rf "$operation_dir"
+git -C "$operation_repo" worktree add --quiet "$operation_dir" bisect-work
+git -C "$operation_dir" bisect start bisect-work main >/dev/null
+operation_output=$(git -C "$operation_repo" cleanup-repo \
+  --all --remove-worktrees 2>&1)
+_assert_contains "active bisect prevents clean worktree removal" \
+  "worktree has active bisect: $operation_dir" "$operation_output"
+_assert_eq "active bisect preserves branch" bisect-work \
+  "$(git -C "$operation_repo" branch --list --format='%(refname:short)' bisect-work)"
+_assert_eq "active bisect preserves worktree" present \
+  "$(if [[ -e "$operation_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
+git -C "$operation_dir" bisect reset >/dev/null
+
+# Git's own final worktree-remove check must catch a file created after our
+# clean preflight and leave both the worktree and branch intact.
+late_dirty_repo=$(_clone_remote)
+git -C "$late_dirty_repo" switch --quiet -c late-dirty
+_commit_file "$late_dirty_repo" late.txt clean "add late dirty work"
+git -C "$late_dirty_repo" switch --quiet main
+late_dirty_dir=$(_tmpdir)
+rm -rf "$late_dirty_dir"
+git -C "$late_dirty_repo" worktree add --quiet "$late_dirty_dir" late-dirty
+late_dirty_bin=$(_tmpdir)
+cat >"$late_dirty_bin/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == worktree && "${2:-}" == remove &&
+  "${3:-}" == "$GIT_LATE_DIRTY_PATH" ]]; then
+  printf 'late\n' >"$GIT_LATE_DIRTY_PATH/late-untracked.txt"
+fi
+exec "$GIT_LATE_DIRTY_REAL" "$@"
+EOF
+chmod +x "$late_dirty_bin/git"
+late_dirty_output=$(cd "$late_dirty_repo" &&
+  PATH="$late_dirty_bin:$PATH" \
+    GIT_LATE_DIRTY_PATH="$late_dirty_dir" \
+    GIT_LATE_DIRTY_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
+    "$ROOT/bin/git-cleanup-repo" --base main --all --remove-worktrees 2>&1)
+_assert_contains "late dirty worktree removal fails closed" \
+  "worktree could not be removed safely: $late_dirty_dir" "$late_dirty_output"
+_assert_eq "late dirty worktree preserves branch" late-dirty \
+  "$(git -C "$late_dirty_repo" branch --list --format='%(refname:short)' late-dirty)"
+_assert_eq "late dirty worktree remains" present \
+  "$(if [[ -e "$late_dirty_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
 
 dirty_worktree_repo=$(_clone_remote)
 git -C "$dirty_worktree_repo" switch --quiet -c dirty-work
@@ -1446,11 +1576,57 @@ result=$(
     git cleanup-repo --all --remove-worktrees 2>&1
 )
 _assert_contains "reports dirty linked worktrees without inspecting or removing them" \
-  "preserving local cleanup candidate dirty-work at " "$result"
+  "skipping dirty-work; worktree has uncommitted changes: $dirty_worktree_dir" "$result"
 _assert_not_contains "does not let git worktree remove reject dirty worktrees" \
   "fatal:" "$result"
 _assert_eq "dirty worktree branch remains" \
   "$(printf 'dirty-work\nmain')" "$(_branches "$dirty_worktree_repo")"
+
+# Ignored files are local content even though ordinary porcelain status omits
+# them. Never remove a worktree that contains such files.
+ignored_worktree_repo=$(_clone_remote)
+git -C "$ignored_worktree_repo" switch --quiet -c ignored-work
+_commit_file "$ignored_worktree_repo" .gitignore '*.local' "ignore local files"
+git -C "$ignored_worktree_repo" switch --quiet main
+ignored_worktree_dir=$(_tmpdir)
+rm -rf "$ignored_worktree_dir"
+git -C "$ignored_worktree_repo" worktree add --quiet \
+  "$ignored_worktree_dir" ignored-work
+printf 'private local data\n' >"$ignored_worktree_dir/notes.local"
+ignored_worktree_output=$(git -C "$ignored_worktree_repo" cleanup-repo \
+  --all --remove-worktrees 2>&1)
+_assert_contains "ignored content prevents worktree removal" \
+  "worktree has hidden local content: $ignored_worktree_dir" \
+  "$ignored_worktree_output"
+_assert_eq "ignored content preserves branch" ignored-work \
+  "$(git -C "$ignored_worktree_repo" branch --list --format='%(refname:short)' ignored-work)"
+_assert_eq "ignored content preserves worktree" present \
+  "$(if [[ -e "$ignored_worktree_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
+
+# Index flags can hide modified tracked files from status. Both skip-worktree
+# and assume-unchanged must make automatic worktree removal ineligible.
+for hidden_mode in skip-worktree assume-unchanged; do
+  hidden_worktree_repo=$(_clone_remote)
+  git -C "$hidden_worktree_repo" switch --quiet -c "hidden-$hidden_mode"
+  _commit_file "$hidden_worktree_repo" hidden.txt baseline \
+    "add $hidden_mode fixture"
+  git -C "$hidden_worktree_repo" switch --quiet main
+  hidden_worktree_dir=$(_tmpdir)
+  rm -rf "$hidden_worktree_dir"
+  git -C "$hidden_worktree_repo" worktree add --quiet \
+    "$hidden_worktree_dir" "hidden-$hidden_mode"
+  git -C "$hidden_worktree_dir" update-index "--$hidden_mode" hidden.txt
+  printf 'hidden local edit\n' >"$hidden_worktree_dir/hidden.txt"
+  hidden_worktree_output=$(git -C "$hidden_worktree_repo" cleanup-repo \
+    --all --remove-worktrees 2>&1)
+  _assert_contains "$hidden_mode prevents worktree removal" \
+    "worktree has hidden local content: $hidden_worktree_dir" \
+    "$hidden_worktree_output"
+  _assert_eq "$hidden_mode preserves branch" "hidden-$hidden_mode" \
+    "$(git -C "$hidden_worktree_repo" branch --list --format='%(refname:short)' "hidden-$hidden_mode")"
+  _assert_eq "$hidden_mode preserves worktree" present \
+    "$(if [[ -e "$hidden_worktree_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
+done
 
 corrupt_worktree_repo=$(_clone_remote)
 git -C "$corrupt_worktree_repo" switch --quiet -c corrupt-work
@@ -1466,7 +1642,7 @@ result=$(
     git cleanup-repo --all --remove-worktrees 2>&1
 )
 _assert_contains "reports corrupt linked worktrees without inspecting or removing them" \
-  "preserving local cleanup candidate corrupt-work at " "$result"
+  "skipping corrupt-work; could not inspect worktree operation state: $corrupt_worktree_dir" "$result"
 _assert_not_contains "does not remove corrupt worktrees after failed status" \
   "fatal:" "$result"
 _assert_eq "corrupt worktree branch remains" \

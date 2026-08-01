@@ -20,21 +20,24 @@ done
 
 "$ROOT/support/sync-launcher-bootstrap" --check
 
-if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck -x -P "$ROOT" \
-    "${commands[@]/#/$ROOT/bin/}" \
-    "$ROOT"/completions/*.bash \
-    "$ROOT/lib/git-tools-base.sh" \
-    "$ROOT/lib/git-tools-inventory.sh" \
-    "$ROOT/lib/git-tools-pr.sh" \
-    "$ROOT/install.sh" \
-    "$ROOT/support/sync-launcher-bootstrap" \
-    "$ROOT/test/extras-test" \
-    "$ROOT/test/launcher-bootstrap-test" \
-    "$ROOT/test/lib/test-temp.sh" \
-    "$ROOT/test/test-temp-test" \
-    "${test_files[@]}" \
-    "$ROOT/test/run"
+# Shared CI owns one required inventory lint; local runs still lint by default.
+if [[ "${GIT_TOOLS_SKIP_SHELLCHECK:-0}" != 1 ]] &&
+  command -v shellcheck >/dev/null 2>&1; then
+  shell_files=()
+  while IFS=$'\t' read -r record_type path ||
+    [[ -n "$record_type$path" ]]; do
+    if [[ "$record_type" == program ]]; then
+      shell_files+=("$ROOT/$path")
+    fi
+  done <"$ROOT/.github/shellcheck-files.txt"
+  ((${#shell_files[@]} > 0)) || {
+    printf 'test/run: ShellCheck inventory has no programs\n' >&2
+    exit 1
+  }
+  (
+    cd "$ROOT"
+    shellcheck -x -P SCRIPTDIR "${shell_files[@]}"
+  )
 fi
 
 "$ROOT/test/launcher-bootstrap-test"

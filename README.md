@@ -310,24 +310,23 @@ git branch-audit --drop-merged --yes
 ### `git cleanup-repo`
 
 Resolves the remote's fetch endpoint, fetches the exact default-branch ref, then
-reports stale local branch candidates with their exact OIDs.
+deletes stale local branches whose exact OIDs are proven merged.
 
 ```sh
 git cleanup-repo
 ```
 
-By default the command reports local branches that are already merged into the
+By default the command deletes local branches that are already merged into the
 base branch. This includes squash-, rebase-, and cherry-pick-merged branches:
 patch IDs identify candidate matches, and the exact net tree delta must also be
 present in a pinned base snapshot. A clean squash merge is therefore recognized
 even though its commits are not ancestors of the base, while byte-, mode-, or
-later same-path differences are excluded. Branch and upstream-state enumeration
-must complete before any candidates are reported. No local branch or worktree is
-deleted automatically because an already-resolved checkout cannot be serialized
-portably with ref deletion. Use `--gone` to also report branches whose existing
-upstream-tracking state is gone. The command deliberately does not run configured
-fetch or prune mappings; refresh other remote-tracking state separately when
-needed.
+later same-path differences are excluded. The complete branch and upstream-state
+inventory is validated before the first mutation. Each candidate is rechecked
+before deletion, and the ref is deleted only if it still has the exact proven
+OID. Use `--gone` to also delete branches whose existing upstream-tracking state
+is gone. The command deliberately does not run configured fetch or prune
+mappings; refresh other remote-tracking state separately when needed.
 
 Base updates do not depend on configured fetch refspecs or short ref names. The
 command pins exactly `refs/heads/<base>` from the resolved endpoint, fetches it
@@ -342,15 +341,18 @@ lets Git apply any `insteadOf` rewrite exactly once per operation. Remotes with
 zero or multiple fetch URLs are rejected because there is no single endpoint to
 pin.
 
-Use `--all` to report every local branch except the base branch regardless of
+Use `--all` to delete every local branch except the base branch regardless of
 merge state:
 
 ```sh
 git cleanup-repo --all
 ```
 
-The legacy `--remove-worktrees` option remains accepted for compatibility but
-does not remove worktrees or branches:
+Branches checked out or reserved by another worktree are skipped by default.
+Use `--remove-worktrees` to remove a linked worktree before deleting its branch.
+Only worktrees with no uncommitted, ignored, or index-hidden local content and
+no active rebase/merge/cherry-pick/revert/bisect operation are eligible, and
+removal never uses `--force`:
 
 ```sh
 git cleanup-repo --all --remove-worktrees
@@ -366,7 +368,11 @@ git cleanup-repo --remote upstream
 ```
 
 The command refuses to run with a dirty current worktree or an active
-rebase/merge/cherry-pick/revert.
+rebase/merge/cherry-pick/revert. Git cannot atomically combine worktree
+reservation checks with ref deletion, so do not create, switch, or mutate
+worktrees concurrently with cleanup. The command rechecks observable state and
+uses expected-old-OID ref deletion to preserve a branch that advances during
+cleanup.
 
 ### `git stash-audit`
 

@@ -1,27 +1,27 @@
-.TH GIT-CLEANUP-REPO 1 "2026-06-13" "git-tools" "User Commands"
+.TH GIT-CLEANUP-REPO 1 "2026-07-31" "git-tools" "User Commands"
 .SH NAME
-git-cleanup-repo \- report stale local branch cleanup candidates
+git-cleanup-repo \- delete safely merged local branches
 .SH SYNOPSIS
 .B git cleanup-repo
 .RI [ options ]
 .SH DESCRIPTION
 .B git cleanup-repo
 resolves the remote fetch endpoint, fetches the exact repository default branch
-without updating remote-tracking refs or FETCH_HEAD, then reports stale local
-branch candidates with exact object IDs.
+without updating remote-tracking refs or FETCH_HEAD, then deletes stale local
+branches whose exact object IDs are proven merged.
 .PP
-By default it reports local branches that are already merged into the base
+By default it deletes local branches that are already merged into the base
 branch. This includes squash-, rebase-, and cherry-pick-merged branches: patch
 IDs identify candidate matches, and the exact net tree delta must also be
 present in a pinned base snapshot. A clean squash merge is recognized even
 though its commits are not ancestors of the base, while byte-, mode-, or later
 same-path differences are excluded. Branch and upstream-state enumeration must
-complete before candidates are reported. No local branch or worktree is deleted
-automatically because Git cannot portably serialize ref deletion with an
-already-resolved checkout. It can also report branches whose existing upstream
-tracking state is gone or every local branch except the base branch. The command
-does not execute configured fetch or prune mappings; other remote-tracking state
-must be refreshed separately when needed.
+complete and validate before the first deletion. Each candidate is rechecked,
+and its ref is deleted only if it still has the exact proven object ID. It can
+also delete branches whose existing upstream tracking state is gone or every
+local branch except the base branch. The command does not execute configured
+fetch or prune mappings; other remote-tracking state must be refreshed
+separately when needed.
 .PP
 Base selection does not depend on configured fetch refspecs or short ref names.
 The command fetches exactly
@@ -47,13 +47,15 @@ Remote fetch endpoint to resolve and fetch from. Defaults to
 .BR origin .
 .TP
 .B \-\-gone
-Also report branches whose upstream is gone.
+Also delete branches whose upstream is gone.
 .TP
 .BR \-a ", " \-\-all
-Report all local branches except the base branch.
+Delete all local branches except the base branch.
 .TP
 .B \-\-remove\-worktrees
-Accepted for compatibility; no worktree or branch is removed.
+Remove clean, operation-free linked worktrees for branches selected for
+deletion. Removal never uses
+.BR \-\-force .
 .TP
 .BR \-n ", " \-\-dry\-run
 Print actions without changing anything.
@@ -61,9 +63,11 @@ Print actions without changing anything.
 .BR \-h ", " \-\-help
 Show help.
 .SH SAFETY
-The command refuses to run with a dirty current worktree or active
-rebase, merge, cherry-pick, or revert state. Automatic local branch and
-linked-worktree removal is disabled even with
-.BR \-\-remove\-worktrees ,
-because Git does not provide the serialization needed to preserve an in-flight
-checkout safely.
+The command refuses to run with a dirty current worktree or active rebase,
+merge, cherry-pick, or revert state. A linked worktree is preserved when it has
+uncommitted, ignored, or index-hidden local content, is unreadable, is locked by
+an active operation, or cannot be removed without force. Git cannot atomically
+combine worktree reservation checks with ref deletion, so callers must not
+create, switch, or mutate worktrees concurrently with cleanup. Observable state
+is rechecked, and expected-old-object-ID ref deletion preserves a branch that
+advances during cleanup.

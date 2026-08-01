@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Report stale local Git branch cleanup candidates after PRs have landed.
+# Clean up stale local Git branches after PRs have landed.
 
 set -euo pipefail
 
@@ -23,18 +23,17 @@ _usage() {
   cat <<'EOF'
 Usage: git cleanup-repo [options]
 
-Fetch the exact remote base, update it by pinned OID, then report stale local
-branch candidates with exact OIDs. Patch IDs identify replay candidates, but
-the branch's exact net tree delta must also be present in a pinned base snapshot.
-Incomplete branch inventories abort before reporting. No local branch or
-worktree is deleted automatically.
+Fetch the exact remote base, update it by pinned OID, then delete stale local
+branches whose exact OIDs are proven merged. Patch IDs identify replay
+candidates, but the branch's exact net tree delta must also be present in a
+pinned base snapshot. Incomplete branch inventories abort before deletion.
 
 Options:
   -b, --base <branch>       Base branch to keep and update.
   -r, --remote <name>       Remote endpoint to fetch from (default: origin).
-      --gone                Also report branches whose upstream is gone.
-  -a, --all                 Report all local branches except the base branch.
-      --remove-worktrees    Accepted for compatibility; removes nothing.
+      --gone                Also delete branches whose upstream is gone.
+  -a, --all                 Delete all local branches except the base branch.
+      --remove-worktrees    Remove clean linked worktrees for deleted branches.
   -n, --dry-run             Print actions without changing anything.
   -h, --help                Show this help.
 EOF
@@ -308,10 +307,127 @@ _delete_reason() {
   return 1
 }
 
-_cleanup_branches() {
-  local records branch_ref branch branch_oid upstream_track reason
-  local candidates=0 skipped=0
+_worktree_dirty_state() {
+  local path="$1" entry ignored index_state output
 
+  if ! output=$(GIT_OPTIONAL_LOCKS=0 \
+    gt_git_without_local_env -C "$path" status --porcelain 2>/dev/null); then
+    printf 'unknown\n'
+  elif [[ -n "$output" ]]; then
+    printf 'dirty\n'
+  elif ! ignored=$(GIT_OPTIONAL_LOCKS=0 \
+    gt_git_without_local_env -C "$path" ls-files \
+    --others --ignored --exclude-standard 2>/dev/null); then
+    printf 'unknown\n'
+  elif [[ -n "$ignored" ]]; then
+    printf 'hidden\n'
+  elif ! index_state=$(GIT_OPTIONAL_LOCKS=0 \
+    gt_git_without_local_env -C "$path" ls-files -v 2>/dev/null); then
+    printf 'unknown\n'
+  else
+    while IFS= read -r entry; do
+      case "$entry" in
+        [a-z]' '* | S' '*)
+          printf 'hidden\n'
+          return 0
+          ;;
+      esac
+    done <<<"$index_state"
+    printf 'clean\n'
+  fi
+}
+
+_branch_still_at() {
+  local branch="$1" expected_oid="$2" status=0
+
+  gt_find_ref_commit "refs/heads/$branch" || status=$?
+  [[ "$status" == 0 && "$GT_REF_OID" == "$expected_oid" ]]
+}
+
+_remove_branch_worktree_if_needed() {
+  local branch="$1" branch_oid="$2" operation path state
+
+  if ! gt_find_worktree_reserving_branch "$branch"; then
+    _say "skipping $branch; could not inspect worktree reservations"
+    return 1
+  fi
+  path=$GT_WORKTREE_PATH
+  [[ -n "$path" ]] || return 0
+
+  if [[ "$_remove_worktrees" != 1 ]]; then
+    _say "skipping $branch; checked out in worktree $path"
+    return 1
+  fi
+
+  if ! operation=$(gt_worktree_operation "$path"); then
+    _say "skipping $branch; could not inspect worktree operation state: $path"
+    return 1
+  fi
+  if [[ -n "$operation" ]]; then
+    _say "skipping $branch; worktree has active $operation: $path"
+    return 1
+  fi
+
+  state=$(_worktree_dirty_state "$path")
+  case "$state" in
+    clean) ;;
+    dirty)
+      _say "skipping $branch; worktree has uncommitted changes: $path"
+      return 1
+      ;;
+    hidden)
+      _say "skipping $branch; worktree has hidden local content: $path"
+      return 1
+      ;;
+    *)
+      _say "skipping $branch; could not inspect worktree status: $path"
+      return 1
+      ;;
+  esac
+
+  if ! _branch_still_at "$branch" "$branch_oid"; then
+    _say "skipping $branch; branch changed during cleanup"
+    return 1
+  fi
+  if ! _run git worktree remove "$path"; then
+    _say "skipping $branch; worktree could not be removed safely: $path"
+    return 1
+  fi
+}
+
+_delete_branch() {
+  local branch="$1" branch_oid="$2" reason="$3"
+
+  if ! gt_find_worktree_reserving_branch "$branch"; then
+    _say "skipping $branch; could not recheck worktree reservations"
+    return 1
+  fi
+  if [[ -n "$GT_WORKTREE_PATH" && "$_dry_run" != 1 ]]; then
+    _say "skipping $branch; branch became reserved by worktree $GT_WORKTREE_PATH"
+    return 1
+  fi
+  if ! _branch_still_at "$branch" "$branch_oid"; then
+    _say "skipping $branch; branch changed during cleanup"
+    return 1
+  fi
+
+  if [[ "$_dry_run" == 1 ]]; then
+    _say "would delete $branch at $branch_oid ($reason)"
+  else
+    _say "deleting $branch ($reason)"
+  fi
+  if ! _run git update-ref -d "refs/heads/$branch" "$branch_oid"; then
+    _say "skipping $branch; exact ref deletion failed"
+    return 1
+  fi
+}
+
+_inventory_branches() {
+  local records branch_ref branch branch_oid upstream_track status=0
+
+  _branches=()
+  _branch_oids=()
+  _upstream_tracks=()
   records=$(git for-each-ref \
     --format='%(refname)%09%(objectname)%09%(upstream:track)' refs/heads) ||
     _die "could not enumerate branches"
@@ -322,7 +438,28 @@ _cleanup_branches() {
       refs/heads/*) branch=${branch_ref#refs/heads/} ;;
       *) _die "invalid branch inventory record: $branch_ref" ;;
     esac
+    _validate_native_oid "$branch_oid" ||
+      _die "invalid branch object ID in inventory: $branch_ref"
+    status=0
+    gt_find_ref_commit "$branch_ref" || status=$?
+    [[ "$status" == 0 && "$GT_REF_OID" == "$branch_oid" ]] ||
+      _die "branch changed while inventory was collected: $branch_ref"
     [[ "$branch" != "$_base" ]] || continue
+    _branches+=("$branch")
+    _branch_oids+=("$branch_oid")
+    _upstream_tracks+=("$upstream_track")
+  done <<<"$records"
+}
+
+_cleanup_branches() {
+  local branch branch_oid upstream_track reason index
+  local candidates=0 skipped=0
+
+  _inventory_branches
+  for index in "${!_branches[@]}"; do
+    branch=${_branches[$index]}
+    branch_oid=${_branch_oids[$index]}
+    upstream_track=${_upstream_tracks[$index]}
 
     reason=$(_delete_reason "$branch_oid" "$upstream_track") || {
       _say "keeping $branch; not merged and upstream still exists"
@@ -330,11 +467,22 @@ _cleanup_branches() {
       continue
     }
 
-    _say "preserving local cleanup candidate $branch at $branch_oid ($reason); delete it manually after verifying no checkout is in flight"
+    if ! _remove_branch_worktree_if_needed "$branch" "$branch_oid"; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    if ! _delete_branch "$branch" "$branch_oid" "$reason"; then
+      skipped=$((skipped + 1))
+      continue
+    fi
     candidates=$((candidates + 1))
-  done <<<"$records"
+  done
 
-  _say "done; reported $candidates local cleanup candidate(s), skipped $skipped; no local branches deleted"
+  if [[ "$_dry_run" == 1 ]]; then
+    _say "done; would delete $candidates local branch(es), skipped $skipped"
+  else
+    _say "done; deleted $candidates local branch(es), skipped $skipped"
+  fi
 }
 
 _parse_args() {
@@ -343,6 +491,7 @@ _parse_args() {
   _all=0
   _gone=0
   _dry_run=0
+  _remove_worktrees=0
 
   while (($#)); do
     case "$1" in
@@ -379,6 +528,7 @@ _parse_args() {
         shift
         ;;
       --remove-worktrees)
+        _remove_worktrees=1
         shift
         ;;
       -n | --dry-run)

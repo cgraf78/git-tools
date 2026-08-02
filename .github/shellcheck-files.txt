@@ -54,4 +54,5 @@ program	test/git-worktree-audit-test
 program	test/launcher-bootstrap-test
 program	test/lib/test-temp.sh
 program	test/run
+program	test/runner-test
 program	test/test-temp-test

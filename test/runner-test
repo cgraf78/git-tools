@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+failures=0
+old_umask=$(umask)
+umask 077
+sandbox=$(mktemp -d "${TMPDIR:-/tmp}/git-tools-runner-test.XXXXXX") || {
+  umask "$old_umask"
+  exit 1
+}
+umask "$old_umask"
+background_runner_pid=""
+
+cleanup_sandbox() {
+  if [[ -n "$background_runner_pid" ]]; then
+    kill -TERM "$background_runner_pid" 2>/dev/null || true
+    wait "$background_runner_pid" 2>/dev/null || true
+  fi
+  rm -rf -- "$sandbox"
+}
+
+signal_cleanup_sandbox() {
+  local status="$1"
+
+  trap - EXIT HUP INT TERM
+  cleanup_sandbox
+  exit "$status"
+}
+
+trap cleanup_sandbox EXIT
+trap 'signal_cleanup_sandbox 129' HUP
+trap 'signal_cleanup_sandbox 130' INT
+trap 'signal_cleanup_sandbox 143' TERM
+
+pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  failures=$((failures + 1))
+}
+
+process_is_live() {
+  local pid="$1" state stat_line
+
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [[ -r "/proc/$pid/stat" ]]; then
+    stat_line=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    stat_line=${stat_line##*) }
+    state=${stat_line%% *}
+  else
+    state=$(ps -o stat= -p "$pid" 2>/dev/null) || return 1
+    state=${state//[[:space:]]/}
+  fi
+  [[ "$state" != Z* && "$state" != X* ]]
+}
+
+fixture="$sandbox/repo"
+runner_tmp="$sandbox/tmp"
+mkdir -p "$fixture/lib" "$fixture/support" "$fixture/test" \
+  "$fixture/.github" "$runner_tmp"
+cp "$ROOT/test/run" "$fixture/test/run"
+
+cat >"$fixture/lib/git-tools-inventory.sh" <<'EOF'
+git_tools_validate_commands() { :; }
+git_tools_commands() { printf '%s\n' one two; }
+EOF
+cat >"$fixture/support/sync-launcher-bootstrap" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat >"$fixture/test/suite" <<'EOF'
+#!/usr/bin/env bash
+set -u
+name=${0##*/}
+name=${name%-test}
+: >"$RUNNER_STATE/$name.started"
+
+if [[ "${HANG_SUITE:-}" == "$name" ]]; then
+  printf '%s\n' "$$" >"$RUNNER_STATE/$name.pid"
+  trap ': >"$RUNNER_STATE/$name.terminated"; exit 143' TERM
+  sleep 1000 &
+  descendant_pid=$!
+  printf '%s\n' "$descendant_pid" >"$RUNNER_STATE/$name.descendant-pid"
+  : >"$RUNNER_STATE/$name.ready"
+  wait "$descendant_pid"
+fi
+if [[ "${ABORT_SUITE:-}" == "$name" ]]; then
+  printf '%s\n' "$$" >"$RUNNER_STATE/$name.pid"
+  sleep 1000 &
+  descendant_pid=$!
+  printf '%s\n' "$descendant_pid" >"$RUNNER_STATE/$name.descendant-pid"
+  kill -KILL "$$"
+fi
+
+if [[ "$name" == runner || "$name" == launcher-bootstrap ]]; then
+  count=0
+  while [[ ! -e "$RUNNER_STATE/runner.started" ||
+    ! -e "$RUNNER_STATE/launcher-bootstrap.started" ]]; do
+    sleep 0.02
+    count=$((count + 1))
+    if ((count >= 100)); then
+      printf '%s did not overlap\n' "$name"
+      exit 9
+    fi
+  done
+fi
+
+case "$name" in
+  runner) sleep 0.08 ;;
+  launcher-bootstrap) sleep 0.01 ;;
+esac
+printf '%s-output\n' "$name"
+[[ "${FAIL_SUITE:-}" != "$name" ]] || exit 7
+EOF
+chmod +x "$fixture/support/sync-launcher-bootstrap" "$fixture/test/run" \
+  "$fixture/test/suite"
+for suite in runner launcher-bootstrap extras test-temp one two; do
+  cp "$fixture/test/suite" "$fixture/test/$suite-test"
+done
+
+state="$sandbox/state"
+output="$sandbox/output"
+mkdir "$state"
+if TMPDIR="$runner_tmp" RUNNER_STATE="$state" GIT_TOOLS_SKIP_SHELLCHECK=1 \
+  GIT_TOOLS_TEST_JOBS=2 "$fixture/test/run" >"$output" 2>&1; then
+  if [[ -z "$(find "$runner_tmp" -name 'git-tools-run.*' -print)" ]]; then
+    pass "runner overlaps suites and removes private logs"
+  else
+    fail "runner overlaps suites and removes private logs"
+  fi
+else
+  fail "runner overlaps suites and removes private logs"
+fi
+
+previous=0
+ordered=1
+for suite in runner launcher-bootstrap extras test-temp one two; do
+  line=$(grep -n -F -x "$suite-output" "$output" | cut -d: -f1)
+  if [[ -z "$line" || "$line" -le "$previous" ]]; then
+    ordered=0
+    break
+  fi
+  previous=$line
+done
+if ((ordered)); then
+  pass "runner replays suite output in stable order"
+else
+  fail "runner replays suite output in stable order"
+fi
+
+rm -rf "$state"
+mkdir "$state"
+run_status=0
+TMPDIR="$runner_tmp" RUNNER_STATE="$state" FAIL_SUITE=one \
+  GIT_TOOLS_SKIP_SHELLCHECK=1 \
+  GIT_TOOLS_TEST_JOBS=2 "$fixture/test/run" >"$output" 2>&1 ||
+  run_status=$?
+if [[ "$run_status" -eq 7 ]] && grep -F -q 'one-output' "$output" &&
+  grep -F -q 'two-output' "$output"; then
+  pass "runner preserves the first failure after draining every suite"
+else
+  fail "runner preserves the first failure after draining every suite"
+fi
+
+rm -rf "$state"
+mkdir "$state"
+TMPDIR="$runner_tmp" RUNNER_STATE="$state" ABORT_SUITE=one \
+  GIT_TOOLS_SKIP_SHELLCHECK=1 GIT_TOOLS_TEST_JOBS=6 \
+  "$fixture/test/run" >"$output" 2>&1 &
+runner_pid=$!
+background_runner_pid=$runner_pid
+count=0
+while kill -0 "$runner_pid" 2>/dev/null && ((count < 500)); do
+  sleep 0.02
+  count=$((count + 1))
+done
+run_status=0
+if kill -0 "$runner_pid" 2>/dev/null; then
+  kill -TERM "$runner_pid" 2>/dev/null || true
+  wait "$runner_pid" || run_status=$?
+else
+  wait "$runner_pid" || run_status=$?
+fi
+background_runner_pid=""
+suite_pid=$(cat "$state/one.pid" 2>/dev/null || true)
+descendant_pid=$(cat "$state/one.descendant-pid" 2>/dev/null || true)
+if [[ "$count" -lt 500 && "$run_status" -eq 137 && -n "$suite_pid" &&
+  -n "$descendant_pid" ]] && grep -F -q 'two-output' "$output" &&
+  ! process_is_live "$suite_pid" &&
+  ! process_is_live "$descendant_pid"; then
+  pass "runner drains descendants when a suite is killed"
+else
+  fail "runner drains descendants when a suite is killed"
+  [[ -z "$suite_pid" ]] || kill -KILL "$suite_pid" 2>/dev/null || true
+  [[ -z "$descendant_pid" ]] || kill -KILL "$descendant_pid" 2>/dev/null || true
+fi
+
+rm -rf "$state"
+mkdir "$state"
+for invalid_jobs in invalid 0 00 08; do
+  run_status=0
+  TMPDIR="$runner_tmp" RUNNER_STATE="$state" GIT_TOOLS_SKIP_SHELLCHECK=1 \
+    GIT_TOOLS_TEST_JOBS="$invalid_jobs" \
+    "$fixture/test/run" >"$output" 2>&1 || run_status=$?
+  if [[ "$run_status" -ne 0 ]] &&
+    grep -F -q 'GIT_TOOLS_TEST_JOBS' "$output" &&
+    [[ -z "$(find "$state" -type f -print)" ]]; then
+    pass "runner rejects worker count $invalid_jobs before tests"
+  else
+    fail "runner rejects worker count $invalid_jobs before tests"
+  fi
+done
+
+rm -rf "$state"
+mkdir "$state"
+TMPDIR="$runner_tmp" RUNNER_STATE="$state" HANG_SUITE=runner \
+  GIT_TOOLS_SKIP_SHELLCHECK=1 \
+  GIT_TOOLS_TEST_JOBS=2 "$fixture/test/run" >"$output" 2>&1 &
+runner_pid=$!
+background_runner_pid=$runner_pid
+count=0
+while [[ ! -e "$state/runner.ready" && "$count" -lt 500 ]]; do
+  sleep 0.02
+  count=$((count + 1))
+done
+suite_pid=$(cat "$state/runner.pid" 2>/dev/null || true)
+descendant_pid=$(cat "$state/runner.descendant-pid" 2>/dev/null || true)
+kill -TERM "$runner_pid" 2>/dev/null || true
+run_status=0
+wait "$runner_pid" || run_status=$?
+background_runner_pid=""
+if [[ "$run_status" -eq 143 && -n "$suite_pid" && -n "$descendant_pid" &&
+  -e "$state/runner.terminated" ]] &&
+  ! process_is_live "$suite_pid" &&
+  ! process_is_live "$descendant_pid" &&
+  [[ -z "$(find "$runner_tmp" -name 'git-tools-run.*' -print)" ]]; then
+  pass "runner termination drains processes and private logs"
+else
+  fail "runner termination drains processes and private logs"
+  [[ -z "$suite_pid" ]] || kill -KILL "$suite_pid" 2>/dev/null || true
+  [[ -z "$descendant_pid" ]] || kill -KILL "$descendant_pid" 2>/dev/null || true
+fi
+
+if ((failures > 0)); then
+  printf '%s failure(s)\n' "$failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

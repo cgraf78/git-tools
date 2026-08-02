@@ -13,7 +13,12 @@ commands=()
 while IFS= read -r command; do
   commands+=("$command")
 done < <(git_tools_commands "$ROOT")
-test_files=()
+test_files=(
+  "$ROOT/test/runner-test"
+  "$ROOT/test/launcher-bootstrap-test"
+  "$ROOT/test/extras-test"
+  "$ROOT/test/test-temp-test"
+)
 for command in "${commands[@]}"; do
   test_files+=("$ROOT/test/$command-test")
 done
@@ -40,9 +45,138 @@ if [[ "${GIT_TOOLS_SKIP_SHELLCHECK:-0}" != 1 ]] &&
   )
 fi
 
-"$ROOT/test/launcher-bootstrap-test"
-"$ROOT/test/extras-test"
-"$ROOT/test/test-temp-test"
-for command in "${commands[@]}"; do
-  "$ROOT/test/$command-test"
+jobs=${GIT_TOOLS_TEST_JOBS:-4}
+case "$jobs" in
+  "" | *[!0-9]* | 0*)
+    printf 'test/run: GIT_TOOLS_TEST_JOBS must be a positive integer\n' >&2
+    exit 2
+    ;;
+esac
+
+pids=()
+logs=()
+statuses=()
+run_root=""
+
+terminate_suite_group() {
+  local group="$1" count=0
+
+  case "$group" in
+    "" | *[!0-9]*) return 0 ;;
+  esac
+  kill -TERM -- "-$group" 2>/dev/null || return 0
+  while kill -0 -- "-$group" 2>/dev/null && ((count < 250)); do
+    sleep 0.02
+    count=$((count + 1))
+  done
+  if kill -0 -- "-$group" 2>/dev/null; then
+    kill -KILL -- "-$group" 2>/dev/null || true
+    count=0
+    while kill -0 -- "-$group" 2>/dev/null && ((count < 100)); do
+      sleep 0.02
+      count=$((count + 1))
+    done
+  fi
+}
+
+# shellcheck disable=SC2329 # invoked by the EXIT trap.
+cleanup() {
+  local status=$? pid index
+
+  trap - EXIT HUP INT TERM
+  if ((${#pids[@]} > 0)); then
+    for index in "${!pids[@]}"; do
+      if [[ ! -e "${statuses[$index]}" ]]; then
+        terminate_suite_group "${pids[$index]}"
+      fi
+    done
+    for pid in "${pids[@]}"; do
+      wait "$pid" 2>/dev/null || true
+    done
+  fi
+  [[ -z "$run_root" ]] || rm -rf -- "$run_root"
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+old_umask=$(umask)
+umask 077
+run_root=$(mktemp -d "${TMPDIR:-/tmp}/git-tools-run.XXXXXX") || {
+  umask "$old_umask"
+  exit 1
+}
+umask "$old_umask"
+
+finalize_worker() {
+  local index="$1" wait_for_suite="$2" status=0 status_tmp
+
+  [[ ! -e "${statuses[$index]}" ]] || return 0
+  if [[ "$wait_for_suite" == 1 ]]; then
+    wait "${pids[$index]}" || status=$?
+  elif kill -0 "${pids[$index]}" 2>/dev/null; then
+    return 1
+  else
+    wait "${pids[$index]}" || status=$?
+  fi
+  # A failed or signaled suite may have left descendants behind. Successful
+  # suites retain their existing responsibility to clean up before returning.
+  [[ "$status" == 0 ]] || terminate_suite_group "${pids[$index]}"
+  status_tmp="${statuses[$index]}.tmp"
+  printf '%s\n' "$status" >"$status_tmp"
+  mv -f -- "$status_tmp" "${statuses[$index]}"
+}
+
+for index in "${!test_files[@]}"; do
+  while :; do
+    active=0
+    if ((${#statuses[@]} > 0)); then
+      for prior in "${!statuses[@]}"; do
+        if [[ ! -e "${statuses[$prior]}" ]]; then
+          if ! finalize_worker "$prior" 0; then
+            active=$((active + 1))
+          fi
+        fi
+      done
+    fi
+    if ((active < jobs)); then
+      break
+    fi
+    sleep 0.02
+  done
+
+  log="$run_root/$index.log"
+  status_file="$run_root/$index.status"
+  logs+=("$log")
+  statuses+=("$status_file")
+  # Monitor mode gives every background suite its own process group, whose ID
+  # is the suite PID recorded here by the runner itself.
+  set -m
+  "${test_files[$index]}" >"$log" 2>&1 &
+  pids+=("$!")
+  set +m
 done
+
+if ((${#pids[@]} > 0)); then
+  for index in "${!pids[@]}"; do
+    finalize_worker "$index" 1 || true
+  done
+fi
+pids=()
+
+failed=0
+for index in "${!test_files[@]}"; do
+  cat "${logs[$index]}"
+  status=$(cat "${statuses[$index]}" 2>/dev/null || printf '1\n')
+  case "$status" in
+    "" | *[!0-9]*) status=1 ;;
+  esac
+  if [[ "$status" != 0 && "$failed" == 0 ]]; then
+    failed=$status
+  fi
+done
+
+exit "$failed"

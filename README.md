@@ -520,6 +520,9 @@ Run the complete local test suite:
 test/run
 ```
 
+The runner uses four workers by default. Set `GIT_TOOLS_TEST_JOBS` to a
+positive integer to tune concurrency, or to `1` for serial execution.
+
 Or run the focused command test directly:
 
 ```sh

@@ -1,0 +1,68 @@
+.TH GIT-PR-SUBMIT 1 "2026-08-10" "git-tools" "User Commands"
+.SH NAME
+git-pr-submit \- submit default-branch commits through a pull request
+.SH SYNOPSIS
+.B git pr-submit
+.SH DESCRIPTION
+.B git pr-submit
+turns local commits made directly on the repository default branch into a
+GitHub pull request, queues protected squash auto-merge, and returns the
+checkout to the default branch.
+.PP
+The worktree must be clean, the current branch must be the repository default,
+and the exact remote default-branch commit must be an ancestor of the local
+head. Behind or divergent branches are rejected rather than rebased
+automatically because conflict resolution must remain an explicit user action.
+.PP
+The command snapshots and fetches the exact remote default-branch ref through a
+URL validated against the current GitHub repository. It creates a deterministic
+.B pr/<short-oid>
+branch at the submitted head before atomically restoring the local default
+branch with an expected-old-object check. This ordering ensures every later
+failure leaves the submitted commits reachable on a named branch.
+.PP
+For one commit, its subject is the pull request title and its body is the pull
+request description. For two or more commits, the Git editor is opened before
+any branch is changed. The buffer contains all full commit messages in
+chronological order. Its first edited line becomes the title and its remainder
+becomes the body. A failed editor, unchanged normalized content, or an empty
+title cancels without moving refs or creating a pull request.
+.PP
+Pull request creation delegates to
+.BR git-pr-open (1),
+which validates the push target, pushes the exact head object, and verifies the
+created pull request topology. Auto-merge is requested with the same immutable
+head object ID and never uses administrator bypasses, so branch protection,
+required checks, and required reviews remain authoritative.
+.PP
+When repository auto-merge is unavailable, including on a plan-limited private
+repository, creating the pull request remains a successful submission and a
+diagnostic identifies the required manual landing.
+If GitHub rejects auto-merge after creating the pull request, the command prints
+the pull request URL, returns to the default branch, and exits nonzero. If pull
+request creation itself fails, the generated branch remains checked out for
+inspection or a manual
+.B git pr-open
+retry.
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.SH EXIT STATUS
+.TP
+.B 0
+The pull request was created. Auto-merge was queued when the repository allows
+it.
+.TP
+.B 1
+Repository inspection, ref movement, pull request creation, auto-merge, or
+checkout recovery failed. Diagnostics distinguish failures that occur after a
+branch or pull request has already been preserved.
+.TP
+.B 2
+Usage or local repository state is unsuitable for submission.
+.SH SEE ALSO
+.BR git-pr-open (1),
+.BR git-pr-checks (1),
+.BR git-pr-land (1),
+.BR git-cleanup-repo (1)

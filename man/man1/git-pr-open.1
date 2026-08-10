@@ -22,6 +22,10 @@ refs/heads/base source is fetched without named-remote refspecs or tags. The
 feature push target is resolved independently from branch push configuration;
 fork heads are qualified as owner:branch.
 .PP
+OpenSSH Host aliases are accepted when their effective hostname matches the
+configured repository host. Git SSH command and variant overrides are rejected
+because a plain OpenSSH expansion cannot prove where those transports will go.
+.PP
 The feature branch is pushed by immutable object ID through the captured
 validated URL and the resulting remote object ID is verified. Upstream tracking
 is installed locally only after the named remote is revalidated against that
@@ -33,6 +37,13 @@ the returned pull request is queried through structured output and must match
 the requested repository, head and base refs, head repository,
 cross-repository state, and exact head object ID. If a server-side race creates
 an inconsistent pull request, the command reports its URL and exits nonzero.
+.PP
+Composition callers can require the current branch commit and normalized
+checkout identity with
+.B --expect-head
+and
+.BR --expect-repo .
+Mismatches stop before the immutable feature push.
 .PP
 Credential-bearing HTTP URLs, query or fragment suffixes, unsafe git-config key
 bytes, and invalid GitHub owner or repository components are rejected before
@@ -55,6 +66,14 @@ Base branch. Defaults to the repository default branch.
 .TP
 .BI "\-H, \-\-head " branch
 Head branch name for GitHub. Defaults to the current branch.
+.TP
+.BI "\-\-expect-head " oid
+Require the current branch to resolve to this full commit object ID before
+pushing.
+.TP
+.BI "\-\-expect-repo " host/owner/repository
+Require the checkout to resolve to this normalized GitHub repository identity
+before pushing.
 .TP
 .BR \-d ", " \-\-draft
 Create a draft pull request.

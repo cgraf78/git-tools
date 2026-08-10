@@ -10,6 +10,8 @@ complete -c git-pr-open -s b -l body -d "Pull request body" -r
 complete -c git-pr-open -s F -l body-file -d "Read pull request body from file" -r
 complete -c git-pr-open -s B -l base -d "Base branch" -a "(__git_pr_open_refs)"
 complete -c git-pr-open -s H -l head -d "Head branch name for GitHub" -a "(__git_pr_open_refs)"
+complete -c git-pr-open -l expect-head -d "Require current branch commit" -r
+complete -c git-pr-open -l expect-repo -d "Require checkout repository identity" -r
 complete -c git-pr-open -s d -l draft -d "Create a draft pull request"
 complete -c git-pr-open -l fill -d "Use commit info for title and body"
 complete -c git-pr-open -l fill-first -d "Use first commit info for title and body"

@@ -165,6 +165,66 @@ gt_github_repo_identity_from_url() {
   printf '%s/%s\n' "$host" "$normalized" | LC_ALL=C tr '[:upper:]' '[:lower:]'
 }
 
+# @brief Normalize the repository identity reached by one Git transport URL.
+# HTTPS hosts are already explicit. SSH URLs may name a Host alias, so consult
+# OpenSSH's effective configuration and compare the hostname the transport will
+# actually use without hard-coding any machine-specific alias names.
+gt_github_repo_transport_identity_from_url() {
+  local url="$1" identity rest authority ssh_target output key value extra
+  local config_status
+  local effective_host="" effective_identity hostname_count=0
+
+  identity=$(gt_github_repo_identity_from_url "$url") || return 1
+  case "$url" in
+    http://* | https://*)
+      printf '%s\n' "$identity"
+      return 0
+      ;;
+    ssh://*)
+      rest=${url#ssh://}
+      authority=${rest%%/*}
+      ssh_target=$authority
+      ;;
+    *@*:*)
+      authority=${url%%:*}
+      ssh_target=$authority
+      ;;
+    *) return 1 ;;
+  esac
+
+  # Git can replace OpenSSH, or change the argument contract Git uses to invoke
+  # it, through either environment or repository configuration. In those cases
+  # a plain `ssh -G` probe does not prove where the later push will go. Detect
+  # presence rather than non-empty values because even an explicitly empty
+  # override changes Git's configuration inputs and should fail closed.
+  [[ "${GIT_SSH_COMMAND+x}" != x ]] || return 1
+  [[ "${GIT_SSH+x}" != x ]] || return 1
+  [[ "${GIT_SSH_VARIANT+x}" != x ]] || return 1
+  config_status=0
+  git config --get core.sshCommand >/dev/null 2>&1 || config_status=$?
+  [[ "$config_status" == 1 ]] || return 1
+  config_status=0
+  git config --get ssh.variant >/dev/null 2>&1 || config_status=$?
+  [[ "$config_status" == 1 ]] || return 1
+
+  # `ssh -G` is a local configuration expansion; it makes no network
+  # connection. Preserve the URL username because OpenSSH `Match user` rules can
+  # select a different effective hostname. Require exactly one simple hostname
+  # so malformed output fails closed rather than weakening routing checks.
+  output=$(ssh -G -- "$ssh_target" 2>/dev/null) || return 1
+  while IFS=$' \t' read -r key value extra; do
+    [[ "$key" == hostname ]] || continue
+    [[ -n "$value" && -z "$extra" ]] || return 1
+    hostname_count=$((hostname_count + 1))
+    effective_host=$value
+  done <<<"$output"
+  [[ "$hostname_count" == 1 ]] || return 1
+
+  effective_identity=$(gt_github_repo_identity_from_url \
+    "https://$effective_host/${identity#*/}.git") || return 1
+  printf '%s\n' "$effective_identity"
+}
+
 # @brief Normalize a structured GitHub nameWithOwner value.
 gt_github_name_with_owner() {
   local name="$1" owner repo
@@ -278,8 +338,11 @@ gt_load_current_repo_default_branch() {
 
   [[ -z "${GT_CURRENT_REPO_DEFAULT_BRANCH:-}" ]] || return 0
   gt_load_current_repo_identity || return 1
+  # `gh repo view` accepts its repository as a positional argument. Keep the
+  # explicit verified identity instead of relying on cwd inference, while using
+  # the real CLI contract rather than a test-only `--repo` spelling.
   output=$(GH_REPO="$GT_CURRENT_REPO_SPEC" GH_HOST="$GT_CURRENT_REPO_HOST" \
-    gh repo view --repo "$GT_CURRENT_REPO_SPEC" \
+    gh repo view "$GT_CURRENT_REPO_SPEC" \
     --json defaultBranchRef \
     --jq '.defaultBranchRef.name // ""') || return 1
   [[ -n "$output" && "$output" != *$'\n'* ]] || return 1
@@ -437,7 +500,7 @@ gt_find_current_repo_fetch_remote() {
     urls=$(git remote get-url --all "$remote" 2>/dev/null) || urls_rc=$?
     [[ "$urls_rc" == 0 ]] || return 2
     [[ -n "$urls" && "$urls" != *$'\n'* ]] || continue
-    identity=$(gt_github_repo_identity_from_url "$urls") || continue
+    identity=$(gt_github_repo_transport_identity_from_url "$urls") || continue
     [[ "$identity" == "$GT_CURRENT_REPO_IDENTITY" ]] || continue
     matches=$((matches + 1))
     match=$remote
@@ -489,10 +552,12 @@ gt_find_branch_push_remote() {
     fi
     [[ "$status" == 0 ]] || return 2
     [[ -n "$configured" && "$configured" != *$'\n'* ]] || continue
-    configured_identity=$(gt_github_repo_identity_from_url "$configured") || continue
+    configured_identity=$(gt_github_repo_transport_identity_from_url \
+      "$configured") || continue
     expanded=$(git remote get-url --push --all "$remote" 2>/dev/null) || return 2
     [[ -n "$expanded" && "$expanded" != *$'\n'* ]] || continue
-    expanded_identity=$(gt_github_repo_identity_from_url "$expanded") || continue
+    expanded_identity=$(gt_github_repo_transport_identity_from_url \
+      "$expanded") || continue
     [[ "$configured_identity" == "$expanded_identity" ]] || continue
     matches=$((matches + 1))
     candidate=$remote
@@ -539,7 +604,8 @@ gt_find_pr_head_remote() {
       return 2
     }
     [[ -n "$configured" && "$configured" != *$'\n'* ]] || continue
-    identity=$(gt_github_repo_identity_from_url "$configured") || continue
+    identity=$(gt_github_repo_transport_identity_from_url "$configured") ||
+      continue
     [[ "$identity" == "$expected" ]] || continue
 
     expanded_rc=0
@@ -547,7 +613,8 @@ gt_find_pr_head_remote() {
       expanded_rc=$?
     [[ "$expanded_rc" == 0 ]] || return 2
     [[ -n "$expanded" && "$expanded" != *$'\n'* ]] || continue
-    identity=$(gt_github_repo_identity_from_url "$expanded") || continue
+    identity=$(gt_github_repo_transport_identity_from_url "$expanded") ||
+      continue
     [[ "$identity" == "$expected" ]] || continue
     matches=$((matches + 1))
     if [[ -z "$match" || "$remote" == "$preferred" ]]; then

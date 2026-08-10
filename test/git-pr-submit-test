@@ -1,0 +1,854 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+# shellcheck source=test/lib/test-temp.sh
+. "$ROOT/test/lib/test-temp.sh"
+gt_test_temp_init || exit 1
+_tmpdir() { gt_test_temp_dir; }
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_contains() {
+  local name="$1" needle="$2" haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_assert_eq() {
+  local name="$1" expected="$2" actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %q\n' "$expected" >&2
+    printf '  actual:   %q\n' "$actual" >&2
+  fi
+}
+
+_assert_not_contains() {
+  local name="$1" needle="$2" haystack="$3"
+
+  if [[ "$haystack" != *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output not to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_assert_ref_missing() {
+  local name="$1" repo="$2" ref="$3"
+
+  if git -C "$repo" show-ref --verify --quiet "$ref"; then
+    _fail "$name"
+    printf '  unexpected ref: %s\n' "$ref" >&2
+  else
+    _pass "$name"
+  fi
+}
+
+_git_remote_repo() {
+  local remote="$1" seed="$2"
+
+  git init -q --bare --initial-branch=main "$remote"
+  git init -q --initial-branch=main "$seed"
+  git -C "$seed" config user.email "test@test.com"
+  git -C "$seed" config user.name "Test"
+  git -C "$seed" config core.hooksPath /dev/null
+  printf 'base\n' >"$seed/README.md"
+  git -C "$seed" add README.md
+  git -C "$seed" commit -m base >/dev/null
+  git -C "$seed" remote add origin "$remote"
+  git -C "$seed" push -u origin main >/dev/null 2>&1
+}
+
+_clone_main_repo() {
+  local remote="$1" repo="$2"
+
+  git clone -q "$remote" "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+  git -C "$repo" config "url.$remote.insteadOf" \
+    https://github.test/example/repo.git
+  git -C "$repo" remote set-url origin \
+    https://github.test/example/repo.git
+}
+
+_write_command_stubs() {
+  local bin="$1"
+
+  # Keep git-pr-submit and git-pr-open real in every test. The gh stub supplies
+  # deterministic server records, while the narrow Git wrapper exposes raw
+  # configured URLs before delegating all graph, ref, fetch, and push behavior
+  # to real Git. This makes the recovery assertions about actual repositories,
+  # not mocked shell call sequences.
+  cat >"$bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf 'repo=%s host=%s %s\n' "${GH_REPO:-}" "${GH_HOST:-}" "$*" \
+  >>"${GH_LOG:?}"
+
+if [[ "$1 $2" == "auth status" ]]; then
+  exit 0
+fi
+
+if [[ "$1 $2" == "repo view" ]]; then
+  if [[ "$*" == *"--json defaultBranchRef"* ]]; then
+    printf 'main\n'
+  else
+    configured=$(/usr/bin/git config --get remote.origin.url 2>/dev/null || true)
+    if [[ "$configured" == *foreign/repo* ]]; then
+      printf 'foreign/repo\thttps://github.test/foreign/repo\n'
+    else
+      printf 'example/repo\thttps://github.test/example/repo\n'
+    fi
+  fi
+  exit 0
+fi
+
+if [[ "$1" == api ]]; then
+  printf '%s\t%s\n' "${GH_AUTO_MERGE_ALLOWED:-true}" \
+    "${GH_REPO_VISIBILITY:-public}"
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr create" ]]; then
+  # Failure injection verifies that the wrapper preserves the submitted commit
+  # even when GitHub rejects creation after the feature branch was pushed.
+  [[ "${GH_CREATE_FAIL:-0}" == 0 ]] || exit 71
+  base=""
+  head=""
+  title=""
+  body_file=""
+  previous=""
+  for argument in "$@"; do
+    case "$previous" in
+      --base) base=$argument ;;
+      --head) head=$argument ;;
+      --title) title=$argument ;;
+      --body-file) body_file=$argument ;;
+    esac
+    previous=$argument
+  done
+  [[ -z "$body_file" ]] || cat "$body_file" >"${GH_LOG}.body"
+  head_ref=${head#*:}
+  created_oid=$(git rev-parse HEAD)
+  printf '11\tOPEN\tfalse\tCLEAN\t%s\t%s\t%s\texample/repo\tfalse\thttps://github.test/example/repo/pull/11\t%s\n' \
+    "$head_ref" "$created_oid" "$base" "$title" >"${GH_LOG}.created"
+  printf 'https://github.test/example/repo/pull/11\n'
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr view" && -e "${GH_LOG}.created" ]]; then
+  cat "${GH_LOG}.created"
+  exit 0
+fi
+
+if [[ "$1 $2" == "pr merge" ]]; then
+  # GitHub can return an error after PR creation. The command must still return
+  # the checkout to main while reporting that auto-merge was not queued.
+  [[ "${GH_MERGE_FAIL:-0}" == 0 ]] || exit 72
+  exit 0
+fi
+
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 99
+EOF
+  chmod +x "$bin/gh"
+
+  cat >"$bin/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-} ${2:-} ${3:-} ${4:-}" == "remote get-url --push --all" ]]; then
+  remote=${5:-}
+  url=$(/usr/bin/git config --get-all "remote.$remote.pushurl" 2>/dev/null || true)
+  [[ -n "$url" ]] || url=$(/usr/bin/git config --get-all "remote.$remote.url")
+  printf '%s\n' "$url"
+  exit 0
+fi
+if [[ "${1:-} ${2:-} ${3:-}" == "remote get-url --all" ]]; then
+  /usr/bin/git config --get-all "remote.${4:-}.url"
+  exit $?
+fi
+if [[ "${1:-}" == -c && "${2:-}" == url.*.insteadOf=* &&
+  "${3:-}" == -c && "${4:-}" == url.*.pushInsteadOf=* ]]; then
+  pin=${2#url.}
+  target=${pin%%.insteadOf=*}
+  alias=${pin#*.insteadOf=}
+  shift 4
+  rewritten=()
+  for argument in "$@"; do
+    [[ "$argument" != "$alias" ]] || argument=$target
+    rewritten+=("$argument")
+  done
+  set -- "${rewritten[@]}"
+fi
+if [[ "${GIT_TEST_MOVE_MAIN_AFTER_SWITCH:-0}" == 1 &&
+  "${1:-} ${2:-} ${3:-}" == "switch --quiet main" ]]; then
+  # Simulate a checkout hook or concurrent local Git process advancing main
+  # after switch itself reports success. Keep the tree identical so only an
+  # explicit OID verification can observe the race.
+  /usr/bin/git "$@"
+  old=$(/usr/bin/git rev-parse HEAD)
+  tree=$(/usr/bin/git rev-parse "$old^{tree}")
+  moved=$(printf 'concurrent main movement\n' |
+    /usr/bin/git commit-tree "$tree" -p "$old")
+  /usr/bin/git update-ref refs/heads/main "$moved" "$old"
+  exit 0
+fi
+if [[ "${GIT_TEST_MOVE_FEATURE_DURING_OPEN:-0}" == 1 &&
+  "${1:-} ${2:-}" == "status --porcelain" ]]; then
+  branch=$(/usr/bin/git symbolic-ref -q --short HEAD 2>/dev/null || true)
+  if [[ "$branch" == pr/* && ! -e "${GIT_TEST_MOVE_FEATURE_MARKER:?}" ]]; then
+    feature=$(/usr/bin/git rev-parse HEAD)
+    main=$(/usr/bin/git rev-parse refs/heads/main)
+    # pr-submit checks cleanliness once before restoring main; pr-open checks it
+    # again afterward. Mutate only at that second boundary so the regression
+    # exercises the cross-command handoff rather than the earlier local guard.
+    if [[ "$main" != "$feature" ]]; then
+      tree=$(/usr/bin/git rev-parse "$feature^{tree}")
+      moved=$(printf 'concurrent feature movement\n' |
+        /usr/bin/git commit-tree "$tree" -p "$feature")
+      /usr/bin/git update-ref "refs/heads/$branch" "$moved" "$feature"
+      printf '%s\n' "$moved" >"$GIT_TEST_MOVE_FEATURE_MARKER"
+    fi
+  fi
+fi
+if [[ "${GIT_TEST_RETARGET_REPO_DURING_OPEN:-0}" == 1 &&
+  "${1:-} ${2:-}" == "rev-parse --git-dir" &&
+  ! -e "${GIT_TEST_RETARGET_REPO_MARKER:?}" ]]; then
+  branch=$(/usr/bin/git symbolic-ref -q --short HEAD 2>/dev/null || true)
+  if [[ "$branch" == pr/* ]]; then
+    feature=$(/usr/bin/git rev-parse HEAD)
+    main=$(/usr/bin/git rev-parse refs/heads/main)
+    # The base ref differs only after pr-submit restores it, which identifies
+    # pr-open's fresh-process identity lookup without a production test hook.
+    if [[ "$main" != "$feature" ]]; then
+      /usr/bin/git config remote.origin.url \
+        https://github.test/foreign/repo.git
+      /usr/bin/git config \
+        "url.${GIT_TEST_RETARGET_REMOTE:?}.insteadOf" \
+        https://github.test/foreign/repo.git
+      : >"$GIT_TEST_RETARGET_REPO_MARKER"
+    fi
+  fi
+fi
+if [[ "${GIT_TEST_SIGNAL_ON_EDITOR_RESOLVE:-0}" == 1 &&
+  "${1:-} ${2:-}" == "var GIT_EDITOR" ]]; then
+  # Signal the submit process while it is waiting on a child command. This
+  # gives the real trap path a deterministic interruption without sleeps or a
+  # lingering editor subprocess.
+  kill -TERM "$PPID"
+  exit 0
+fi
+if [[ "${GIT_TEST_PARTIAL_REV_LIST:-0}" == 1 &&
+  "${1:-} ${2:-}" == "rev-list --reverse" ]]; then
+  # Emit a plausible prefix before failing. Process substitution can hide this
+  # producer status and tempt the caller to describe only part of the history.
+  /usr/bin/git "$@" | sed -n '1p'
+  exit 73
+fi
+exec /usr/bin/git "$@"
+EOF
+  chmod +x "$bin/git"
+}
+
+echo "=== git pr-submit ==="
+
+# The primary case matches the intended daily workflow: commit directly on a
+# clean main, submit once, and continue on the restored protected base while
+# GitHub owns the required-check and merge lifecycle.
+remote=$(_tmpdir)/remote.git
+seed=$(_tmpdir)/seed
+repo=$(_tmpdir)/repo
+bin_dir=$(_tmpdir)
+log=$(_tmpdir)/gh.log
+export GH_LOG="$log"
+_git_remote_repo "$remote" "$seed"
+_clone_main_repo "$remote" "$repo"
+_write_command_stubs "$bin_dir"
+
+base_oid=$(git -C "$repo" rev-parse HEAD)
+printf 'change\n' >"$repo/change.txt"
+git -C "$repo" add change.txt
+git -C "$repo" commit -m "Fix typo" -m "Preserve the intended wording." \
+  >/dev/null
+head_oid=$(git -C "$repo" rev-parse HEAD)
+short_oid=$(git -C "$repo" rev-parse --short=12 HEAD)
+feature_branch="pr/$short_oid"
+
+status=0
+result=$(cd "$repo" && GH_REPO=foreign.test/foreign/repo \
+  GH_HOST=foreign.test PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+
+_assert_eq "submits one commit from main" "0" "$status"
+_assert_contains "prints the created PR URL" \
+  "https://github.test/example/repo/pull/11" "$result"
+_assert_eq "returns to main" "main" \
+  "$(git -C "$repo" branch --show-current)"
+_assert_eq "restores main to the fetched base" "$base_oid" \
+  "$(git -C "$repo" rev-parse refs/heads/main)"
+_assert_eq "preserves the commit on a generated branch" "$head_oid" \
+  "$(git -C "$repo" rev-parse "refs/heads/$feature_branch" 2>/dev/null || true)"
+_assert_eq "pushes the generated branch" "$head_oid" \
+  "$(git --git-dir="$remote" rev-parse "refs/heads/$feature_branch" 2>/dev/null || true)"
+_assert_contains "uses the commit subject as PR title" \
+  "pr create --base main --head $feature_branch --title Fix typo" \
+  "$(<"$log")"
+_assert_eq "uses the commit body as PR description" \
+  "Preserve the intended wording." \
+  "$(cat "${log}.body" 2>/dev/null || true)"
+_assert_contains "queues squash auto-merge for the exact head" \
+  "pr merge https://github.test/example/repo/pull/11 --auto --squash --match-head-commit $head_oid" \
+  "$(<"$log")"
+_assert_contains "capability query uses the pinned REST repository endpoint" \
+  "host=github.test api --hostname github.test repos/example/repo --jq [.allow_auto_merge,.visibility] | @tsv" \
+  "$(<"$log")"
+default_queries=$(awk \
+  'index($0, "--json defaultBranchRef") { count++ } END { print count + 0 }' \
+  "$log")
+_assert_eq "pins one default-branch lookup across the pr-open handoff" \
+  "1" "$default_queries"
+
+multi_repo=$(_tmpdir)/multi-repo
+multi_log=$(_tmpdir)/multi-gh.log
+editor_seed_log=$(_tmpdir)/editor-seed
+editor=$bin_dir/editor-success
+export GH_LOG="$multi_log"
+export EDITOR_SEED_LOG="$editor_seed_log"
+_clone_main_repo "$remote" "$multi_repo"
+multi_base_oid=$(git -C "$multi_repo" rev-parse HEAD)
+printf 'first\n' >"$multi_repo/first.txt"
+git -C "$multi_repo" add first.txt
+git -C "$multi_repo" commit -m "Add first change" -m "First details." \
+  >/dev/null
+printf 'second\n' >"$multi_repo/second.txt"
+git -C "$multi_repo" add second.txt
+git -C "$multi_repo" commit -m "Refine change" -m "Second details." \
+  >/dev/null
+multi_head_oid=$(git -C "$multi_repo" rev-parse HEAD)
+multi_short_oid=$(git -C "$multi_repo" rev-parse --short=12 HEAD)
+multi_feature_branch="pr/$multi_short_oid"
+cat >"$editor" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == --edit ]] || exit 64
+shift
+cp "$1" "${EDITOR_SEED_LOG:?}"
+# Quoted printf arguments encode Markdown hard-break spaces without leaving
+# trailing whitespace in this test source. Repeated empty arguments verify that
+# the human-edited body is not rewritten by comparison normalization.
+printf '%s\n' 'Consolidate the change' '' 'Combined explanation.  ' '' '' \
+  'Second paragraph.' >"$1"
+EOF
+chmod +x "$editor"
+
+status=0
+result=$(cd "$multi_repo" && GIT_EDITOR="$editor --edit" \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+
+expected_seed=$'Add first change\n\nFirst details.\n\n---\n\nRefine change\n\nSecond details.'
+_assert_eq "submits multiple commits after editing PR text" "0" "$status"
+_assert_eq "supports a Git editor command with arguments" "0" "$status"
+_assert_eq "seeds the editor with all commit messages in order" \
+  "$expected_seed" "$(cat "$editor_seed_log" 2>/dev/null || true)"
+_assert_contains "uses the edited first line as PR title" \
+  "pr create --base main --head $multi_feature_branch --title Consolidate the change" \
+  "$(cat "$multi_log" 2>/dev/null || true)"
+expected_body=$'Combined explanation.  \n\n\nSecond paragraph.'
+_assert_eq "preserves the human-edited PR description whitespace" \
+  "$expected_body" \
+  "$(cat "${multi_log}.body" 2>/dev/null || true)"
+_assert_eq "restores main after a multi-commit submission" "$multi_base_oid" \
+  "$(git -C "$multi_repo" rev-parse refs/heads/main)"
+_assert_eq "preserves every submitted commit on the generated branch" \
+  "$multi_head_oid" \
+  "$(git -C "$multi_repo" rev-parse \
+    "refs/heads/$multi_feature_branch" 2>/dev/null || true)"
+
+# rev-list is the authoritative bridge between the pinned base/head pair and
+# the commit text shown to the human. A producer that emits a prefix and then
+# fails must abort before refs move; otherwise the PR body can omit commits that
+# the generated branch still publishes.
+partial_list_repo=$(_tmpdir)/partial-list-repo
+partial_list_log=$(_tmpdir)/partial-list-gh.log
+export GH_LOG="$partial_list_log"
+_clone_main_repo "$remote" "$partial_list_repo"
+printf 'first\n' >"$partial_list_repo/first.txt"
+git -C "$partial_list_repo" add first.txt
+git -C "$partial_list_repo" commit -m "First partial list commit" >/dev/null
+printf 'second\n' >"$partial_list_repo/second.txt"
+git -C "$partial_list_repo" add second.txt
+git -C "$partial_list_repo" commit -m "Second partial list commit" >/dev/null
+partial_list_head=$(git -C "$partial_list_repo" rev-parse HEAD)
+partial_list_short=$(git -C "$partial_list_repo" rev-parse --short=12 HEAD)
+status=0
+result=$(cd "$partial_list_repo" && GIT_TEST_PARTIAL_REV_LIST=1 \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "partial commit enumeration is nonzero" "1" "$status"
+_assert_contains "partial commit enumeration explains the failure" \
+  "could not enumerate commits to submit" "$result"
+_assert_eq "partial commit enumeration leaves main untouched" \
+  "$partial_list_head" "$(git -C "$partial_list_repo" rev-parse HEAD)"
+_assert_ref_missing "partial commit enumeration creates no feature branch" \
+  "$partial_list_repo" "refs/heads/pr/$partial_list_short"
+_assert_not_contains "partial commit enumeration creates no pull request" \
+  "pr create" "$(cat "$partial_list_log" 2>/dev/null || true)"
+
+# The editor runs before local ref mutation because closing an editor is a
+# common way to reconsider a submission. An unchanged buffer must therefore be
+# a true cancellation, not a partially-created branch that needs cleanup.
+cancel_repo=$(_tmpdir)/cancel-repo
+cancel_log=$(_tmpdir)/cancel-gh.log
+cancel_editor=$bin_dir/editor-unchanged
+export GH_LOG="$cancel_log"
+_clone_main_repo "$remote" "$cancel_repo"
+printf 'first\n' >"$cancel_repo/first.txt"
+git -C "$cancel_repo" add first.txt
+git -C "$cancel_repo" commit -m "First cancel commit" >/dev/null
+printf 'second\n' >"$cancel_repo/second.txt"
+git -C "$cancel_repo" add second.txt
+git -C "$cancel_repo" commit -m "Second cancel commit" >/dev/null
+cancel_head_oid=$(git -C "$cancel_repo" rev-parse HEAD)
+cancel_short_oid=$(git -C "$cancel_repo" rev-parse --short=12 HEAD)
+cancel_feature_branch="pr/$cancel_short_oid"
+cat >"$cancel_editor" <<'EOF'
+#!/usr/bin/env bash
+# Returning success without touching the file models quitting the editor
+# without saving, which is the explicit human cancellation gesture.
+exit 0
+EOF
+chmod +x "$cancel_editor"
+
+status=0
+result=$(cd "$cancel_repo" && GIT_EDITOR="$cancel_editor" \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+
+_assert_eq "unchanged multi-commit editor cancels submission" "1" "$status"
+_assert_contains "unchanged editor explains cancellation" \
+  "PR text was not changed; submission cancelled" "$result"
+_assert_eq "cancelled submission remains on main" "main" \
+  "$(git -C "$cancel_repo" branch --show-current)"
+_assert_eq "cancelled submission leaves main at the local commits" \
+  "$cancel_head_oid" "$(git -C "$cancel_repo" rev-parse HEAD)"
+_assert_ref_missing "cancelled submission creates no feature branch" \
+  "$cancel_repo" "refs/heads/$cancel_feature_branch"
+_assert_not_contains "cancelled submission creates no pull request" \
+  "pr create" "$(cat "$cancel_log" 2>/dev/null || true)"
+
+# A nonzero editor exit is an explicit failure rather than an edited buffer.
+# As with the unchanged case, it must happen before any durable ref mutation.
+editor_fail_repo=$(_tmpdir)/editor-fail-repo
+editor_fail_log=$(_tmpdir)/editor-fail-gh.log
+editor_fail=$bin_dir/editor-fail
+export GH_LOG="$editor_fail_log"
+_clone_main_repo "$remote" "$editor_fail_repo"
+printf 'first\n' >"$editor_fail_repo/first.txt"
+git -C "$editor_fail_repo" add first.txt
+git -C "$editor_fail_repo" commit -m "First editor failure" >/dev/null
+printf 'second\n' >"$editor_fail_repo/second.txt"
+git -C "$editor_fail_repo" add second.txt
+git -C "$editor_fail_repo" commit -m "Second editor failure" >/dev/null
+editor_fail_head=$(git -C "$editor_fail_repo" rev-parse HEAD)
+cat >"$editor_fail" <<'EOF'
+#!/usr/bin/env bash
+exit 42
+EOF
+chmod +x "$editor_fail"
+
+status=0
+result=$(cd "$editor_fail_repo" && GIT_EDITOR="$editor_fail" \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "failed editor cancels submission" "1" "$status"
+_assert_contains "failed editor reports cancellation" \
+  "editor exited unsuccessfully; submission cancelled" "$result"
+_assert_eq "failed editor leaves main and its commits untouched" \
+  "$editor_fail_head" "$(git -C "$editor_fail_repo" rev-parse HEAD)"
+_assert_not_contains "failed editor creates no pull request" \
+  "pr create" "$(cat "$editor_fail_log" 2>/dev/null || true)"
+
+# A body cannot compensate for an empty first line. Validate the title before
+# whole-buffer whitespace normalization so `git stripspace` cannot promote the
+# first body line and silently bypass the explicit human-title requirement.
+empty_repo=$(_tmpdir)/empty-repo
+empty_log=$(_tmpdir)/empty-gh.log
+empty_editor=$bin_dir/editor-empty
+export GH_LOG="$empty_log"
+_clone_main_repo "$remote" "$empty_repo"
+printf 'first\n' >"$empty_repo/first.txt"
+git -C "$empty_repo" add first.txt
+git -C "$empty_repo" commit -m "First empty edit" >/dev/null
+printf 'second\n' >"$empty_repo/second.txt"
+git -C "$empty_repo" add second.txt
+git -C "$empty_repo" commit -m "Second empty edit" >/dev/null
+empty_head=$(git -C "$empty_repo" rev-parse HEAD)
+cat >"$empty_editor" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cat >"$1" <<'BODY'
+
+Body without a title must not be promoted.
+BODY
+EOF
+chmod +x "$empty_editor"
+
+status=0
+result=$(cd "$empty_repo" && GIT_EDITOR="$empty_editor" \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "blank edited PR title cancels submission" "1" "$status"
+_assert_contains "blank edited PR title explains cancellation" \
+  "edited PR title is empty; submission cancelled" "$result"
+_assert_eq "blank title leaves main and its commits untouched" \
+  "$empty_head" "$(git -C "$empty_repo" rev-parse HEAD)"
+_assert_not_contains "blank title creates no pull request" \
+  "pr create" "$(cat "$empty_log" 2>/dev/null || true)"
+
+# Signals are cancellation, never success. Resolve the editor through a Git
+# wrapper that sends TERM to the submit process, then require both the standard
+# signal exit code and removal of the private draft file.
+signal_repo=$(_tmpdir)/signal-repo
+signal_log=$(_tmpdir)/signal-gh.log
+signal_tmp=$(_tmpdir)
+export GH_LOG="$signal_log"
+_clone_main_repo "$remote" "$signal_repo"
+printf 'first\n' >"$signal_repo/first.txt"
+git -C "$signal_repo" add first.txt
+git -C "$signal_repo" commit -m "First signal commit" >/dev/null
+printf 'second\n' >"$signal_repo/second.txt"
+git -C "$signal_repo" add second.txt
+git -C "$signal_repo" commit -m "Second signal commit" >/dev/null
+signal_head=$(git -C "$signal_repo" rev-parse HEAD)
+status=0
+result=$(cd "$signal_repo" && TMPDIR="$signal_tmp" \
+  GIT_TEST_SIGNAL_ON_EDITOR_RESOLVE=1 PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "TERM during submission uses the conventional signal status" \
+  "143" "$status"
+_assert_eq "TERM removes the private PR draft" "" \
+  "$(compgen -G "$signal_tmp/git-pr-submit.*" || true)"
+_assert_eq "TERM leaves main and its commits untouched" "$signal_head" \
+  "$(git -C "$signal_repo" rev-parse HEAD)"
+_assert_not_contains "TERM creates no pull request" \
+  "pr create" "$(cat "$signal_log" 2>/dev/null || true)"
+
+# Repository auto-merge is advisory outside the managed core set. Creating the
+# PR remains useful, but the diagnostic must make the required manual landing
+# step visible and no merge request should be attempted.
+fallback_repo=$(_tmpdir)/fallback-repo
+fallback_log=$(_tmpdir)/fallback-gh.log
+export GH_LOG="$fallback_log"
+_clone_main_repo "$remote" "$fallback_repo"
+fallback_base=$(git -C "$fallback_repo" rev-parse HEAD)
+printf 'fallback\n' >"$fallback_repo/fallback.txt"
+git -C "$fallback_repo" add fallback.txt
+git -C "$fallback_repo" commit -m "Submit without auto merge" >/dev/null
+
+status=0
+result=$(cd "$fallback_repo" && GH_AUTO_MERGE_ALLOWED=false \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "repository without auto-merge still creates its PR" "0" "$status"
+_assert_contains "repository without auto-merge reports manual landing" \
+  "repository auto-merge is unavailable" "$result"
+_assert_not_contains "repository without auto-merge queues no merge" \
+  "pr merge" "$(cat "$fallback_log" 2>/dev/null || true)"
+_assert_eq "manual-landing fallback still restores main" "$fallback_base" \
+  "$(git -C "$fallback_repo" rev-parse refs/heads/main)"
+
+# GitHub can retain allow_auto_merge=true in repository settings even when the
+# owner's plan cannot use auto-merge for private repositories. Treat visibility
+# as part of effective capability so private dotfile repositories still get a
+# successful PR instead of a false post-creation failure from `gh pr merge`.
+private_repo=$(_tmpdir)/private-repo
+private_log=$(_tmpdir)/private-gh.log
+export GH_LOG="$private_log"
+_clone_main_repo "$remote" "$private_repo"
+private_base=$(git -C "$private_repo" rev-parse HEAD)
+printf 'private\n' >"$private_repo/private.txt"
+git -C "$private_repo" add private.txt
+git -C "$private_repo" commit -m "Submit private repository change" >/dev/null
+
+status=0
+result=$(cd "$private_repo" && GH_AUTO_MERGE_ALLOWED=true \
+  GH_REPO_VISIBILITY=private PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "private repository still creates its PR" "0" "$status"
+_assert_contains "private repository reports manual landing" \
+  "repository auto-merge is unavailable" "$result"
+_assert_not_contains "private repository queues no merge" \
+  "pr merge" "$(cat "$private_log" 2>/dev/null || true)"
+_assert_eq "private repository fallback still restores main" "$private_base" \
+  "$(git -C "$private_repo" rev-parse refs/heads/main)"
+
+# Auto-merge is a second GitHub mutation after PR creation. Its failure must be
+# actionable but cannot turn a successfully-created PR into a false claim that
+# no submission occurred.
+merge_fail_repo=$(_tmpdir)/merge-fail-repo
+merge_fail_log=$(_tmpdir)/merge-fail-gh.log
+export GH_LOG="$merge_fail_log"
+_clone_main_repo "$remote" "$merge_fail_repo"
+merge_fail_base=$(git -C "$merge_fail_repo" rev-parse HEAD)
+printf 'merge fail\n' >"$merge_fail_repo/merge-fail.txt"
+git -C "$merge_fail_repo" add merge-fail.txt
+git -C "$merge_fail_repo" commit -m "Exercise merge failure" >/dev/null
+
+status=0
+result=$(cd "$merge_fail_repo" && GH_MERGE_FAIL=1 \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "auto-merge failure is nonzero" "1" "$status"
+_assert_contains "auto-merge failure retains the PR URL" \
+  "https://github.test/example/repo/pull/11" "$result"
+_assert_contains "auto-merge failure is explicit" \
+  "protected auto-merge could not be queued" "$result"
+_assert_eq "auto-merge failure still restores main" "$merge_fail_base" \
+  "$(git -C "$merge_fail_repo" rev-parse refs/heads/main)"
+
+# The commit text and generated branch are pinned before invoking git-pr-open.
+# Move that checked-out ref during pr-open's clean check; the expected-head
+# lease must reject the handoff before a push or PR can broaden the submission.
+handoff_repo=$(_tmpdir)/handoff-repo
+handoff_log=$(_tmpdir)/handoff-gh.log
+handoff_marker=$(_tmpdir)/handoff-moved
+export GH_LOG="$handoff_log"
+_clone_main_repo "$remote" "$handoff_repo"
+handoff_base=$(git -C "$handoff_repo" rev-parse HEAD)
+printf 'handoff\n' >"$handoff_repo/handoff.txt"
+git -C "$handoff_repo" add handoff.txt
+git -C "$handoff_repo" commit -m "Exercise handoff race" >/dev/null
+handoff_head=$(git -C "$handoff_repo" rev-parse HEAD)
+handoff_short=$(git -C "$handoff_repo" rev-parse --short=12 HEAD)
+handoff_branch="pr/$handoff_short"
+status=0
+result=$(cd "$handoff_repo" && GIT_TEST_MOVE_FEATURE_DURING_OPEN=1 \
+  GIT_TEST_MOVE_FEATURE_MARKER="$handoff_marker" PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "feature movement during pr-open is nonzero" "1" "$status"
+_assert_contains "feature movement rejects the expected-head handoff" \
+  "current feature branch does not match expected head" "$result"
+_assert_not_contains "feature movement creates no pull request" \
+  "pr create" "$(cat "$handoff_log" 2>/dev/null || true)"
+_assert_eq "feature movement leaves restored main at the fetched base" \
+  "$handoff_base" "$(git -C "$handoff_repo" rev-parse refs/heads/main)"
+_assert_eq "feature movement leaves its generated branch checked out" \
+  "$handoff_branch" "$(git -C "$handoff_repo" branch --show-current)"
+if git -C "$handoff_repo" merge-base --is-ancestor "$handoff_head" \
+  "refs/heads/$handoff_branch"; then
+  _pass "feature movement keeps the submitted commit reachable"
+else
+  _fail "feature movement keeps the submitted commit reachable"
+fi
+
+# The child command re-resolves checkout identity. Retarget origin after the
+# parent has validated it but before pr-open starts; an expected-repository
+# lease must reject that drift before any foreign push or pull request.
+repo_race_repo=$(_tmpdir)/repo-race-repo
+repo_race_log=$(_tmpdir)/repo-race-gh.log
+repo_race_marker=$(_tmpdir)/repo-race-moved
+export GH_LOG="$repo_race_log"
+_clone_main_repo "$remote" "$repo_race_repo"
+repo_race_base=$(git -C "$repo_race_repo" rev-parse HEAD)
+printf 'repo race\n' >"$repo_race_repo/repo-race.txt"
+git -C "$repo_race_repo" add repo-race.txt
+git -C "$repo_race_repo" commit -m "Exercise repository handoff race" \
+  >/dev/null
+repo_race_short=$(git -C "$repo_race_repo" rev-parse --short=12 HEAD)
+repo_race_branch="pr/$repo_race_short"
+status=0
+result=$(cd "$repo_race_repo" && GIT_TEST_RETARGET_REPO_DURING_OPEN=1 \
+  GIT_TEST_RETARGET_REPO_MARKER="$repo_race_marker" \
+  GIT_TEST_RETARGET_REMOTE="$remote" PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "repository movement during pr-open is nonzero" "1" "$status"
+_assert_contains "repository movement rejects the expected-repo handoff" \
+  "current repository does not match expected repository" "$result"
+_assert_not_contains "repository movement creates no pull request" \
+  "pr create" "$(cat "$repo_race_log" 2>/dev/null || true)"
+_assert_eq "repository movement leaves main at the fetched base" \
+  "$repo_race_base" "$(git -C "$repo_race_repo" rev-parse refs/heads/main)"
+_assert_eq "repository movement leaves the generated branch checked out" \
+  "$repo_race_branch" "$(git -C "$repo_race_repo" branch --show-current)"
+
+# A successful `git switch main` is not sufficient proof that the checkout is
+# on the fetched base OID. Detect a hook or concurrent process moving the ref
+# after switch and preserve the already-created PR URL in the diagnostic.
+switch_race_repo=$(_tmpdir)/switch-race-repo
+switch_race_log=$(_tmpdir)/switch-race-gh.log
+export GH_LOG="$switch_race_log"
+_clone_main_repo "$remote" "$switch_race_repo"
+printf 'switch race\n' >"$switch_race_repo/switch-race.txt"
+git -C "$switch_race_repo" add switch-race.txt
+git -C "$switch_race_repo" commit -m "Exercise switch race" >/dev/null
+status=0
+result=$(cd "$switch_race_repo" && GIT_TEST_MOVE_MAIN_AFTER_SWITCH=1 \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "post-switch main movement is nonzero" "1" "$status"
+_assert_contains "post-switch main movement retains the PR URL" \
+  "https://github.test/example/repo/pull/11" "$result"
+_assert_contains "post-switch main movement reports verification failure" \
+  "checkout returned to main at an unexpected commit" "$result"
+
+# PR creation happens only after the feature branch is durable locally and
+# remotely and local main has been restored. A server-side creation failure can
+# therefore leave the user on that feature branch with no unreachable commit.
+create_fail_repo=$(_tmpdir)/create-fail-repo
+create_fail_log=$(_tmpdir)/create-fail-gh.log
+export GH_LOG="$create_fail_log"
+_clone_main_repo "$remote" "$create_fail_repo"
+create_fail_base=$(git -C "$create_fail_repo" rev-parse HEAD)
+printf 'create fail\n' >"$create_fail_repo/create-fail.txt"
+git -C "$create_fail_repo" add create-fail.txt
+git -C "$create_fail_repo" commit -m "Exercise create failure" >/dev/null
+create_fail_head=$(git -C "$create_fail_repo" rev-parse HEAD)
+create_fail_short=$(git -C "$create_fail_repo" rev-parse --short=12 HEAD)
+create_fail_branch="pr/$create_fail_short"
+
+status=0
+result=$(cd "$create_fail_repo" && GH_CREATE_FAIL=1 \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "PR creation failure is nonzero" "1" "$status"
+_assert_contains "PR creation failure names the preserved branch" \
+  "commit is preserved on $create_fail_branch" "$result"
+_assert_eq "PR creation failure leaves the feature branch checked out" \
+  "$create_fail_branch" "$(git -C "$create_fail_repo" branch --show-current)"
+_assert_eq "PR creation failure restores local main" "$create_fail_base" \
+  "$(git -C "$create_fail_repo" rev-parse refs/heads/main)"
+_assert_eq "PR creation failure preserves the exact head" "$create_fail_head" \
+  "$(git -C "$create_fail_repo" rev-parse \
+    "refs/heads/$create_fail_branch")"
+
+# A pre-existing deterministic branch name indicates a previous partial run or
+# a short-OID collision. Refuse instead of reusing an identity whose remote PR
+# state is unknown.
+collision_repo=$(_tmpdir)/collision-repo
+collision_log=$(_tmpdir)/collision-gh.log
+export GH_LOG="$collision_log"
+_clone_main_repo "$remote" "$collision_repo"
+printf 'collision\n' >"$collision_repo/collision.txt"
+git -C "$collision_repo" add collision.txt
+git -C "$collision_repo" commit -m "Exercise branch collision" >/dev/null
+collision_head=$(git -C "$collision_repo" rev-parse HEAD)
+collision_short=$(git -C "$collision_repo" rev-parse --short=12 HEAD)
+git -C "$collision_repo" branch "pr/$collision_short" HEAD
+
+status=0
+result=$(cd "$collision_repo" && PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "generated branch collision is nonzero" "1" "$status"
+_assert_contains "generated branch collision is explicit" \
+  "generated feature branch already exists" "$result"
+_assert_eq "branch collision leaves main at the submitted commit" \
+  "$collision_head" "$(git -C "$collision_repo" rev-parse HEAD)"
+_assert_not_contains "branch collision creates no pull request" \
+  "pr create" "$(cat "$collision_log" 2>/dev/null || true)"
+
+# Dirty state cannot be carried across the branch switch safely, and a base
+# with no local commits is not a submission. Both errors must precede any PR.
+dirty_repo=$(_tmpdir)/dirty-repo
+dirty_log=$(_tmpdir)/dirty-gh.log
+export GH_LOG="$dirty_log"
+_clone_main_repo "$remote" "$dirty_repo"
+printf 'committed\n' >"$dirty_repo/committed.txt"
+git -C "$dirty_repo" add committed.txt
+git -C "$dirty_repo" commit -m "Committed change" >/dev/null
+printf 'dirty\n' >"$dirty_repo/dirty.txt"
+status=0
+result=$(cd "$dirty_repo" && PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "dirty worktree is rejected" "1" "$status"
+_assert_contains "dirty worktree diagnostic is explicit" \
+  "worktree must be clean" "$result"
+_assert_eq "dirty rejection performs no GitHub query" "" \
+  "$(cat "$dirty_log" 2>/dev/null || true)"
+
+empty_base_repo=$(_tmpdir)/empty-base-repo
+empty_base_log=$(_tmpdir)/empty-base-gh.log
+export GH_LOG="$empty_base_log"
+_clone_main_repo "$remote" "$empty_base_repo"
+status=0
+result=$(cd "$empty_base_repo" && PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "base without local commits is rejected" "2" "$status"
+_assert_contains "base without local commits explains the error" \
+  "base branch has no commits to submit" "$result"
+_assert_not_contains "base without local commits creates no pull request" \
+  "pr create" "$(cat "$empty_base_log" 2>/dev/null || true)"
+
+# pr-submit exists specifically to repair commits made on the protected base.
+# An already-created feature branch has the more flexible pr-open workflow and
+# must not be renamed or retargeted by this opinionated shortcut.
+feature_repo=$(_tmpdir)/feature-repo
+feature_log=$(_tmpdir)/feature-gh.log
+export GH_LOG="$feature_log"
+_clone_main_repo "$remote" "$feature_repo"
+git -C "$feature_repo" switch -q -c feature/manual
+printf 'feature\n' >"$feature_repo/feature.txt"
+git -C "$feature_repo" add feature.txt
+git -C "$feature_repo" commit -m "Manual feature" >/dev/null
+status=0
+result=$(cd "$feature_repo" && PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "existing feature branch is rejected" "2" "$status"
+_assert_contains "existing feature branch points to pr-open behavior" \
+  "current branch is not the base branch" "$result"
+_assert_not_contains "existing feature branch creates no pull request" \
+  "pr create" "$(cat "$feature_log" 2>/dev/null || true)"
+
+# The shortcut must never hide a rebase decision. When remote main advances
+# independently, preserving the local commits in place is safer than creating
+# a PR branch from a stale fork point that git-pr-open would later reject.
+diverged_remote=$(_tmpdir)/diverged-remote.git
+diverged_seed=$(_tmpdir)/diverged-seed
+diverged_repo=$(_tmpdir)/diverged-repo
+diverged_log=$(_tmpdir)/diverged-gh.log
+export GH_LOG="$diverged_log"
+_git_remote_repo "$diverged_remote" "$diverged_seed"
+_clone_main_repo "$diverged_remote" "$diverged_repo"
+printf 'local\n' >"$diverged_repo/local.txt"
+git -C "$diverged_repo" add local.txt
+git -C "$diverged_repo" commit -m "Local divergent change" >/dev/null
+diverged_local_head=$(git -C "$diverged_repo" rev-parse HEAD)
+printf 'remote\n' >"$diverged_seed/remote.txt"
+git -C "$diverged_seed" add remote.txt
+git -C "$diverged_seed" commit -m "Remote divergent change" >/dev/null
+git -C "$diverged_seed" push origin main >/dev/null 2>&1
+status=0
+result=$(cd "$diverged_repo" && PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+_assert_eq "diverged main is rejected" "1" "$status"
+_assert_contains "diverged main requires an explicit rebase" \
+  "has diverged from its remote; rebase it before submitting" "$result"
+_assert_eq "divergence leaves local main untouched" "$diverged_local_head" \
+  "$(git -C "$diverged_repo" rev-parse HEAD)"
+_assert_not_contains "divergence creates no pull request" \
+  "pr create" "$(cat "$diverged_log" 2>/dev/null || true)"
+
+if ((_failures > 0)); then
+  printf '%s failure(s)\n' "$_failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

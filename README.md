@@ -68,6 +68,9 @@ through its validated URL without applying the remote's fetch refspecs or
 importing tags. The feature push target is resolved independently;
 fork heads are qualified as `owner:branch`, so a base branch tracking upstream
 cannot redirect the feature push upstream.
+OpenSSH `Host` aliases are accepted when their effective hostname matches the
+configured repository host. Git SSH command and variant overrides are rejected
+because a plain OpenSSH expansion cannot prove where those transports will go.
 The feature branch is pushed by immutable OID through the captured validated
 URL, then its remote OID is verified. Upstream tracking is written locally only
 after the named remote is revalidated against that captured URL; a concurrent
@@ -78,6 +81,45 @@ returns, the created PR's canonical repository, head and base refs, head
 repository, cross-repository state, and head OID must match the requested
 topology. A PR created during a server-side race is reported with its URL as an
 actionable nonzero state instead of clean success.
+Composition callers can add `--expect-head <oid>` and
+`--expect-repo <host/owner/repository>` leases. These stop before push when the
+branch commit or checkout identity has changed since the caller inspected it.
+
+### `git pr-submit`
+
+Turns commits made directly on the protected default branch into a pull
+request, queues squash auto-merge, and returns the checkout to the default
+branch:
+
+```sh
+git commit -m "Fix typo"
+git pr-submit
+```
+
+The command requires a clean worktree and an ahead-only default branch. It
+fetches the exact remote default-branch object ID, creates a deterministic
+`pr/<short-oid>` branch at the local head, and then atomically restores the
+local default branch to the fetched object. The existing `git pr-open` command
+performs the validated push and PR creation under expected-head, repository,
+and base leases. Auto-merge is requested with the exact submitted head object
+ID and never uses administrator bypasses, so all required checks and reviews
+still apply.
+
+For one commit, its subject becomes the PR title and its body becomes the PR
+description. For multiple commits, the configured Git editor opens before any
+branch is moved. Its buffer contains every full commit message in chronological
+order; edit the first line into the PR title and the remainder into the PR
+description. Exiting unsuccessfully, leaving the normalized buffer unchanged,
+or saving an empty title cancels without changing local refs or creating a PR.
+
+If PR creation fails after the generated branch is pushed, the command leaves
+that branch checked out and names it in the diagnostic, while local `main`
+remains restored. If auto-merge is unavailable for the repository, including
+on plan-limited private repositories, PR creation still succeeds and the
+command reports that manual landing is required. A
+failure to queue auto-merge is nonzero but retains and prints the created PR
+URL. Generated local branches can be removed after landing with
+`git cleanup-repo`.
 
 ### `git repo-state`
 
@@ -483,6 +525,7 @@ git pr-open
 git pr-ready
 git pr-restack
 git pr-stack
+git pr-submit
 git pr-sync-stack
 git repo-state
 git resolve-base
@@ -535,6 +578,7 @@ test/git-pr-land-stack-test
 test/git-pr-ready-test
 test/git-pr-restack-test
 test/git-pr-stack-test
+test/git-pr-submit-test
 ```
 
 If `git-absorb` is not installed, the test suite verifies the dependency error

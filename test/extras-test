@@ -135,6 +135,9 @@ _description_for() {
     git-pr-stack)
       printf '%s\n' 'discover a linear GitHub pull request stack'
       ;;
+    git-pr-submit)
+      printf '%s\n' 'submit default-branch commits through a pull request'
+      ;;
     git-pr-sync-stack)
       printf '%s\n' 'restack a GitHub pull request stack'
       ;;

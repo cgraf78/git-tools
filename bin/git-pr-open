@@ -38,6 +38,8 @@ Options:
   -F, --body-file <file>    Read pull request body from file.
   -B, --base <branch>       Base branch (default: repository default branch).
   -H, --head <branch>       Head branch name for GitHub (default: current branch).
+      --expect-head <oid>   Require the current branch to match this commit.
+      --expect-repo <id>    Require this host/owner/repository identity.
   -d, --draft               Create a draft pull request.
       --fill                Use commit info for title and body.
       --fill-first          Use first commit info for title and body.
@@ -58,6 +60,8 @@ _body=""
 _body_file=""
 _base=""
 _head=""
+_expected_head=""
+_expected_repo=""
 _draft=0
 _fill=""
 _maintainer_edit=1
@@ -124,6 +128,30 @@ while (($#)); do
       [[ -n "$_head" ]] || gt_usage_error "--head requires a value"
       shift
       ;;
+    --expect-head)
+      shift
+      (($#)) || gt_usage_error "--expect-head requires a value"
+      _expected_head="$1"
+      shift
+      ;;
+    --expect-head=*)
+      _expected_head="${1#--expect-head=}"
+      [[ -n "$_expected_head" ]] ||
+        gt_usage_error "--expect-head requires a value"
+      shift
+      ;;
+    --expect-repo)
+      shift
+      (($#)) || gt_usage_error "--expect-repo requires a value"
+      _expected_repo="$1"
+      shift
+      ;;
+    --expect-repo=*)
+      _expected_repo="${1#--expect-repo=}"
+      [[ -n "$_expected_repo" ]] ||
+        gt_usage_error "--expect-repo requires a value"
+      shift
+      ;;
     -d | --draft)
       _draft=1
       shift
@@ -158,6 +186,17 @@ done
   gt_usage_error "--body and --body-file cannot be used together"
 [[ -n "$_title" || -n "$_fill" ]] ||
   gt_usage_error "--title is required unless a --fill mode is used"
+if [[ -n "$_expected_head" &&
+  ! "$_expected_head" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+  gt_usage_error "--expect-head requires a full lowercase commit object ID"
+fi
+if [[ -n "$_expected_repo" ]]; then
+  # Reuse the transport identity parser so this composition guard accepts only
+  # the same normalized host/owner/repository grammar as actual remotes.
+  _expected_repo=$(gt_github_repo_identity_from_url \
+    "https://$_expected_repo.git") ||
+    gt_usage_error "--expect-repo requires host/owner/repository"
+fi
 
 _local_branch_exists() {
   gt_find_ref_commit "refs/heads/$1"
@@ -209,6 +248,11 @@ if [[ -n "$_base" ]]; then
 fi
 
 gt_require_gh
+# Composition callers may have validated checkout identity before invoking this
+# command. Fail before transport resolution when that identity has drifted, so
+# a remote-config race cannot publish the branch or PR to another repository.
+[[ -z "$_expected_repo" || "$GT_CURRENT_REPO_IDENTITY" == "$_expected_repo" ]] ||
+  gt_die "current repository does not match expected repository: $_expected_repo"
 gt_require_clean_worktree
 
 _base_remote_status=0
@@ -251,6 +295,11 @@ esac
 gt_find_ref_commit "refs/heads/$_branch" ||
   gt_die "could not resolve current feature branch"
 _feature_oid=$GT_REF_OID
+# Push already uses this immutable OID instead of the branch name. Checking an
+# optional caller lease here closes the only earlier gap: a ref move between
+# the caller's inspection and this command's own snapshot.
+[[ -z "$_expected_head" || "$_feature_oid" == "$_expected_head" ]] ||
+  gt_die "current feature branch does not match expected head: $_expected_head"
 if [[ "$_dry_run" == 1 ]]; then
   printf 'git pr-open: would run: git push %q %q\n' \
     "$_head_remote" "refs/heads/$_branch:refs/heads/$_head" >&2

@@ -15,9 +15,14 @@ _git_pr_open() {
       COMPREPLY=($(compgen -W "$(_git_pr_open_refs)" -- "$cur"))
       return
       ;;
+    --expect-head | --expect-repo)
+      # These lease values come from orchestration rather than branch-name
+      # completion, so avoid offering unrelated refs or flags as their value.
+      return
+      ;;
   esac
 
-  COMPREPLY=($(compgen -W "-t --title -b --body -F --body-file -B --base -H --head -d --draft --fill --fill-first --fill-verbose --no-maintainer-edit -n --dry-run -h --help" -- "$cur"))
+  COMPREPLY=($(compgen -W "-t --title -b --body -F --body-file -B --base -H --head --expect-head --expect-repo -d --draft --fill --fill-first --fill-verbose --no-maintainer-edit -n --dry-run -h --help" -- "$cur"))
 }
 
 complete -F _git_pr_open git-pr-open

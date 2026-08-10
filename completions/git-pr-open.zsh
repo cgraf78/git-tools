@@ -14,6 +14,8 @@ _git_pr_open() {
     '(-F --body-file)'{-F,--body-file}'[Read pull request body from file]:file:_files' \
     '(-B --base)'{-B,--base}'[Base branch]:base:_git_pr_open_refs' \
     '(-H --head)'{-H,--head}'[Head branch name for GitHub]:head:_git_pr_open_refs' \
+    '--expect-head[Require current branch commit]:object ID' \
+    '--expect-repo[Require checkout repository identity]:host/owner/repository' \
     '(-d --draft)'{-d,--draft}'[Create a draft pull request]' \
     '--fill[Use commit info for title and body]' \
     '--fill-first[Use first commit info for title and body]' \

@@ -10,6 +10,7 @@ program	bin/git-pr-open
 program	bin/git-pr-ready
 program	bin/git-pr-restack
 program	bin/git-pr-stack
+program	bin/git-pr-submit
 program	bin/git-pr-sync-stack
 program	bin/git-repo-state
 program	bin/git-resolve-base
@@ -25,6 +26,7 @@ program	completions/git-pr-open.bash
 program	completions/git-pr-ready.bash
 program	completions/git-pr-restack.bash
 program	completions/git-pr-stack.bash
+program	completions/git-pr-submit.bash
 program	completions/git-pr-sync-stack.bash
 program	completions/git-repo-state.bash
 program	completions/git-resolve-base.bash
@@ -46,6 +48,7 @@ program	test/git-pr-open-test
 program	test/git-pr-ready-test
 program	test/git-pr-restack-test
 program	test/git-pr-stack-test
+program	test/git-pr-submit-test
 program	test/git-pr-sync-stack-test
 program	test/git-repo-state-test
 program	test/git-resolve-base-test

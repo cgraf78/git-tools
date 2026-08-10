@@ -181,6 +181,10 @@ if [[ "${GIT_TEST_MUTATE_PUSH:-0}" == 1 &&
 fi
 if [[ "${1:-} ${2:-} ${3:-} ${4:-}" == "remote get-url --push --all" ]]; then
   remote=${5:-}
+  if [[ -n "${GIT_TEST_EXPANDED_PUSH_URL:-}" ]]; then
+    printf '%s\n' "$GIT_TEST_EXPANDED_PUSH_URL"
+    exit 0
+  fi
   url=$(/usr/bin/git config --get-all "remote.$remote.pushurl" 2>/dev/null || true)
   [[ -n "$url" ]] || url=$(/usr/bin/git config --get-all "remote.$remote.url")
   printf '%s\n' "$url"
@@ -223,6 +227,20 @@ fi
 exec /usr/bin/git "$@"
 EOF
   chmod +x "$1/git"
+
+  cat >"$1/ssh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep alias resolution deterministic and synthetic. Unrecognized invocations
+# retain the system behavior so this fixture cannot approve unrelated hosts.
+case "${1:-} ${2:-} ${3:-}" in
+  "-G -- git@github-alias") printf 'hostname github.test\n' ;;
+  "-G -- git@foreign-alias") printf 'hostname foreign.test\n' ;;
+  *) exec /usr/bin/ssh "$@" ;;
+esac
+EOF
+  chmod +x "$1/ssh"
 }
 
 echo "=== git pr-open ==="
@@ -246,9 +264,184 @@ _assert_contains "passes title and body" "--title Open PR --body Body" "$(<"$log
 _assert_contains "create is pinned to the checkout repository" \
   "repo=github.test/example/repo host=github.test pr create" "$(<"$log")"
 _assert_line "default branch query has a complete pinned argv contract" \
-  'repo=github.test/example/repo host=github.test repo view --repo github.test/example/repo --json defaultBranchRef --jq .defaultBranchRef.name // ""' \
+  'repo=github.test/example/repo host=github.test repo view github.test/example/repo --json defaultBranchRef --jq .defaultBranchRef.name // ""' \
   "$log"
 _assert_contains "pushes current branch" "feature/open" "$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')"
+
+# Composition callers can bind PR creation to history they inspected before
+# invoking git-pr-open. A matching lease succeeds, while a stale lease must stop
+# before the immutable push so no broader branch can be published accidentally.
+leased_remote=$(_tmpdir)/remote.git
+leased_seed=$(_tmpdir)/seed
+leased_repo=$(_tmpdir)/repo
+leased_log=$(_tmpdir)/gh.log
+_git_remote_repo "$leased_remote" "$leased_seed"
+_clone_feature_repo "$leased_remote" "$leased_repo"
+leased_head=$(git -C "$leased_repo" rev-parse HEAD)
+leased_output=$(cd "$leased_repo" && GH_LOG="$leased_log" \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" --title "Leased head" \
+  --expect-head "$leased_head" \
+  --expect-repo github.test/example/repo 2>&1)
+_assert_contains "matching expected head creates the PR" \
+  "https://github.test/example/repo/pull/11" "$leased_output"
+_assert_eq "matching expected head pushes the leased object" "$leased_head" \
+  "$(git -C "$leased_remote" rev-parse refs/heads/feature/open 2>/dev/null || true)"
+
+# A pushInsteadOf rule may select an SSH Host alias whose effective hostname is
+# still the configured GitHub host. Accept only the equivalence reported by
+# OpenSSH, while retaining the immutable push and repository identity checks.
+alias_remote=$(_tmpdir)/remote.git
+alias_seed=$(_tmpdir)/seed
+alias_repo=$(_tmpdir)/repo
+alias_log=$(_tmpdir)/gh.log
+_git_remote_repo "$alias_remote" "$alias_seed"
+_clone_feature_repo "$alias_remote" "$alias_repo"
+git -C "$alias_repo" config --add "url.$alias_remote.insteadOf" \
+  git@github-alias:example/repo.git
+alias_head=$(git -C "$alias_repo" rev-parse HEAD)
+alias_output=$(cd "$alias_repo" && GH_LOG="$alias_log" \
+  GIT_TEST_EXPANDED_PUSH_URL=git@github-alias:example/repo.git \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" --title "SSH alias" \
+  --expect-head "$alias_head" --expect-repo github.test/example/repo 2>&1)
+_assert_contains "verified SSH host alias creates the PR" \
+  "https://github.test/example/repo/pull/11" "$alias_output"
+_assert_eq "verified SSH host alias pushes the expected object" "$alias_head" \
+  "$(git -C "$alias_remote" rev-parse refs/heads/feature/open 2>/dev/null || true)"
+
+# Resolving an alias is not enough by itself: the effective hostname must match
+# the configured repository host or the resolver must stop before publication.
+foreign_alias_remote=$(_tmpdir)/remote.git
+foreign_alias_seed=$(_tmpdir)/seed
+foreign_alias_repo=$(_tmpdir)/repo
+foreign_alias_log=$(_tmpdir)/gh.log
+_git_remote_repo "$foreign_alias_remote" "$foreign_alias_seed"
+_clone_feature_repo "$foreign_alias_remote" "$foreign_alias_repo"
+git -C "$foreign_alias_repo" config --add \
+  "url.$foreign_alias_remote.insteadOf" \
+  git@foreign-alias:example/repo.git
+foreign_alias_rc=0
+foreign_alias_output=$(cd "$foreign_alias_repo" &&
+  GH_LOG="$foreign_alias_log" \
+    GIT_TEST_EXPANDED_PUSH_URL=git@foreign-alias:example/repo.git \
+    PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" \
+    --title "Foreign SSH alias" 2>&1) || foreign_alias_rc=$?
+_assert_eq "foreign SSH host alias is rejected" "1" "$foreign_alias_rc"
+_assert_contains "foreign SSH host alias explains push-target rejection" \
+  "could not resolve one exact push remote" "$foreign_alias_output"
+_assert_eq "foreign SSH host alias pushes no branch" "" \
+  "$(git -C "$foreign_alias_remote" for-each-ref --format='%(refname)' \
+    refs/heads/feature/open)"
+_assert_eq "foreign SSH host alias creates no pull request" "" \
+  "$(sed -n '/pr create/p' "$foreign_alias_log" 2>/dev/null || true)"
+
+# Git can replace the SSH executable through environment or repository config.
+# A plain `ssh -G` probe would not describe that later transport, so the command
+# must fail closed before either the branch or PR exists.
+override_remote=$(_tmpdir)/remote.git
+override_seed=$(_tmpdir)/seed
+override_repo=$(_tmpdir)/repo
+override_log=$(_tmpdir)/gh.log
+_git_remote_repo "$override_remote" "$override_seed"
+_clone_feature_repo "$override_remote" "$override_repo"
+git -C "$override_repo" config --add "url.$override_remote.insteadOf" \
+  git@github-alias:example/repo.git
+override_rc=0
+override_output=$(cd "$override_repo" && GH_LOG="$override_log" \
+  GIT_SSH_COMMAND=/bin/false \
+  GIT_TEST_EXPANDED_PUSH_URL=git@github-alias:example/repo.git \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" \
+  --title "SSH override" 2>&1) || override_rc=$?
+_assert_eq "custom SSH command is rejected" "1" "$override_rc"
+_assert_contains "custom SSH command explains push-target rejection" \
+  "could not resolve one exact push remote" "$override_output"
+_assert_eq "custom SSH command pushes no branch" "" \
+  "$(git -C "$override_remote" for-each-ref --format='%(refname)' \
+    refs/heads/feature/open)"
+_assert_eq "custom SSH command creates no pull request" "" \
+  "$(sed -n '/pr create/p' "$override_log" 2>/dev/null || true)"
+
+# The other Git SSH selectors are equally significant even though they do not
+# need full publication tests: any one of them makes a plain OpenSSH expansion
+# an unreliable proof of the later transport destination.
+ssh_environment_names=(GIT_SSH_COMMAND GIT_SSH GIT_SSH_VARIANT)
+ssh_environment_values=('' /bin/false ssh)
+for ((i = 0; i < ${#ssh_environment_names[@]}; i++)); do
+  ssh_environment_rc=0
+  # shellcheck disable=SC2016 # ROOT is expanded by the explicitly spawned Bash.
+  (cd "$override_repo" &&
+    env "${ssh_environment_names[i]}=${ssh_environment_values[i]}" \
+      ROOT="$ROOT" PATH="$bin_dir:$PATH" /bin/bash -c '
+        . "$ROOT/lib/git-tools-pr.sh"
+        gt_github_repo_transport_identity_from_url \
+          git@github-alias:example/repo.git
+      ') >/dev/null 2>&1 || ssh_environment_rc=$?
+  if [[ "$ssh_environment_rc" != 0 ]]; then
+    _pass "${ssh_environment_names[i]} override is rejected"
+  else
+    _fail "${ssh_environment_names[i]} override is rejected"
+  fi
+done
+
+# Repository config can replace either the SSH command or its invocation
+# contract without an environment variable, so those selectors also fail
+# closed when resolving an SSH URL.
+ssh_config_names=(core.sshCommand ssh.variant)
+ssh_config_values=(/bin/false ssh)
+for ((i = 0; i < ${#ssh_config_names[@]}; i++)); do
+  git -C "$override_repo" config "${ssh_config_names[i]}" \
+    "${ssh_config_values[i]}"
+  ssh_config_rc=0
+  # shellcheck disable=SC2016 # ROOT is expanded by the explicitly spawned Bash.
+  (cd "$override_repo" && ROOT="$ROOT" PATH="$bin_dir:$PATH" \
+    /bin/bash -c '
+      . "$ROOT/lib/git-tools-pr.sh"
+      gt_github_repo_transport_identity_from_url \
+        git@github-alias:example/repo.git
+    ') >/dev/null 2>&1 || ssh_config_rc=$?
+  git -C "$override_repo" config --unset "${ssh_config_names[i]}"
+  if [[ "$ssh_config_rc" != 0 ]]; then
+    _pass "${ssh_config_names[i]} override is rejected"
+  else
+    _fail "${ssh_config_names[i]} override is rejected"
+  fi
+done
+
+repo_lease_remote=$(_tmpdir)/remote.git
+repo_lease_seed=$(_tmpdir)/seed
+repo_lease_repo=$(_tmpdir)/repo
+repo_lease_log=$(_tmpdir)/gh.log
+_git_remote_repo "$repo_lease_remote" "$repo_lease_seed"
+_clone_feature_repo "$repo_lease_remote" "$repo_lease_repo"
+repo_lease_head=$(git -C "$repo_lease_repo" rev-parse HEAD)
+repo_lease_rc=0
+repo_lease_output=$(cd "$repo_lease_repo" && GH_LOG="$repo_lease_log" \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" --title "Wrong repo" \
+  --expect-head "$repo_lease_head" \
+  --expect-repo github.test/foreign/repo 2>&1) || repo_lease_rc=$?
+_assert_eq "mismatched expected repository is rejected" "1" "$repo_lease_rc"
+_assert_contains "mismatched expected repository explains the failure" \
+  "current repository does not match expected repository" "$repo_lease_output"
+_assert_eq "mismatched expected repository pushes no branch" "" \
+  "$(git -C "$repo_lease_remote" for-each-ref --format='%(refname)' \
+    refs/heads/feature/open)"
+
+stale_lease_remote=$(_tmpdir)/remote.git
+stale_lease_seed=$(_tmpdir)/seed
+stale_lease_repo=$(_tmpdir)/repo
+stale_lease_log=$(_tmpdir)/gh.log
+_git_remote_repo "$stale_lease_remote" "$stale_lease_seed"
+_clone_feature_repo "$stale_lease_remote" "$stale_lease_repo"
+stale_lease=$(git -C "$stale_lease_repo" rev-parse refs/heads/main)
+stale_lease_rc=0
+stale_lease_output=$(cd "$stale_lease_repo" && GH_LOG="$stale_lease_log" \
+  PATH="$bin_dir:$PATH" "$ROOT/bin/git-pr-open" --title "Stale lease" \
+  --expect-head "$stale_lease" 2>&1) || stale_lease_rc=$?
+_assert_eq "stale expected head is rejected" "1" "$stale_lease_rc"
+_assert_contains "stale expected head explains the mismatch" \
+  "current feature branch does not match expected head" "$stale_lease_output"
+_assert_eq "stale expected head pushes no branch" "" \
+  "$(git -C "$stale_lease_remote" for-each-ref --format='%(refname)' \
+    refs/heads/feature/open)"
 
 # A remote head can move after the last push verification but while GitHub is
 # creating the pull request. The command must inspect the created PR and report

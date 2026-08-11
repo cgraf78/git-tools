@@ -486,8 +486,7 @@ _gt_squash_patch_merged() (
   exit 1
 )
 
-# @brief Return 0 when <branch>'s changes are already present in <base> via a
-# squash, rebase, or cherry-pick merge.
+# @brief Internal content-merge proof for pinned commit OIDs.
 # These merge methods replay a branch's changes as brand-new commit(s) on the
 # base, so the branch tip is never an ancestor of the base and both
 # `git merge-base --is-ancestor` and `git branch -d` report it as unmerged.
@@ -505,16 +504,23 @@ _gt_squash_patch_merged() (
 # squash matches only #1, a multi-commit rebase matches only #2. Returns 1 for a
 # branch with no unique diff; that degenerate case has no patch-id to match and
 # is already covered by the plain ancestor check.
-gt_branch_content_merged() {
-  local branch base merge_base tree base_tree cherry squash_status=0
+_gt_branch_content_merged_oids() {
+  local branch="$1" base="$2" merge_base cherry squash_status=0
   local branch_delta base_delta missing grep_rc=0
+  local native_width=${#branch}
 
-  branch=$(git rev-parse --verify "$1^{commit}" 2>/dev/null) || return 1
-  base=$(git rev-parse --verify "$2^{commit}" 2>/dev/null) || return 1
+  # This entry point avoids subprocess validation only for OIDs already pinned
+  # by Git ref inventory or by the public wrappers below. Retain a cheap format
+  # check so an accidental future caller cannot turn a ref expression into an
+  # unchecked revision lookup.
+  case "$native_width" in
+    40 | 64) ;;
+    *) return 1 ;;
+  esac
+  [[ "${#base}" == "$native_width" ]] || return 1
+  [[ "$branch" != *[!0-9a-f]* && "$base" != *[!0-9a-f]* ]] || return 1
+
   merge_base=$(git merge-base "$base" "$branch" 2>/dev/null) || return 1
-  tree=$(git rev-parse "$branch^{tree}" 2>/dev/null) || return 1
-  base_tree=$(git rev-parse "$merge_base^{tree}" 2>/dev/null) || return 1
-  [[ "$tree" != "$base_tree" ]] || return 1
 
   # Patch IDs ignore whitespace and are only a historical match signal. Before
   # relying on one, compare exact raw tree deltas from the common ancestor. The
@@ -530,6 +536,9 @@ gt_branch_content_merged() {
     git -c core.quotePath=true diff-tree --no-commit-id --raw -r \
       --no-renames --no-abbrev "$merge_base" "$branch" --
   ) || return 1
+  # The raw delta is already the exact tree comparison needed here. Reusing it
+  # avoids resolving both tree OIDs separately before producing the same diff.
+  [[ -n "$branch_delta" ]] || return 1
   base_delta=$(
     git -c core.quotePath=true diff-tree --no-commit-id --raw -r \
       --no-renames --no-abbrev "$merge_base" "$base" --
@@ -563,6 +572,18 @@ gt_branch_content_merged() {
   esac
 }
 
+# @brief Return 0 when <branch>'s changes are already present in <base> via a
+# squash, rebase, or cherry-pick merge.
+# Resolve arbitrary caller refs to immutable commit OIDs before entering the
+# internal fast path. Branch-audit can skip these subprocesses because its OIDs
+# come directly from one successful `for-each-ref` snapshot.
+gt_branch_content_merged() {
+  local branch base
+  branch=$(git rev-parse --verify "$1^{commit}" 2>/dev/null) || return 1
+  base=$(git rev-parse --verify "$2^{commit}" 2>/dev/null) || return 1
+  _gt_branch_content_merged_oids "$branch" "$base"
+}
+
 # @brief Return 0 when <branch> is merged into <base> by any means.
 # True when the branch tip is an ancestor of the base (plain merge / fast
 # forward) OR when its changes have matching patch IDs in the base and its exact
@@ -577,7 +598,7 @@ gt_branch_merged() {
     ancestor_status=$?
   case "$ancestor_status" in
     0) return 0 ;;
-    1) gt_branch_content_merged "$branch" "$base" ;;
+    1) _gt_branch_content_merged_oids "$branch" "$base" ;;
     *) return 1 ;;
   esac
 }

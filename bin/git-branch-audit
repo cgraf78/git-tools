@@ -160,12 +160,15 @@ _list() {
       gt_die "could not compare branch to default: $name"
     read -r behind ahead <<<"$counts"
     merged=false
-    # A zero right-side count already proves the branch is an ancestor of the
-    # default. Avoid repeating that graph walk for the common ordinary-merge
-    # case; content-based detection remains necessary for squash/rebase merges.
+    # The count walk already classifies both one-sided histories. No branch-only
+    # commits means an ordinary merge; no default-only commits means the branch
+    # was based on the current default, which therefore cannot already contain
+    # a squash/rebase replay. Only genuinely divergent histories need the more
+    # expensive exact-delta and patch-ID proof.
     if [[ "$ahead" == 0 ]]; then
       merged=true
-    elif gt_branch_merged "$oid" "$_default_oid"; then
+    elif [[ "$behind" != 0 ]] &&
+      _gt_branch_content_merged_oids "$oid" "$_default_oid"; then
       merged=true
     fi
     gone=false

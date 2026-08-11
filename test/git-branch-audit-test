@@ -184,25 +184,39 @@ _assert_not_contains "porcelain omits the default branch" $'branch\tmain\t' "$re
 # every merged local branch.
 graph_probe_bin=$(_tmpdir)
 graph_probe_log="$graph_probe_bin/merge-base.log"
+validation_probe_log="$graph_probe_bin/rev-parse.log"
 cat >"$graph_probe_bin/git" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == merge-base ]]; then
   printf '%s\n' "$*" >>"${GIT_GRAPH_PROBE_LOG:?}"
+fi
+if [[ "${1:-}" == rev-parse ]]; then
+  printf '%s\n' "$*" >>"${GIT_VALIDATION_PROBE_LOG:?}"
 fi
 exec "${GIT_GRAPH_PROBE_REAL:?}" "$@"
 EOF
 chmod +x "$graph_probe_bin/git"
 _write_unauthenticated_gh_stub "$graph_probe_bin"
 : >"$graph_probe_log"
+: >"$validation_probe_log"
 merged_oid=$(git -C "$repo" rev-parse refs/heads/merged)
+ahead_oid=$(git -C "$repo" rev-parse refs/heads/ahead)
+gone_oid=$(git -C "$repo" rev-parse refs/heads/gone)
 graph_probe_real=$(type -a -p git | tail -n 1)
 (cd "$repo" &&
   PATH="$graph_probe_bin:$PATH" \
     GIT_GRAPH_PROBE_LOG="$graph_probe_log" \
+    GIT_VALIDATION_PROBE_LOG="$validation_probe_log" \
     GIT_GRAPH_PROBE_REAL="$graph_probe_real" \
     "$ROOT/bin/git-branch-audit" --base main --porcelain >/dev/null)
 _assert_not_contains "ordinary merge does not repeat ancestry graph walk" \
   "$merged_oid" "$(cat "$graph_probe_log")"
+_assert_not_contains "ahead-only branch skips content graph probes" \
+  "$ahead_oid" "$(cat "$graph_probe_log")"
+_assert_not_contains "gone ahead-only branch skips content graph probes" \
+  "$gone_oid" "$(cat "$graph_probe_log")"
+_assert_not_contains "pinned ahead-only branch skips commit revalidation" \
+  "$ahead_oid^{commit}" "$(cat "$validation_probe_log")"
 
 gone_line=$(printf '%s\n' "$result" | grep -F $'branch\tgone\t')
 _assert_contains "porcelain reports gone branch counts" $'branch\tgone\tfalse\t1\t0\t\t' "$gone_line"
@@ -273,14 +287,22 @@ audit_tmp=$(_tmpdir)
 _assert_eq "audit TMPDIR starts without proof artifacts" "" \
   "$(_tool_artifacts "$audit_tmp")"
 : >"$graph_probe_log"
+: >"$validation_probe_log"
 feature_oid=$(git -C "$squash_repo" rev-parse refs/heads/feature)
 (cd "$squash_repo" &&
   PATH="$graph_probe_bin:$PATH" \
     GIT_GRAPH_PROBE_LOG="$graph_probe_log" \
+    GIT_VALIDATION_PROBE_LOG="$validation_probe_log" \
     GIT_GRAPH_PROBE_REAL="$graph_probe_real" \
     "$ROOT/bin/git-branch-audit" --base main --porcelain >/dev/null)
 _assert_contains "squash merge still runs content-aware classification" \
   "$feature_oid" "$(cat "$graph_probe_log")"
+_assert_not_contains "divergence counts replace repeated ancestor probe" \
+  "merge-base --is-ancestor $feature_oid" "$(cat "$graph_probe_log")"
+_assert_not_contains "pinned divergent branch skips commit revalidation" \
+  "$feature_oid^{commit}" "$(cat "$validation_probe_log")"
+_assert_not_contains "raw delta replaces separate branch tree probe" \
+  "$feature_oid^{tree}" "$(cat "$validation_probe_log")"
 result=$(PATH="$unauth:$PATH" TMPDIR="$audit_tmp" \
   git -C "$squash_repo" branch-audit --porcelain 2>&1)
 _assert_contains "porcelain marks squash-merged branch as merged" \

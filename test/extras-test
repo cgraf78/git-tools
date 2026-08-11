@@ -58,6 +58,45 @@ _assert_symlink() {
   fi
 }
 
+_assert_link_target() {
+  local name="$1"
+  local expected="$2"
+  local path="$3"
+
+  if [[ -L "$path" && "$(readlink "$path")" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected link target: %s\n' "$expected" >&2
+    printf '  actual path: %s\n' "$path" >&2
+  fi
+}
+
+_assert_missing() {
+  local name="$1"
+  local path="$2"
+
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected path to be absent: %s\n' "$path" >&2
+  fi
+}
+
+_assert_regular_file_content() {
+  local name="$1"
+  local expected="$2"
+  local path="$3"
+
+  if [[ -f "$path" && ! -L "$path" && "$(cat "$path")" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected preserved regular file: %s\n' "$path" >&2
+  fi
+}
+
 _assert_contains() {
   local name="$1"
   local needle="$2"
@@ -268,6 +307,125 @@ for command in "${_commands[@]}"; do
   _assert_symlink "installs $command bash completion" "$prefix/share/bash-completion/completions/$command"
   _assert_symlink "installs $command zsh completion" "$prefix/share/zsh/site-functions/_$command"
   _assert_symlink "installs $command fish completion" "$prefix/share/fish/vendor_completions.d/$command.fish"
+  _assert_link_target "installs $command binary from this checkout" \
+    "$ROOT/bin/$command" "$prefix/bin/$command"
+  _assert_link_target "installs $command man page from this checkout" \
+    "$ROOT/man/man1/$command.1" "$prefix/share/man/man1/$command.1"
+  _assert_link_target "installs $command bash completion from this checkout" \
+    "$ROOT/completions/$command.bash" \
+    "$prefix/share/bash-completion/completions/$command"
+  _assert_link_target "installs $command zsh completion from this checkout" \
+    "$ROOT/completions/$command.zsh" \
+    "$prefix/share/zsh/site-functions/_$command"
+  _assert_link_target "installs $command fish completion from this checkout" \
+    "$ROOT/completions/$command.fish" \
+    "$prefix/share/fish/vendor_completions.d/$command.fish"
+done
+
+PREFIX="$prefix" "$ROOT/install.sh" >/dev/null
+_assert_link_target "reinstall is idempotent" \
+  "$ROOT/bin/${_commands[0]}" "$prefix/bin/${_commands[0]}"
+
+custom_root=$(_tmpdir)
+custom_bin="$custom_root/commands"
+custom_man="$custom_root/manuals"
+custom_bash="$custom_root/bash"
+custom_zsh="$custom_root/zsh"
+custom_fish="$custom_root/fish"
+BIN_DIR="$custom_bin" MAN_DIR="$custom_man" \
+  BASH_COMPLETION_DIR="$custom_bash" ZSH_COMPLETION_DIR="$custom_zsh" \
+  FISH_COMPLETION_DIR="$custom_fish" "$ROOT/install.sh" >/dev/null
+for command in "${_commands[@]}"; do
+  _assert_link_target "custom BIN_DIR receives $command" \
+    "$ROOT/bin/$command" "$custom_bin/$command"
+  _assert_link_target "custom MAN_DIR receives $command" \
+    "$ROOT/man/man1/$command.1" "$custom_man/$command.1"
+  _assert_link_target "custom BASH_COMPLETION_DIR receives $command" \
+    "$ROOT/completions/$command.bash" "$custom_bash/$command"
+  _assert_link_target "custom ZSH_COMPLETION_DIR receives $command" \
+    "$ROOT/completions/$command.zsh" "$custom_zsh/_$command"
+  _assert_link_target "custom FISH_COMPLETION_DIR receives $command" \
+    "$ROOT/completions/$command.fish" "$custom_fish/$command.fish"
+done
+
+blocked_prefix=$(_tmpdir)
+blocked_fish="$blocked_prefix/share/fish/vendor_completions.d/${_commands[0]}.fish"
+mkdir -p "$(dirname "$blocked_fish")"
+printf 'owned elsewhere\n' >"$blocked_fish"
+blocked_status=0
+blocked_output=$(PREFIX="$blocked_prefix" "$ROOT/install.sh" 2>&1) ||
+  blocked_status=$?
+_assert_eq "install refuses a non-symlink destination" 1 "$blocked_status"
+_assert_regular_file_content "install preserves a non-symlink destination" \
+  "owned elsewhere" "$blocked_fish"
+_assert_missing "destination preflight prevents a partial install" \
+  "$blocked_prefix/bin/${_commands[0]}"
+_assert_contains "destination refusal is actionable" \
+  "refusing to replace non-symlink" <(printf '%s\n' "$blocked_output")
+
+missing_root=$(_tmpdir)
+missing_prefix=$(_tmpdir)
+mkdir -p "$missing_root/lib"
+cp "$ROOT/install.sh" "$missing_root/install.sh"
+cp "$ROOT/lib/git-tools-inventory.sh" "$missing_root/lib/"
+cp -R "$ROOT/bin" "$ROOT/man" "$ROOT/completions" "$missing_root/"
+rm "$missing_root/completions/${_commands[0]}.fish"
+missing_status=0
+missing_output=$(PREFIX="$missing_prefix" "$missing_root/install.sh" 2>&1) ||
+  missing_status=$?
+_assert_eq "install rejects an incomplete source tree" 1 "$missing_status"
+_assert_missing "source preflight prevents a partial install" \
+  "$missing_prefix/bin/${_commands[0]}"
+_assert_contains "missing source is actionable" "source is missing" \
+  <(printf '%s\n' "$missing_output")
+
+rollback_prefix=$(_tmpdir)
+rollback_bin=$(_tmpdir)
+rollback_prior_target=--help
+rollback_last_command=${_commands[${#_commands[@]} - 1]}
+mkdir -p "$rollback_prefix/bin"
+ln -s -- "$rollback_prior_target" \
+  "$rollback_prefix/bin/${_commands[0]}"
+cat >"$rollback_bin/ln" <<'SH'
+#!/usr/bin/env bash
+ln_args=("$@")
+ln_operand_count=${#ln_args[@]}
+ln_source_operand=${ln_args[$((ln_operand_count - 2))]}
+ln_target_operand=${ln_args[$((ln_operand_count - 1))]}
+"$GIT_TOOLS_TEST_REAL_LN" "$@" || exit $?
+if [[ $ln_source_operand == "$GIT_TOOLS_TEST_LN_FAIL_SOURCE" &&
+  $ln_target_operand == "$GIT_TOOLS_TEST_LN_FAIL_TARGET" ]]; then
+  printf 'injected late ln failure\n' >&2
+  exit 73
+fi
+SH
+chmod +x "$rollback_bin/ln"
+rollback_status=0
+rollback_output=$(
+  PATH="$rollback_bin:$PATH" \
+    GIT_TOOLS_TEST_REAL_LN="$(command -v ln)" \
+    GIT_TOOLS_TEST_LN_FAIL_SOURCE="$ROOT/completions/$rollback_last_command.fish" \
+    GIT_TOOLS_TEST_LN_FAIL_TARGET="$rollback_prefix/share/fish/vendor_completions.d/$rollback_last_command.fish" \
+    PREFIX="$rollback_prefix" "$ROOT/install.sh" 2>&1
+) || rollback_status=$?
+_assert_eq "late link failure preserves its status" 73 "$rollback_status"
+_assert_contains "late link failure preserves its diagnostic" \
+  "injected late ln failure" <(printf '%s\n' "$rollback_output")
+_assert_link_target "rollback restores an option-like command target" \
+  "$rollback_prior_target" "$rollback_prefix/bin/${_commands[0]}"
+for command in "${_commands[@]}"; do
+  if [[ "$command" != "${_commands[0]}" ]]; then
+    _assert_missing "rollback removes new $command command link" \
+      "$rollback_prefix/bin/$command"
+  fi
+  _assert_missing "rollback removes new $command manpage link" \
+    "$rollback_prefix/share/man/man1/$command.1"
+  _assert_missing "rollback removes new $command bash completion" \
+    "$rollback_prefix/share/bash-completion/completions/$command"
+  _assert_missing "rollback removes new $command zsh completion" \
+    "$rollback_prefix/share/zsh/site-functions/_$command"
+  _assert_missing "rollback removes new $command fish completion" \
+    "$rollback_prefix/share/fish/vendor_completions.d/$command.fish"
 done
 
 installed_help=$(_tmpdir)/repo-state-help.out

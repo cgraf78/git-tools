@@ -365,13 +365,15 @@ _assert_contains "destination refusal is actionable" \
 
 missing_root=$(_tmpdir)
 missing_prefix=$(_tmpdir)
-mkdir -p "$missing_root/lib"
-cp "$ROOT/install.sh" "$missing_root/install.sh"
+mkdir -p "$missing_root/lib" "$missing_root/support"
+cp "$ROOT/support/install-checkout.sh" \
+  "$missing_root/support/install-checkout.sh"
 cp "$ROOT/lib/git-tools-inventory.sh" "$missing_root/lib/"
 cp -R "$ROOT/bin" "$ROOT/man" "$ROOT/completions" "$missing_root/"
 rm "$missing_root/completions/${_commands[0]}.fish"
 missing_status=0
-missing_output=$(PREFIX="$missing_prefix" "$missing_root/install.sh" 2>&1) ||
+missing_output=$(PREFIX="$missing_prefix" \
+  "$missing_root/support/install-checkout.sh" 2>&1) ||
   missing_status=$?
 _assert_eq "install rejects an incomplete source tree" 1 "$missing_status"
 _assert_missing "source preflight prevents a partial install" \

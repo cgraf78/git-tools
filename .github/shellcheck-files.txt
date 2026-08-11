@@ -36,6 +36,8 @@ program	install.sh
 program	lib/git-tools-base.sh
 program	lib/git-tools-inventory.sh
 program	lib/git-tools-pr.sh
+program	scripts/checkout-installer.conf
+program	support/install-checkout.sh
 program	support/sync-launcher-bootstrap
 program	test/extras-test
 program	test/git-absorb-and-rebase-test
@@ -54,6 +56,7 @@ program	test/git-repo-state-test
 program	test/git-resolve-base-test
 program	test/git-stash-audit-test
 program	test/git-worktree-audit-test
+program	test/install-test
 program	test/launcher-bootstrap-test
 program	test/lib/test-temp.sh
 program	test/run

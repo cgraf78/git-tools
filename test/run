@@ -16,6 +16,7 @@ done < <(git_tools_commands "$ROOT")
 test_files=(
   "$ROOT/test/runner-test"
   "$ROOT/test/launcher-bootstrap-test"
+  "$ROOT/test/install-test"
   "$ROOT/test/extras-test"
   "$ROOT/test/test-temp-test"
 )

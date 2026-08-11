@@ -533,14 +533,33 @@ git stash-audit
 git worktree-audit
 ```
 
-For a simple local install:
+For a checkout-backed curl install:
 
 ```sh
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/cgraf78/git-tools/main/install.sh | bash
 ```
 
+This keeps a durable managed checkout under `$XDG_DATA_HOME` when that path is
+absolute, or under `$HOME/.local/share` otherwise, preserving the command
+family, shared libraries, man pages, and completions on one revision. It does
+not use a release asset or copy a second runtime tree. Git and Bash 3.2 or newer
+are required.
+
+To choose and manage the checkout yourself instead:
+
+```sh
+git clone https://github.com/cgraf78/git-tools.git
+cd git-tools
+bash install.sh
+```
+
+Keep that checkout in place: the installed commands resolve their shared
+libraries through the symlinks. Rerunning the curl command safely fast-forwards
+its clean managed checkout before republishing every link.
+
 Set `PREFIX` or `BIN_DIR` to choose another command destination. The installer
-also links bundled man pages and completions using standard XDG-style
+retargets existing symlinks but refuses to replace real files or directories.
+It also links bundled man pages and completions using standard XDG-style
 subdirectories under `PREFIX/share`:
 
 ```text

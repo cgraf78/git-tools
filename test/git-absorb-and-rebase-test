@@ -112,6 +112,57 @@ else
   _assert_eq "autosquashes fixup commits" "$expected" "$result"
   result=$(git -C "$repo" show HEAD~1:app.txt)
   _assert_eq "folds staged fix into target commit" "alpha fixed" "$result"
+
+  # Dotfiles-style repositories have a separate bare Git directory and work
+  # tree, so there is no parent `.git` directory for command discovery. Keep
+  # that repository shape in the provider suite: the command must honor the
+  # caller's explicit GIT_DIR/GIT_WORK_TREE through both absorb and rebase.
+  bare_work_tree=$(_tmpdir)
+  bare_git_dir="$bare_work_tree/.dotfiles"
+  mkdir -p "$bare_work_tree/.config/test"
+  git init --bare --initial-branch=main "$bare_git_dir" >/dev/null
+  git --git-dir="$bare_git_dir" --work-tree="$bare_work_tree" \
+    config user.email "test@test.com"
+  git --git-dir="$bare_git_dir" --work-tree="$bare_work_tree" \
+    config user.name "Test"
+  git --git-dir="$bare_git_dir" --work-tree="$bare_work_tree" \
+    config core.hooksPath /dev/null
+  printf 'base\n' >"$bare_work_tree/.bashrc"
+  git --git-dir="$bare_git_dir" --work-tree="$bare_work_tree" add .bashrc
+  git --git-dir="$bare_git_dir" --work-tree="$bare_work_tree" \
+    commit -m "base" >/dev/null
+  bare_base=$(git --git-dir="$bare_git_dir" --work-tree="$bare_work_tree" \
+    rev-parse HEAD)
+  printf 'alpha\n' >"$bare_work_tree/.config/test/file"
+  git --git-dir="$bare_git_dir" --work-tree="$bare_work_tree" \
+    add .config/test/file
+  git --git-dir="$bare_git_dir" --work-tree="$bare_work_tree" \
+    commit -m "add dot file" >/dev/null
+  printf 'beta\n' >"$bare_work_tree/.config/test/other"
+  git --git-dir="$bare_git_dir" --work-tree="$bare_work_tree" \
+    add .config/test/other
+  git --git-dir="$bare_git_dir" --work-tree="$bare_work_tree" \
+    commit -m "add other dot file" >/dev/null
+  printf 'alpha fixed\n' >"$bare_work_tree/.config/test/file"
+  git --git-dir="$bare_git_dir" --work-tree="$bare_work_tree" \
+    add .config/test/file
+  result=$(
+    cd "$bare_work_tree/.config/test" &&
+      GIT_DIR="$bare_git_dir" GIT_WORK_TREE="$bare_work_tree" \
+        GIT_SEQUENCE_EDITOR=false git absorb-and-rebase --base "$bare_base" 2>&1
+  )
+  _assert_contains "supports an explicit bare Git directory and work tree" \
+    "git absorb-and-rebase: base $bare_base" "$result"
+  result=$(git --git-dir="$bare_git_dir" --work-tree="$bare_work_tree" \
+    log --format=%s --reverse "$bare_base"..HEAD)
+  expected="$(printf 'add dot file\nadd other dot file')"
+  _assert_eq "autosquashes fixups in a separate bare work tree" \
+    "$expected" "$result"
+  result=$(git --git-dir="$bare_git_dir" --work-tree="$bare_work_tree" \
+    show HEAD~1:.config/test/file)
+  _assert_eq "folds staged fixes in a separate bare work tree" \
+    "alpha fixed" "$result"
+
   result=$(git -C "$repo" absorb-and-rebase 2>&1 || true)
   _assert_contains "refuses with no staged changes" \
     "no staged changes to absorb" "$result"

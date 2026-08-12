@@ -234,7 +234,10 @@ git_tools_worktree_remove() {
     worktree_path="$PWD"
   fi
 
-  if [[ "$worktree_path" == "$main_path" ]]; then
+  # Git reports a physical worktree path while an interactive shell may retain
+  # an equivalent logical spelling (notably `/var` versus `/private/var` on
+  # macOS). Compare filesystem identity so aliases cannot bypass the guard.
+  if [[ "$worktree_path" -ef "$main_path" ]]; then
     printf 'error: cannot remove the main worktree\n' >&2
     return 1
   fi

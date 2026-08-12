@@ -272,10 +272,17 @@ fi
 
 main_remove_output=""
 main_remove_rc=0
-main_remove_output=$(cd "$repo" && git_tools_worktree_remove 2>&1) ||
+# macOS exposes the same temporary directory through `/var` and
+# `/private/var`. A symlink gives every platform the same logical-versus-
+# physical path split, so the main-worktree guard cannot regress to comparing
+# path spelling instead of directory identity.
+repo_alias="$case_root/repo-alias"
+ln -s "$repo" "$repo_alias"
+main_remove_output=$(cd "$repo_alias" && git_tools_worktree_remove 2>&1) ||
   main_remove_rc=$?
-assert_eq "worktree removal refuses the main worktree" 1 "$main_remove_rc"
-assert_eq "main-worktree refusal is actionable" \
+assert_eq "worktree removal refuses the main worktree through a path alias" \
+  1 "$main_remove_rc"
+assert_eq "aliased main-worktree refusal is actionable" \
   "error: cannot remove the main worktree" "$main_remove_output"
 
 slash_output=$(cd "$repo" && git_tools_worktree nested/slash main &&

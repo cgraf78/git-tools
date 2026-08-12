@@ -9,6 +9,7 @@ MAN_DIR="${MAN_DIR:-$SHARE_DIR/man/man1}"
 BASH_COMPLETION_DIR="${BASH_COMPLETION_DIR:-$SHARE_DIR/bash-completion/completions}"
 ZSH_COMPLETION_DIR="${ZSH_COMPLETION_DIR:-$SHARE_DIR/zsh/site-functions}"
 FISH_COMPLETION_DIR="${FISH_COMPLETION_DIR:-$SHARE_DIR/fish/vendor_completions.d}"
+SHELL_INTEGRATION_DIR="${SHELL_INTEGRATION_DIR:-$SHARE_DIR/git-tools}"
 ROOT=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 # shellcheck source=../lib/git-tools-inventory.sh
@@ -51,6 +52,7 @@ for command in "${COMMANDS[@]}"; do
   _require_file "$ROOT/completions/$command.zsh"
   _require_file "$ROOT/completions/$command.fish"
 done
+_require_file "$ROOT/share/git-tools/shell.sh"
 
 # Build the publication order once so destination validation, rollback state,
 # and the actual ln calls describe the same complete command family.
@@ -60,6 +62,11 @@ for command in "${COMMANDS[@]}"; do
   LINK_SOURCES+=("$ROOT/bin/$command")
   LINK_TARGETS+=("$BIN_DIR/$command")
 done
+# The shell API is part of the same checkout-backed interface as the commands.
+# Publish a symlink instead of a copy so an installer update cannot leave
+# interactive functions on a different revision from their Git helpers.
+LINK_SOURCES+=("$ROOT/share/git-tools/shell.sh")
+LINK_TARGETS+=("$SHELL_INTEGRATION_DIR/shell.sh")
 for page in "$ROOT"/man/man1/*.1; do
   LINK_SOURCES+=("$page")
   LINK_TARGETS+=("$MAN_DIR/$(basename "$page")")
@@ -125,7 +132,7 @@ _rollback_links() {
 }
 
 mkdir -p "$BIN_DIR" "$MAN_DIR" "$BASH_COMPLETION_DIR" \
-  "$ZSH_COMPLETION_DIR" "$FISH_COMPLETION_DIR"
+  "$ZSH_COMPLETION_DIR" "$FISH_COMPLETION_DIR" "$SHELL_INTEGRATION_DIR"
 for ((link_index = 0; link_index < ${#LINK_TARGETS[@]}; link_index++)); do
   if ln -sfn -- "${LINK_SOURCES[link_index]}" "${LINK_TARGETS[link_index]}"; then
     continue
@@ -143,3 +150,4 @@ printf 'installed man pages to %s\n' "$MAN_DIR"
 printf 'installed bash completions to %s\n' "$BASH_COMPLETION_DIR"
 printf 'installed zsh completions to %s\n' "$ZSH_COMPLETION_DIR"
 printf 'installed fish completions to %s\n' "$FISH_COMPLETION_DIR"
+printf 'installed shell integration to %s\n' "$SHELL_INTEGRATION_DIR"

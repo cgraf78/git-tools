@@ -139,6 +139,12 @@ _cleanup_dry_objects() {
   exit "$status"
 }
 
+# Dry-run classification still needs the exact remote base object, which may not
+# exist locally; `git fetch --dry-run` therefore cannot supply the commit graph
+# needed below. A normal no-ref fetch avoids ref and FETCH_HEAD updates but would
+# still add objects to the repository. Redirect those writes to private temporary
+# storage, expose the original object store and caller-provided alternates only as
+# read sources, and remove the temporary store on normal or signaled exit.
 _enable_dry_object_store() {
   local source_objects existing_alternates="${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}"
 

@@ -301,6 +301,10 @@ prefix=$(_tmpdir)
 install_out=$(_tmpdir)/install.out
 PREFIX="$prefix" "$ROOT/install.sh" >"$install_out" 2>&1
 
+_assert_symlink "installs interactive shell integration" \
+  "$prefix/share/git-tools/shell.sh"
+_assert_link_target "installs shell integration from this checkout" \
+  "$ROOT/share/git-tools/shell.sh" "$prefix/share/git-tools/shell.sh"
 for command in "${_commands[@]}"; do
   _assert_symlink "installs $command binary" "$prefix/bin/$command"
   _assert_symlink "installs $command man page" "$prefix/share/man/man1/$command.1"
@@ -325,6 +329,8 @@ done
 PREFIX="$prefix" "$ROOT/install.sh" >/dev/null
 _assert_link_target "reinstall is idempotent" \
   "$ROOT/bin/${_commands[0]}" "$prefix/bin/${_commands[0]}"
+_assert_link_target "shell integration reinstall is idempotent" \
+  "$ROOT/share/git-tools/shell.sh" "$prefix/share/git-tools/shell.sh"
 
 custom_root=$(_tmpdir)
 custom_bin="$custom_root/commands"
@@ -332,9 +338,13 @@ custom_man="$custom_root/manuals"
 custom_bash="$custom_root/bash"
 custom_zsh="$custom_root/zsh"
 custom_fish="$custom_root/fish"
+custom_shell="$custom_root/shell"
 BIN_DIR="$custom_bin" MAN_DIR="$custom_man" \
   BASH_COMPLETION_DIR="$custom_bash" ZSH_COMPLETION_DIR="$custom_zsh" \
-  FISH_COMPLETION_DIR="$custom_fish" "$ROOT/install.sh" >/dev/null
+  FISH_COMPLETION_DIR="$custom_fish" \
+  SHELL_INTEGRATION_DIR="$custom_shell" "$ROOT/install.sh" >/dev/null
+_assert_link_target "custom SHELL_INTEGRATION_DIR receives shell integration" \
+  "$ROOT/share/git-tools/shell.sh" "$custom_shell/shell.sh"
 for command in "${_commands[@]}"; do
   _assert_link_target "custom BIN_DIR receives $command" \
     "$ROOT/bin/$command" "$custom_bin/$command"
@@ -369,7 +379,8 @@ mkdir -p "$missing_root/lib" "$missing_root/support"
 cp "$ROOT/support/install-checkout.sh" \
   "$missing_root/support/install-checkout.sh"
 cp "$ROOT/lib/git-tools-inventory.sh" "$missing_root/lib/"
-cp -R "$ROOT/bin" "$ROOT/man" "$ROOT/completions" "$missing_root/"
+cp -R "$ROOT/bin" "$ROOT/man" "$ROOT/completions" "$ROOT/share" \
+  "$missing_root/"
 rm "$missing_root/completions/${_commands[0]}.fish"
 missing_status=0
 missing_output=$(PREFIX="$missing_prefix" \
@@ -429,6 +440,8 @@ for command in "${_commands[@]}"; do
   _assert_missing "rollback removes new $command fish completion" \
     "$rollback_prefix/share/fish/vendor_completions.d/$command.fish"
 done
+_assert_missing "rollback removes new shell integration" \
+  "$rollback_prefix/share/git-tools/shell.sh"
 
 installed_help=$(_tmpdir)/repo-state-help.out
 if "$prefix/bin/git-repo-state" --help >"$installed_help" 2>&1; then
@@ -443,6 +456,8 @@ _assert_contains "install reports man destination" "installed man pages to" "$in
 _assert_contains "install reports bash destination" "installed bash completions to" "$install_out"
 _assert_contains "install reports zsh destination" "installed zsh completions to" "$install_out"
 _assert_contains "install reports fish destination" "installed fish completions to" "$install_out"
+_assert_contains "install reports shell integration destination" \
+  "installed shell integration to" "$install_out"
 
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2

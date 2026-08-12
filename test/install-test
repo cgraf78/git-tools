@@ -85,12 +85,16 @@ run_installer() {
     BASH_COMPLETION_DIR="$prefix/share/bash-completion/completions" \
     ZSH_COMPLETION_DIR="$prefix/share/zsh/site-functions" \
     FISH_COMPLETION_DIR="$prefix/share/fish/vendor_completions.d" \
+    SHELL_INTEGRATION_DIR="$prefix/share/git-tools" \
     "$installer"
 }
 
 assert_install() {
   local description="$1" checkout="$2" prefix="$3" command command_status
 
+  assert_link "$description: interactive shell integration" \
+    "$checkout/share/git-tools/shell.sh" \
+    "$prefix/share/git-tools/shell.sh"
   for command in "${commands[@]}"; do
     assert_link "$description: command $command" \
       "$checkout/bin/$command" "$prefix/bin/$command"
@@ -128,7 +132,7 @@ direct_prefix="$fixture/direct-prefix"
 pipe_prefix="$fixture/pipe-prefix"
 mkdir -p "$source_checkout"
 cp "$wrapper" "$source_checkout/install.sh"
-cp -R "$ROOT/bin" "$ROOT/completions" "$ROOT/lib" "$ROOT/man" \
+cp -R "$ROOT/bin" "$ROOT/completions" "$ROOT/lib" "$ROOT/man" "$ROOT/share" \
   "$ROOT/support" "$source_checkout/"
 git -C "$source_checkout" init --quiet --initial-branch=main --template=''
 git -C "$source_checkout" config core.hooksPath /dev/null
@@ -159,6 +163,7 @@ curl --fail --silent --show-error "file://$source_checkout/install.sh" |
     BASH_COMPLETION_DIR="$pipe_prefix/share/bash-completion/completions" \
     ZSH_COMPLETION_DIR="$pipe_prefix/share/zsh/site-functions" \
     FISH_COMPLETION_DIR="$pipe_prefix/share/fish/vendor_completions.d" \
+    SHELL_INTEGRATION_DIR="$pipe_prefix/share/git-tools" \
     CGRAF78_CHECKOUT_INSTALL_DIR="$managed" \
     CGRAF78_CHECKOUT_INSTALL_REPO_URL="file://$remote" \
     bash -s >"$pipe_output_file" 2>&1

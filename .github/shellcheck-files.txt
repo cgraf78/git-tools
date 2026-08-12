@@ -37,6 +37,7 @@ program	lib/git-tools-base.sh
 program	lib/git-tools-inventory.sh
 program	lib/git-tools-pr.sh
 program	scripts/checkout-installer.conf
+program	share/git-tools/shell.sh
 program	support/install-checkout.sh
 program	support/sync-launcher-bootstrap
 program	test/extras-test
@@ -61,4 +62,5 @@ program	test/launcher-bootstrap-test
 program	test/lib/test-temp.sh
 program	test/run
 program	test/runner-test
+program	test/shell-integration-test
 program	test/test-temp-test

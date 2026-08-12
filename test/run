@@ -18,6 +18,7 @@ test_files=(
   "$ROOT/test/launcher-bootstrap-test"
   "$ROOT/test/install-test"
   "$ROOT/test/extras-test"
+  "$ROOT/test/shell-integration-test"
   "$ROOT/test/test-temp-test"
 )
 for command in "${commands[@]}"; do

@@ -502,6 +502,56 @@ changes when nothing is staged, refuses active rebase/merge/cherry-pick/revert
 states, and rolls back partial fixup generation if `git absorb` leaves staged
 changes behind.
 
+## Interactive shell workflows
+
+`share/git-tools/shell.sh` is a sourceable Bash and zsh integration for common
+interactive Git and worktree workflows. After installation, load it with:
+
+```sh
+. "$HOME/.local/share/git-tools/shell.sh"
+```
+
+The integration exports namespaced functions so it can coexist with an
+existing shell configuration:
+
+- `git_tools_fzf_branch` selects and switches branches.
+- `git_tools_fzf_log` selects and shows a recent commit.
+- `git_tools_fzf_status` selects a changed file and opens it.
+- `git_tools_fzf_stash` selects and, after confirmation, pops a stash.
+- `git_tools_worktree_root` prints the repository's worktree root.
+- `git_tools_worktree` creates or enters a branch worktree.
+- `git_tools_worktree_list` selects and enters an existing worktree.
+- `git_tools_worktree_remove` removes a branch worktree.
+- `git_tools_worktree_prune` prunes stale and empty worktree state.
+
+The picker functions require
+[`fzf`](https://github.com/junegunn/fzf). `git_tools_fzf_status` uses
+`$EDITOR`, defaulting to `vi`. Worktrees live under
+`$GIT_TOOLS_WORKTREE_PARENT/<repository>` when that variable is set, or under
+`$HOME/worktrees/<repository>` otherwise. Slash-separated branch names use
+`__` in their worktree directory names.
+
+Consumers own presentation and local shorthand. Define any of these hooks
+before sourcing the integration to customize it without copying the Git
+workflow implementation:
+
+```sh
+git_tools_fzf_preview() { command fzf --height=80% "$@"; }
+git_tools_fzf_pick() { command fzf --height=40% "$@"; }
+git_tools_edit_file() { "${EDITOR:-vi}" "$1"; }
+
+. "$HOME/.local/share/git-tools/shell.sh"
+
+gbr() { git_tools_fzf_branch "$@"; }
+gw() { git_tools_worktree "$@"; }
+```
+
+Hooks survive repeated sourcing, which makes the file safe to load from shell
+configuration that may be refreshed in place. The provider intentionally does
+not define short names such as `gbr` or `gw`; those remain consumer policy.
+See [`share/git-tools/README.md`](share/git-tools/README.md) for the complete
+embedding contract.
+
 ## Requirements
 
 - Bash
@@ -541,9 +591,9 @@ curl -fsSL https://raw.githubusercontent.com/cgraf78/git-tools/main/install.sh |
 
 This keeps a durable managed checkout under `$XDG_DATA_HOME` when that path is
 absolute, or under `$HOME/.local/share` otherwise, preserving the command
-family, shared libraries, man pages, and completions on one revision. It does
-not use a release asset or copy a second runtime tree. Git and Bash 3.2 or newer
-are required.
+family, shared libraries, shell integration, man pages, and completions on one
+revision. It does not use a release asset or copy a second runtime tree. Git
+and Bash 3.2 or newer are required.
 
 To choose and manage the checkout yourself instead:
 
@@ -563,6 +613,7 @@ It also links bundled man pages and completions using standard XDG-style
 subdirectories under `PREFIX/share`:
 
 ```text
+share/git-tools/shell.sh
 share/man/man1/
 share/bash-completion/completions/
 share/zsh/site-functions/
@@ -570,9 +621,11 @@ share/fish/vendor_completions.d/
 ```
 
 Override `MAN_DIR`, `BASH_COMPLETION_DIR`, `ZSH_COMPLETION_DIR`, or
-`FISH_COMPLETION_DIR` when a shell expects a different local directory. The
+`FISH_COMPLETION_DIR` when a shell expects a different local directory. Set
+`SHELL_INTEGRATION_DIR` to install the sourceable integration elsewhere. The
 repo also keeps the source files in the shdeps-discoverable layout:
-`man/man1/*.1` and `completions/*.{bash,zsh,fish}`.
+`share/git-tools/shell.sh`, `man/man1/*.1`, and
+`completions/*.{bash,zsh,fish}`.
 
 ## Test
 
@@ -598,6 +651,7 @@ test/git-pr-ready-test
 test/git-pr-restack-test
 test/git-pr-stack-test
 test/git-pr-submit-test
+test/shell-integration-test
 ```
 
 If `git-absorb` is not installed, the test suite verifies the dependency error

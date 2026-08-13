@@ -1,4 +1,4 @@
-.TH GIT-CLEANUP-REPO 1 "2026-08-12" "git-tools" "User Commands"
+.TH GIT-CLEANUP-REPO 1 "2026-08-13" "git-tools" "User Commands"
 .SH NAME
 git-cleanup-repo \- delete safely merged local branches
 .SH SYNOPSIS
@@ -56,7 +56,7 @@ Also select branches whose upstream is gone for cleanup.
 Delete all local branches except the base branch.
 .TP
 .B \-\-remove\-worktrees
-Remove clean, operation-free linked worktrees for branches selected for
+Remove eligible, operation-free linked worktrees for branches selected for
 deletion. Removal never uses
 .BR \-\-force .
 .TP
@@ -65,12 +65,36 @@ Print actions without changing anything.
 .TP
 .BR \-h ", " \-\-help
 Show help.
+.SH WORKTREE PRUNING
+Before removing an otherwise eligible linked worktree, the command recognizes
+two explicit classes of disposable top-level entries. A real top-level
+directory is disposable when its real
+.B CACHEDIR.TAG
+file begins with the standard
+.B Signature: 8a477f597d28d172789f06886806bc55
+line. A repository can authorize another literal top-level entry with a
+repository-local, multi-valued setting:
+.PP
+.nf
+git config --local --add cleanupRepo.worktreePrunePath .cache
+.fi
+.PP
+This setting grants deletion authority. Values containing a path separator,
+traversal, a newline, or the Git administrative name
+.B .git
+are rejected. Global and command-line configuration cannot grant this
+authority. The command prunes an authorized entry with a path-limited
+.B git clean -fdx
+and repeats all worktree checks afterward. Unknown local content present at
+preflight prevents every prune. Dry-run only reports entries that would be
+pruned.
 .SH SAFETY
 The command refuses to run with a dirty current worktree or active rebase,
-merge, cherry-pick, or revert state. A linked worktree is preserved when it has
-uncommitted, ignored, or index-hidden local content, is unreadable, is locked by
-an active operation, or cannot be removed without force. Git cannot atomically
-combine worktree reservation checks with ref deletion, so callers must not
-create, switch, or mutate worktrees concurrently with cleanup. Observable state
-is rechecked, and expected-old-object-ID ref deletion preserves a branch that
-advances during cleanup.
+merge, cherry-pick, or revert state. Except for explicitly disposable entries,
+a linked worktree is preserved when it has uncommitted, untracked, ignored, or
+index-hidden local content, is unreadable, is locked by an active operation, or
+cannot be removed without force. Git cannot atomically combine worktree
+reservation checks with ref deletion, so callers must not create, switch, or
+mutate worktrees concurrently with cleanup. Observable state is rechecked, and
+expected-old-object-ID ref deletion preserves a branch that advances during
+cleanup.

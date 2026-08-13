@@ -294,7 +294,7 @@ _assert_contains "zsh cleanup describes gone selection" \
   "--gone[Select gone-upstream branches for cleanup]" \
   "$ROOT/completions/git-cleanup-repo.zsh"
 _assert_contains "fish cleanup describes worktree removal" \
-  'remove-worktrees -d "Remove clean linked worktrees for deleted branches"' \
+  'remove-worktrees -d "Remove eligible linked worktrees for deleted branches"' \
   "$ROOT/completions/git-cleanup-repo.fish"
 
 prefix=$(_tmpdir)

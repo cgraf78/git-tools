@@ -34,7 +34,7 @@ Options:
   -r, --remote <name>       Remote endpoint to fetch from (default: origin).
       --gone                Select gone-upstream branches for cleanup.
   -a, --all                 Delete all local branches except the base branch.
-      --remove-worktrees    Remove clean linked worktrees for deleted branches.
+      --remove-worktrees    Remove eligible linked worktrees for deleted branches.
   -n, --dry-run             Print actions without changing anything.
   -h, --help                Show this help.
 EOF
@@ -314,20 +314,202 @@ _delete_reason() {
   return 1
 }
 
-_worktree_dirty_state() {
-  local path="$1" entry ignored index_state output
+_validate_worktree_prune_path() {
+  local entry="$1" folded
 
-  if ! output=$(GIT_OPTIONAL_LOCKS=0 \
-    gt_git_without_local_env -C "$path" status --porcelain 2>/dev/null); then
-    printf 'unknown\n'
-  elif [[ -n "$output" ]]; then
+  case "$entry" in
+    "" | . | .. | */* | *\\* | *$'\n'* | *$'\r'*) return 1 ;;
+  esac
+  folded=$(printf '%s' "$entry" | LC_ALL=C tr '[:upper:]' '[:lower:]') ||
+    return 1
+  [[ "$folded" != .git ]]
+}
+
+_emit_worktree_prune_paths() {
+  # Keep the unpredictable completion marker in positional parameters. A
+  # named local can inherit an exported attribute from the caller and leak the
+  # marker to the Git producer's environment on Bash 3.2.
+  set -- "$1" 0
+  git config --local --null --get-all \
+    cleanupRepo.worktreePrunePath || set -- "$1" "$?"
+  printf '%s:%s\0' "$1" "$2"
+}
+
+_load_worktree_prune_paths() {
+  local candidate completion_status="" config_fd="" configured entry existing
+  local complete=0 invalid=0 invalid_entry="" malformed=0 saw_entry=0
+  local trailing=0
+
+  _worktree_prune_paths=()
+  for candidate in 9 8 7 6 5 4 3; do
+    if ! { true <&"$candidate"; } 2>/dev/null; then
+      config_fd=$candidate
+      break
+    fi
+  done
+  [[ -n "$config_fd" ]] ||
+    _die "could not reserve a descriptor for worktree prune paths"
+  set -- "$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null && printf x)"
+  set -- "${1//[[:space:]]/}"
+  [[ ${#1} -eq 33 && "$1" == *x && "${1%x}" != *[!0-9a-f]* ]] ||
+    _die "could not create a worktree prune path completion record"
+  set -- $'\036git-tools-worktree-prune-paths-complete-'"${1%x}"
+  if ! eval "exec $config_fd< <(_emit_worktree_prune_paths \"\$1\")"; then
+    _die "could not read repository-local worktree prune paths"
+  fi
+
+  # Deletion authority must be granted by this repository. In particular,
+  # inherited global and command-scope values cannot silently opt every
+  # checkout into removing a common name such as .cache.
+  while :; do
+    entry=""
+    if IFS= read -r -d '' entry <&"$config_fd"; then
+      if [[ "$entry" == "$1":* ]]; then
+        if [[ "$complete" == 1 ]]; then
+          trailing=1
+        else
+          completion_status=${entry#"$1":}
+          [[ -n "$completion_status" &&
+            "$completion_status" != *[!0-9]* ]] || malformed=1
+          complete=1
+        fi
+        continue
+      fi
+      if [[ "$complete" == 1 ]]; then
+        trailing=1
+        continue
+      fi
+      saw_entry=1
+      if ! _validate_worktree_prune_path "$entry"; then
+        if [[ "$invalid" == 0 ]]; then
+          invalid=1
+          invalid_entry=$entry
+        fi
+        continue
+      fi
+      configured=0
+      for existing in \
+        ${_worktree_prune_paths[@]+"${_worktree_prune_paths[@]}"}; do
+        if [[ "$existing" == "$entry" ]]; then
+          configured=1
+          break
+        fi
+      done
+      [[ "$configured" == 1 ]] || _worktree_prune_paths+=("$entry")
+      continue
+    fi
+    [[ -z "$entry" ]] || malformed=1
+    break
+  done
+  eval "exec $config_fd<&-"
+
+  [[ "$complete" == 1 && "$trailing" == 0 && "$malformed" == 0 ]] ||
+    _die "could not read repository-local worktree prune paths"
+  case "$completion_status" in
+    0) ;;
+    1)
+      [[ "$saw_entry" == 0 ]] ||
+        _die "could not read repository-local worktree prune paths"
+      return 0
+      ;;
+    *) _die "could not read repository-local worktree prune paths" ;;
+  esac
+  [[ "$invalid" == 0 ]] ||
+    _die "invalid repository-local worktree prune path: $invalid_entry"
+}
+
+_worktree_entry_has_cache_tag() {
+  local path="$1" entry="$2" signature=""
+
+  # Restrict automatic recognition to real, top-level directories and real
+  # tags. A symlink must never turn cache pruning into traversal outside the
+  # worktree.
+  case "$entry" in
+    "" | . | .. | .git | */*) return 1 ;;
+  esac
+  [[ -d "$path/$entry" && ! -L "$path/$entry" ]] || return 1
+  [[ -f "$path/$entry/CACHEDIR.TAG" &&
+    ! -L "$path/$entry/CACHEDIR.TAG" ]] || return 1
+  IFS= read -r signature <"$path/$entry/CACHEDIR.TAG" || return 1
+  [[ "$signature" == "Signature: 8a477f597d28d172789f06886806bc55" ]]
+}
+
+_worktree_entry_is_disposable() {
+  local path="$1" entry="$2" configured
+
+  for configured in \
+    ${_worktree_prune_paths[@]+"${_worktree_prune_paths[@]}"}; do
+    [[ "$configured" != "$entry" ]] || return 0
+  done
+  _worktree_entry_has_cache_tag "$path" "$entry"
+}
+
+_classify_worktree_status() {
+  local path="$1" entry record="" top
+  local has_dirty=0 has_disposable=0 has_hidden=0 malformed=0
+
+  while :; do
+    record=""
+    if IFS= read -r -d '' record; then
+      # A rename or copy has a second, headerless pathname record. Once any
+      # tracked status is present, the worktree is ineligible; drain the rest
+      # without interpreting continuation records or risking producer SIGPIPE.
+      [[ "$has_dirty" == 0 ]] || continue
+      case "$record" in
+        '?? '* | '!! '*)
+          entry=${record#???}
+          if [[ -z "$entry" ]]; then
+            malformed=1
+            continue
+          fi
+          top=${entry%%/*}
+          if _worktree_entry_is_disposable "$path" "$top"; then
+            has_disposable=1
+          else
+            has_hidden=1
+          fi
+          ;;
+        ??' '*) has_dirty=1 ;;
+        *) malformed=1 ;;
+      esac
+      continue
+    fi
+    [[ -z "$record" ]] || malformed=1
+    break
+  done
+
+  [[ "$malformed" == 0 ]] || return 1
+  if [[ "$has_dirty" == 1 ]]; then
     printf 'dirty\n'
-  elif ! ignored=$(GIT_OPTIONAL_LOCKS=0 \
-    gt_git_without_local_env -C "$path" ls-files \
-    --others --ignored --exclude-standard 2>/dev/null); then
-    printf 'unknown\n'
-  elif [[ -n "$ignored" ]]; then
+  elif [[ "$has_hidden" == 1 ]]; then
     printf 'hidden\n'
+  elif [[ "$has_disposable" == 1 ]]; then
+    printf 'disposable\n'
+  else
+    printf 'clean\n'
+  fi
+}
+
+_worktree_status_state() {
+  local path="$1" state status=0
+
+  state=$(
+    set -o pipefail
+    GIT_OPTIONAL_LOCKS=0 gt_git_without_local_env -C "$path" status \
+      --porcelain=v1 -z --ignored=matching --untracked-files=all \
+      2>/dev/null | _classify_worktree_status "$path"
+  ) || status=$?
+  [[ "$status" == 0 ]] || return 1
+  printf '%s\n' "$state"
+}
+
+_worktree_dirty_state() {
+  local path="$1" entry index_state state
+
+  if ! state=$(_worktree_status_state "$path"); then
+    printf 'unknown\n'
+  elif [[ "$state" == dirty ]]; then
+    printf 'dirty\n'
   elif ! index_state=$(GIT_OPTIONAL_LOCKS=0 \
     gt_git_without_local_env -C "$path" ls-files -v 2>/dev/null); then
     printf 'unknown\n'
@@ -340,8 +522,55 @@ _worktree_dirty_state() {
           ;;
       esac
     done <<<"$index_state"
-    printf 'clean\n'
+    printf '%s\n' "$state"
   fi
+}
+
+_prune_worktree_entry() {
+  local path="$1" entry="$2"
+
+  [[ -e "$path/$entry" || -L "$path/$entry" ]] || return 0
+  if [[ "$_dry_run" == 1 ]]; then
+    _say "would prune disposable worktree entry: $path/$entry"
+  else
+    _say "pruning disposable worktree entry: $path/$entry"
+    # One force flag deliberately preserves nested repositories. The literal
+    # top-level pathspec and the post-clean state check are additional guards;
+    # this never broadens into a worktree-wide clean.
+    GIT_OPTIONAL_LOCKS=0 gt_git_without_local_env -C "$path" \
+      clean -fdx -- ":(top,literal)$entry" || return 1
+  fi
+}
+
+_prune_disposable_worktree_entries() {
+  local path="$1" configured entry existing seen tag
+  local -a entries=()
+
+  for configured in \
+    ${_worktree_prune_paths[@]+"${_worktree_prune_paths[@]}"}; do
+    entries+=("$configured")
+  done
+
+  for tag in \
+    "$path"/*/CACHEDIR.TAG \
+    "$path"/.[!.]*/CACHEDIR.TAG \
+    "$path"/..?*/CACHEDIR.TAG; do
+    entry=${tag#"$path"/}
+    entry=${entry%/CACHEDIR.TAG}
+    _worktree_entry_has_cache_tag "$path" "$entry" || continue
+    seen=0
+    for existing in ${entries[@]+"${entries[@]}"}; do
+      if [[ "$existing" == "$entry" ]]; then
+        seen=1
+        break
+      fi
+    done
+    [[ "$seen" == 1 ]] || entries+=("$entry")
+  done
+
+  for entry in ${entries[@]+"${entries[@]}"}; do
+    _prune_worktree_entry "$path" "$entry" || return 1
+  done
 }
 
 _branch_still_at() {
@@ -378,6 +607,38 @@ _remove_branch_worktree_if_needed() {
   state=$(_worktree_dirty_state "$path")
   case "$state" in
     clean) ;;
+    disposable)
+      if ! _branch_still_at "$branch" "$branch_oid"; then
+        _say "skipping $branch; branch changed before cache pruning"
+        return 1
+      fi
+      if ! _prune_disposable_worktree_entries "$path"; then
+        _say "skipping $branch; disposable entry could not be pruned safely: $path"
+        return 1
+      fi
+      if [[ "$_dry_run" != 1 ]]; then
+        state=$(_worktree_dirty_state "$path")
+        case "$state" in
+          clean) ;;
+          dirty)
+            _say "skipping $branch; worktree changed while pruning cache: $path"
+            return 1
+            ;;
+          hidden)
+            _say "skipping $branch; worktree has hidden local content: $path"
+            return 1
+            ;;
+          disposable)
+            _say "skipping $branch; disposable entry could not be pruned safely: $path"
+            return 1
+            ;;
+          *)
+            _say "skipping $branch; could not recheck worktree status: $path"
+            return 1
+            ;;
+        esac
+      fi
+      ;;
     dirty)
       _say "skipping $branch; worktree has uncommitted changes: $path"
       return 1
@@ -570,6 +831,11 @@ _parse_args() {
 
 _parse_args "$@"
 _ensure_repo_ready
+if [[ "$_remove_worktrees" == 1 ]]; then
+  _load_worktree_prune_paths
+else
+  _worktree_prune_paths=()
+fi
 _resolve_remote
 
 # A non-writing hash probe detects the native SHA width without requiring the

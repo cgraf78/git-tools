@@ -380,19 +380,29 @@ gt_resolve_base() {
   return 1
 }
 
-# Stream a collapsed branch diff and base history through patch-id in a private
-# workspace. Returns 0 for an exact patch-id match, 1 for a valid non-match, and
-# 2 when any producer, parser, or cleanup operation fails.
+# Stream a collapsed branch diff and first-parent base history through patch-id
+# in a private workspace. Patch IDs only locate candidates: a match is accepted
+# after the branch's raw delta exactly matches the candidate commit's raw delta
+# from its first parent. Returns 0 for an exact historical match, 1 for a valid
+# non-match, and 2 when any producer, parser, comparison, or cleanup fails.
 _gt_squash_patch_merged() (
   set -o pipefail
   umask 077
+  local LC_ALL=C
 
   local branch="$1" base="$2" merge_base="$3"
   local _gt_squash_tmp_root="${TMPDIR:-/tmp}" _gt_squash_tmpdir="" \
     _gt_squash_branch_file="" _gt_squash_base_file="" \
+    _gt_squash_path_file="" \
+    _gt_squash_branch_delta_file="" _gt_squash_candidate_delta_file="" \
+    _gt_squash_comparison_error_file="" \
     _gt_squash_exit_trap="" || exit 2
   local line="" patch_id="" patch_source="" extra=""
+  local candidate="" comparison_status=0 path=""
   local branch_patch_id="" native_width=${#branch} branch_records=0 matched=0
+  local path_filter=1 pathspec_bytes=0 pathspec_count=0
+  local pathspec_limit=32768 pathspec_count_limit=256
+  local -a base_pathspec_args=(--)
 
   _gt_valid_patch_record() {
     local record="$1" id="$2" source="$3" expected_width="${4:-0}"
@@ -423,6 +433,9 @@ _gt_squash_patch_merged() (
     trap - EXIT HUP INT TERM
     local _gt_cleanup_status="$1" _gt_cleanup_branch_path="$2" \
       _gt_cleanup_base_path="$3" _gt_cleanup_tmp_path="$4" \
+      _gt_cleanup_path_path="$5" _gt_cleanup_branch_delta_path="$6" \
+      _gt_cleanup_candidate_delta_path="$7" \
+      _gt_cleanup_comparison_error_path="$8" \
       _gt_cleanup_failed=0 || exit 2
 
     if [[ -n "$_gt_cleanup_branch_path" ]]; then
@@ -430,6 +443,18 @@ _gt_squash_patch_merged() (
     fi
     if [[ -n "$_gt_cleanup_base_path" ]]; then
       rm -f -- "$_gt_cleanup_base_path" || _gt_cleanup_failed=1
+    fi
+    if [[ -n "$_gt_cleanup_path_path" ]]; then
+      rm -f -- "$_gt_cleanup_path_path" || _gt_cleanup_failed=1
+    fi
+    if [[ -n "$_gt_cleanup_branch_delta_path" ]]; then
+      rm -f -- "$_gt_cleanup_branch_delta_path" || _gt_cleanup_failed=1
+    fi
+    if [[ -n "$_gt_cleanup_candidate_delta_path" ]]; then
+      rm -f -- "$_gt_cleanup_candidate_delta_path" || _gt_cleanup_failed=1
+    fi
+    if [[ -n "$_gt_cleanup_comparison_error_path" ]]; then
+      rm -f -- "$_gt_cleanup_comparison_error_path" || _gt_cleanup_failed=1
     fi
     if [[ -n "$_gt_cleanup_tmp_path" ]]; then
       rmdir -- "$_gt_cleanup_tmp_path" || _gt_cleanup_failed=1
@@ -439,28 +464,65 @@ _gt_squash_patch_merged() (
   }
 
   trap '_gt_squash_patch_cleanup 2 "$_gt_squash_branch_file" \
-    "$_gt_squash_base_file" "$_gt_squash_tmpdir"' HUP INT TERM
+    "$_gt_squash_base_file" "$_gt_squash_tmpdir" \
+    "$_gt_squash_path_file" \
+    "$_gt_squash_branch_delta_file" \
+    "$_gt_squash_candidate_delta_file" \
+    "$_gt_squash_comparison_error_file"' HUP INT TERM
   _gt_squash_tmpdir=$(mktemp -d \
     "$_gt_squash_tmp_root/git-tools-patch.XXXXXX") || exit 2
   _gt_squash_branch_file="$_gt_squash_tmpdir/branch.patch-ids"
   _gt_squash_base_file="$_gt_squash_tmpdir/base.patch-ids"
+  _gt_squash_path_file="$_gt_squash_tmpdir/branch.paths"
+  _gt_squash_branch_delta_file="$_gt_squash_tmpdir/branch.raw"
+  _gt_squash_candidate_delta_file="$_gt_squash_tmpdir/candidate.raw"
+  _gt_squash_comparison_error_file="$_gt_squash_tmpdir/comparison.stderr"
   # Bash 3.2 unwinds function locals before EXIT. Capture the concrete paths in
   # the trap command before replacing the setup-time signal cleanup handlers.
   printf -v _gt_squash_exit_trap \
-    '_gt_squash_patch_cleanup "$?" %q %q %q' \
+    '_gt_squash_patch_cleanup "$?" %q %q %q %q %q %q %q' \
     "$_gt_squash_branch_file" "$_gt_squash_base_file" \
-    "$_gt_squash_tmpdir" || exit 2
+    "$_gt_squash_tmpdir" "$_gt_squash_path_file" \
+    "$_gt_squash_branch_delta_file" \
+    "$_gt_squash_candidate_delta_file" \
+    "$_gt_squash_comparison_error_file" || exit 2
   # Expanding now is the Bash 3.2 compatibility fix.
   # shellcheck disable=SC2064
   trap "$_gt_squash_exit_trap" EXIT
   trap 'exit 2' HUP INT TERM
+  : >"$_gt_squash_comparison_error_file" || exit 2
 
   git diff --no-ext-diff --no-textconv --binary --full-index \
+    --ignore-submodules=none \
     "$merge_base" "$branch" -- |
     git patch-id --stable >"$_gt_squash_branch_file" || exit 2
-  git log --no-ext-diff --no-textconv --format='commit %H' \
-    -p --binary --full-index "$merge_base..$base" -- |
+  git diff --name-only -z --no-renames --ignore-submodules=none \
+    "$merge_base" "$branch" -- >"$_gt_squash_path_file" || exit 2
+  while IFS= read -r -d '' path; do
+    [[ -n "$path" ]] || exit 2
+    if ((path_filter)); then
+      pathspec_count=$((pathspec_count + 1))
+      pathspec_bytes=$((pathspec_bytes + ${#path} + 15))
+      if ((pathspec_bytes > pathspec_limit || \
+        pathspec_count > pathspec_count_limit)); then
+        path_filter=0
+        base_pathspec_args=(--)
+      else
+        base_pathspec_args+=(":(top,literal)$path")
+      fi
+    fi
+  done <"$_gt_squash_path_file"
+  [[ -z "$path" ]] || exit 2
+  # -m is the Git 2.29-compatible way to emit merge transitions. Only a
+  # candidate's first-parent delta can pass the exact comparison below.
+  git -c log.diffMerges=first-parent log \
+    --first-parent --ancestry-path -m --no-ext-diff --no-textconv \
+    --format='commit %H' -p --binary --full-index --ignore-submodules=none \
+    "$merge_base..$base" "${base_pathspec_args[@]}" |
     git patch-id --stable >"$_gt_squash_base_file" || exit 2
+  git -c core.quotePath=true diff-tree --no-commit-id --raw -r -z \
+    --no-renames --no-abbrev --ignore-submodules=none \
+    "$merge_base" "$branch" -- >"$_gt_squash_branch_delta_file" || exit 2
 
   while IFS= read -r line; do
     IFS=' ' read -r patch_id patch_source extra <<<"$line"
@@ -478,7 +540,27 @@ _gt_squash_patch_merged() (
     [[ -z "$extra" ]] || exit 2
     _gt_valid_patch_record \
       "$line" "$patch_id" "$patch_source" "$native_width" || exit 2
-    [[ "$patch_id" == "$branch_patch_id" ]] && matched=1
+    if [[ "$patch_id" == "$branch_patch_id" && "$matched" == 0 ]]; then
+      candidate=$patch_source
+      # --ancestry-path guarantees that this first-parent transition follows
+      # the branch merge base, even when that base is another merge parent.
+      git -c core.quotePath=true diff-tree --no-commit-id --raw -r -z \
+        --no-renames --no-abbrev --ignore-submodules=none \
+        "$candidate^1" "$candidate" -- \
+        >"$_gt_squash_candidate_delta_file" || exit 2
+      comparison_status=0
+      exec 3>"$_gt_squash_comparison_error_file" || exit 2
+      git diff --no-index --quiet --no-ext-diff --no-textconv -- \
+        "$_gt_squash_branch_delta_file" \
+        "$_gt_squash_candidate_delta_file" 2>&3 || comparison_status=$?
+      exec 3>&- || exit 2
+      [[ ! -s "$_gt_squash_comparison_error_file" ]] || exit 2
+      case "$comparison_status" in
+        0) matched=1 ;;
+        1) ;;
+        *) exit 2 ;;
+      esac
+    fi
   done <"$_gt_squash_base_file"
   [[ -z "$line" ]] || exit 2
 
@@ -490,15 +572,18 @@ _gt_squash_patch_merged() (
 # These merge methods replay a branch's changes as brand-new commit(s) on the
 # base, so the branch tip is never an ancestor of the base and both
 # `git merge-base --is-ancestor` and `git branch -d` report it as unmerged.
-# Use patch IDs to find candidate equivalence, then require the branch's changed
-# paths to match the base tree exactly. Two history shapes must be handled:
+# Use patch IDs to find candidate equivalence, then require exact raw-delta
+# evidence. Two history shapes must be handled:
 #
-#   1. Squash merge: the whole branch lands as ONE new commit. Stream the
-#      branch's collapsed diff and base history into stable patch-ID records.
+#   1. Squash merge: the whole branch lands as ONE new first-parent transition.
+#      Patch IDs locate historical candidates after the branch merge base, then
+#      the branch delta must equal the candidate's first-parent-to-commit delta
+#      exactly. Later mainline edits do not erase that historical proof.
 #   2. Rebase / cherry-pick merge: each branch commit is replayed separately, so
 #      every merge-base..branch commit has an equivalent patch-id in the base.
 #      `git cherry` prints '+' for any branch commit NOT yet in the base; none
 #      missing (with at least one compared) means the whole branch is applied.
+#      Its exact net delta must still be present in the pinned base snapshot.
 #
 # The squash patch ID and per-commit check are complementary: a multi-commit
 # squash matches only #1, a multi-commit rebase matches only #2. Returns 1 for a
@@ -522,26 +607,39 @@ _gt_branch_content_merged_oids() {
 
   merge_base=$(git merge-base "$base" "$branch" 2>/dev/null) || return 1
 
-  # Patch IDs ignore whitespace and are only a historical match signal. Before
-  # relying on one, compare exact raw tree deltas from the common ancestor. The
-  # branch delta must be a subset of the base delta, including full object IDs,
-  # modes, gitlinks, paths, and deletion states. --no-renames makes rename
-  # representation deterministic; quoted output keeps unusual paths on one
-  # sortable record per tree entry.
+  # Shape 1: squash merge. Keep binary and NUL-delimited streams out of shell
+  # variables, observe both sides of each pipeline, and fail closed on every
+  # operational error. This proof compares the branch against the historical
+  # first-parent commit that landed it, rather than against today's base tip.
+  _gt_squash_patch_merged "$branch" "$base" "$merge_base" || squash_status=$?
+  case "$squash_status" in
+    0) return 0 ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+
+  # Patch IDs ignore whitespace. The multi-commit replay fallback therefore
+  # still requires the branch's exact raw tree delta to be present in the
+  # current base snapshot. The branch delta must be a subset of the base delta,
+  # including full object IDs, modes, gitlinks, paths, and deletion states.
+  # --no-renames makes rename representation deterministic; quoted output keeps
+  # unusual paths on one sortable record per tree entry.
   #
   # Materialize and status-check each producer. Process-substitution failures
   # are not reflected in `comm`'s status, which could otherwise make a failed
   # branch producer look like an empty, fully merged delta.
   branch_delta=$(
     git -c core.quotePath=true diff-tree --no-commit-id --raw -r \
-      --no-renames --no-abbrev "$merge_base" "$branch" --
+      --no-renames --no-abbrev --ignore-submodules=none \
+      "$merge_base" "$branch" --
   ) || return 1
   # The raw delta is already the exact tree comparison needed here. Reusing it
   # avoids resolving both tree OIDs separately before producing the same diff.
   [[ -n "$branch_delta" ]] || return 1
   base_delta=$(
     git -c core.quotePath=true diff-tree --no-commit-id --raw -r \
-      --no-renames --no-abbrev "$merge_base" "$base" --
+      --no-renames --no-abbrev --ignore-submodules=none \
+      "$merge_base" "$base" --
   ) || return 1
   branch_delta=$(LC_ALL=C sort <<<"$branch_delta") || return 1
   base_delta=$(LC_ALL=C sort <<<"$base_delta") || return 1
@@ -551,15 +649,6 @@ _gt_branch_content_merged_oids() {
       <(printf '%s\n' "$base_delta")
   ) || return 1
   [[ -z "$missing" ]] || return 1
-
-  # Shape 1: squash merge. Keep binary patch streams out of shell variables,
-  # observe both sides of each pipeline, and fail closed on operational errors.
-  _gt_squash_patch_merged "$branch" "$base" "$merge_base" || squash_status=$?
-  case "$squash_status" in
-    0) return 0 ;;
-    1) ;;
-    *) return 1 ;;
-  esac
 
   # Shape 2: rebase / cherry-pick merge.
   cherry=$(git cherry "$base" "$branch" 2>/dev/null) || return 1
@@ -586,10 +675,10 @@ gt_branch_content_merged() {
 
 # @brief Return 0 when <branch> is merged into <base> by any means.
 # True when the branch tip is an ancestor of the base (plain merge / fast
-# forward) OR when its changes have matching patch IDs in the base and its exact
-# net tree delta is present there (squash, rebase, or cherry-pick merge). This is
-# the merge predicate branch-cleanup tooling should use so squash/rebase-merged
-# branches are not stranded as "unmerged".
+# forward) OR when matching patch IDs and exact raw deltas prove a squash,
+# rebase, or cherry-pick replay. Historical squash proof remains valid after a
+# later mainline edit. This is the merge predicate branch-cleanup tooling should
+# use so replay-merged branches are not stranded as "unmerged".
 gt_branch_merged() {
   local branch base ancestor_status=0
   branch=$(git rev-parse --verify "$1^{commit}" 2>/dev/null) || return 1

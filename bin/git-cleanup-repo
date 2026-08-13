@@ -25,13 +25,14 @@ Usage: git cleanup-repo [options]
 
 Fetch the exact remote base, update it by pinned OID, then delete stale local
 branches whose exact OIDs are proven merged. Patch IDs identify replay
-candidates, but the branch's exact net tree delta must also be present in a
-pinned base snapshot. Incomplete branch inventories abort before deletion.
+candidates, but exact raw-delta evidence is also required. Historical squash
+proof survives later mainline edits. Incomplete branch inventories abort before
+deletion.
 
 Options:
   -b, --base <branch>       Base branch to keep and update.
   -r, --remote <name>       Remote endpoint to fetch from (default: origin).
-      --gone                Also delete branches whose upstream is gone.
+      --gone                Select gone-upstream branches for cleanup.
   -a, --all                 Delete all local branches except the base branch.
       --remove-worktrees    Remove clean linked worktrees for deleted branches.
   -n, --dry-run             Print actions without changing anything.
@@ -278,9 +279,9 @@ _update_base() {
   _base_oid=$GT_REF_OID
 }
 
-# Ancestor-only merge check. Squash/rebase merges are detected separately via
-# the shared `gt_branch_content_merged` so `_delete_reason` can report a distinct
-# reason for each.
+# Ancestor-only merge check. Squash/rebase merges are detected separately with
+# the shared pinned-OID predicate so `_delete_reason` can report a distinct
+# reason for each without resolving inventory OIDs again.
 _branch_merged_into_base() {
   git merge-base --is-ancestor "$1" "$_base_oid" 2>/dev/null
 }
@@ -301,7 +302,7 @@ _delete_reason() {
     1) ;;
     *) return 1 ;;
   esac
-  if gt_branch_content_merged "$branch_oid" "$_base_oid"; then
+  if _gt_branch_content_merged_oids "$branch_oid" "$_base_oid"; then
     printf 'content-merged\n'
     return 0
   fi
@@ -429,16 +430,18 @@ _delete_branch() {
 }
 
 _inventory_branches() {
-  local records branch_ref branch branch_oid upstream_track status=0
+  local records branch_ref branch branch_oid upstream upstream_track status=0
 
   _branches=()
   _branch_oids=()
+  _upstreams=()
   _upstream_tracks=()
   records=$(git for-each-ref \
-    --format='%(refname)%09%(objectname)%09%(upstream:track)' refs/heads) ||
+    --format='%(refname)%09%(objectname)%09%(upstream)%09%(upstream:track)' \
+    refs/heads) ||
     _die "could not enumerate branches"
 
-  while IFS=$'\t' read -r branch_ref branch_oid upstream_track; do
+  while IFS=$'\t' read -r branch_ref branch_oid upstream upstream_track; do
     [[ -n "$branch_ref" ]] || continue
     case "$branch_ref" in
       refs/heads/*) branch=${branch_ref#refs/heads/} ;;
@@ -453,22 +456,31 @@ _inventory_branches() {
     [[ "$branch" != "$_base" ]] || continue
     _branches+=("$branch")
     _branch_oids+=("$branch_oid")
+    _upstreams+=("$upstream")
     _upstream_tracks+=("$upstream_track")
   done <<<"$records"
 }
 
 _cleanup_branches() {
-  local branch branch_oid upstream_track reason index
+  local branch branch_oid upstream upstream_track reason index
   local candidates=0 skipped=0
 
   _inventory_branches
   for index in "${!_branches[@]}"; do
     branch=${_branches[$index]}
     branch_oid=${_branch_oids[$index]}
+    upstream=${_upstreams[$index]}
     upstream_track=${_upstream_tracks[$index]}
 
     reason=$(_delete_reason "$branch_oid" "$upstream_track") || {
-      _say "keeping $branch; not merged and upstream still exists"
+      if [[ "$upstream_track" == "[gone]" ]]; then
+        _say "keeping $branch; merge not proven; upstream is gone;" \
+          "--gone selects it for cleanup"
+      elif [[ -n "$upstream" ]]; then
+        _say "keeping $branch; merge not proven; upstream still exists"
+      else
+        _say "keeping $branch; merge not proven; no upstream is configured"
+      fi
       skipped=$((skipped + 1))
       continue
     }

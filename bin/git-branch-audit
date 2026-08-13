@@ -33,10 +33,10 @@ age, ahead/behind counts, whether they are merged into the default branch, and
 the open PR number when GitHub data is available. The default branch itself is
 the reference point and is omitted from the listing.
 
-Squash, rebase, and cherry-pick matches require both patch history and an exact
-net tree delta in pinned branch/default snapshots. Candidate reporting includes
-each branch's exact object ID. Incomplete branch enumeration aborts reporting.
-No local branch is deleted automatically.
+Squash, rebase, and cherry-pick matches require both patch history and exact
+raw-delta evidence. Historical squash proof survives later mainline edits.
+Candidate reporting includes each branch's exact object ID. Incomplete branch
+enumeration aborts reporting. No local branch is deleted automatically.
 
 Options:
       --porcelain        Print stable tab-separated branch records.

@@ -17,7 +17,7 @@ _git_cleanup_repo() {
   _arguments -s \
     '(-b --base)'{-b,--base}'[Base branch to keep and update]:base branch:_git_cleanup_repo_refs' \
     '(-r --remote)'{-r,--remote}'[Remote to fetch the exact base from]:remote:_git_cleanup_repo_remotes' \
-    '--gone[Also delete branches whose upstream is gone]' \
+    '--gone[Select gone-upstream branches for cleanup]' \
     '(-a --all)'{-a,--all}'[Delete all local branches except the base branch]' \
     '--remove-worktrees[Remove clean linked worktrees for deleted branches]' \
     '(-n --dry-run)'{-n,--dry-run}'[Print deletion actions without changing anything]' \

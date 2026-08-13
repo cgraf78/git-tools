@@ -282,6 +282,11 @@ git -C "$squash_repo" add feature.txt
 git -C "$squash_repo" commit -q -m "feature (#1)"
 # Rebase-merge rebased: replay each commit as a new commit on main.
 git -C "$squash_repo" cherry-pick rebased~1 rebased >/dev/null 2>&1
+# The exact squash commit remains historical proof even after its path changes
+# again. Cleanup classification should not depend on the current tip blob.
+printf '%s\n' three >"$squash_repo/feature.txt"
+git -C "$squash_repo" add feature.txt
+git -C "$squash_repo" commit -q -m "edit squashed path later"
 
 audit_tmp=$(_tmpdir)
 _assert_eq "audit TMPDIR starts without proof artifacts" "" \
@@ -451,6 +456,9 @@ git -C "$sha256_repo" switch -q main
 printf '%s\n' two >"$sha256_repo/sha256.txt"
 git -C "$sha256_repo" add sha256.txt
 git -C "$sha256_repo" commit -q -m "squash sha256 branch"
+printf '%s\n' three >"$sha256_repo/sha256.txt"
+git -C "$sha256_repo" add sha256.txt
+git -C "$sha256_repo" commit -q -m "edit sha256 squash path later"
 sha256_oid=$(git -C "$sha256_repo" rev-parse sha256-merged)
 sha256_output=$(git -C "$sha256_repo" branch-audit --drop-merged --yes 2>&1)
 _assert_contains "reports full SHA-256 cleanup candidate" \

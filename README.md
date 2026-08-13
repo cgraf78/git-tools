@@ -331,12 +331,15 @@ PR lookup is best-effort: when `gh` is missing or unauthenticated, the audit
 still reports local branch state and omits PR numbers.
 
 A branch counts as merged when its pinned tip is an ancestor of a pinned default
-branch snapshot, or when patch IDs identify a replay and the branch's exact net
-tree delta is present in that snapshot. The delta includes full object IDs,
-types, modes, paths, and deletions. This recognizes squash-, rebase-, and
-cherry-pick-merged branches without treating patch-ID-equivalent but
-byte-distinct content as merged. If the default branch later changes one of the
-same paths, the branch is kept conservatively.
+branch snapshot or exact replay evidence exists. For a squash merge, patch IDs
+locate transitions on the default branch's first-parent history after the
+branch merge base, including merge-commit transitions. The branch's raw net
+delta must exactly equal the candidate's first-parent-to-commit delta. A later
+mainline edit therefore does not erase an exact historical squash proof.
+Multi-commit rebase and cherry-pick matches require every commit's patch ID and
+the exact net delta in the pinned default snapshot. Raw comparisons include
+full object IDs, types, modes, paths, and deletions, so
+patch-ID-equivalent but byte-distinct content does not count as merged.
 
 Use `--drop-merged` to report exact local cleanup candidates, including each
 branch's current OID. It intentionally does not delete branches: worktree
@@ -360,15 +363,19 @@ git cleanup-repo
 
 By default the command deletes local branches that are already merged into the
 base branch. This includes squash-, rebase-, and cherry-pick-merged branches:
-patch IDs identify candidate matches, and the exact net tree delta must also be
-present in a pinned base snapshot. A clean squash merge is therefore recognized
-even though its commits are not ancestors of the base, while byte-, mode-, or
-later same-path differences are excluded. The complete branch and upstream-state
-inventory is validated before the first mutation. Each candidate is rechecked
-before deletion, and the ref is deleted only if it still has the exact proven
-OID. Use `--gone` to also delete branches whose existing upstream-tracking state
-is gone. The command deliberately does not run configured fetch or prune
-mappings; refresh other remote-tracking state separately when needed.
+patch IDs locate candidates, but exact raw-delta evidence is also required. A
+squash candidate must be a transition after the branch merge base on the pinned
+base's first-parent history. Its first-parent-to-commit delta must exactly match
+the branch's net delta; this also covers transitions introduced by merge
+commits. Later mainline edits do not erase that historical proof; byte, mode,
+path, deletion, or gitlink differences still reject it. Multi-commit rebase and
+cherry-pick matches retain an exact-current-snapshot check. The complete branch
+and upstream-state inventory is validated before the first mutation. Each
+candidate is rechecked before deletion, and the ref is deleted only if it still
+has the exact proven OID. Use `--gone` to also select branches whose existing
+upstream-tracking state is gone. The command deliberately does not run
+configured fetch or prune mappings; refresh other remote-tracking state
+separately when needed.
 
 Base updates do not depend on configured fetch refspecs or short ref names. The
 command pins exactly `refs/heads/<base>` from the resolved endpoint, fetches it

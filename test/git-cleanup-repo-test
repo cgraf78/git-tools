@@ -82,6 +82,17 @@ _assert_not_contains() {
   fi
 }
 
+_assert_occurrences() {
+  local name="$1" expected="$2" needle="$3" haystack="$4"
+  local count=0 remainder="$haystack"
+
+  while [[ "$remainder" == *"$needle"* ]]; do
+    remainder=${remainder#*"$needle"}
+    count=$((count + 1))
+  done
+  _assert_eq "$name" "$expected" "$count"
+}
+
 _mode() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
@@ -2019,6 +2030,385 @@ _assert_eq "ignored content preserves branch" ignored-work \
   "$(git -C "$ignored_worktree_repo" branch --list --format='%(refname:short)' ignored-work)"
 _assert_eq "ignored content preserves worktree" present \
   "$(if [[ -e "$ignored_worktree_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
+
+# A top-level directory carrying the standard cache-directory signature is an
+# explicit promise that its contents are disposable. Such a cache must not
+# strand an otherwise removable worktree.
+tagged_cache_repo=$(_clone_remote)
+git -C "$tagged_cache_repo" switch --quiet -c tagged-cache
+_commit_file "$tagged_cache_repo" tagged.txt clean "add tagged cache work"
+git -C "$tagged_cache_repo" switch --quiet main
+tagged_cache_dir=$(_tmpdir)
+rm -rf "$tagged_cache_dir"
+git -C "$tagged_cache_repo" worktree add --quiet \
+  "$tagged_cache_dir" tagged-cache
+mkdir "$tagged_cache_dir/.rumdl_cache"
+printf '%s\n' '*' >"$tagged_cache_dir/.rumdl_cache/.gitignore"
+cat >"$tagged_cache_dir/.rumdl_cache/CACHEDIR.TAG" <<'EOF'
+Signature: 8a477f597d28d172789f06886806bc55
+# This directory contains disposable cache data.
+EOF
+printf 'generated cache\n' >"$tagged_cache_dir/.rumdl_cache/data"
+git -C "$tagged_cache_repo" config --local --add \
+  cleanupRepo.worktreePrunePath .rumdl_cache
+tagged_cache_dry_output=$(git -C "$tagged_cache_repo" cleanup-repo \
+  --all --remove-worktrees --dry-run 2>&1)
+_assert_occurrences "duplicate cache proof produces one dry-run prune" 1 \
+  "would prune disposable worktree entry: $tagged_cache_dir/.rumdl_cache" \
+  "$tagged_cache_dry_output"
+git -C "$tagged_cache_repo" config --local --unset-all \
+  cleanupRepo.worktreePrunePath
+tagged_cache_output=$(git -C "$tagged_cache_repo" cleanup-repo \
+  --all --remove-worktrees 2>&1)
+_assert_contains "standard cache tag permits worktree removal" \
+  "deleting tagged-cache (all)" "$tagged_cache_output"
+_assert_eq "standard cache tag does not strand branch" "" \
+  "$(git -C "$tagged_cache_repo" branch --list --format='%(refname:short)' tagged-cache)"
+_assert_eq "standard cache tag does not strand worktree" missing \
+  "$(if [[ -e "$tagged_cache_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
+
+# Repository owners can opt additional top-level entries into pruning. Keep the
+# policy local to this repository so a user's global config cannot silently
+# broaden deletion in every checkout.
+configured_cache_repo=$(_clone_remote)
+git -C "$configured_cache_repo" switch --quiet -c configured-cache
+_commit_file "$configured_cache_repo" configured.txt clean \
+  "add configured cache work"
+git -C "$configured_cache_repo" switch --quiet main
+configured_cache_dir=$(_tmpdir)
+rm -rf "$configured_cache_dir"
+git -C "$configured_cache_repo" worktree add --quiet \
+  "$configured_cache_dir" configured-cache
+mkdir "$configured_cache_dir/.cache"
+printf 'generated cache\n' >"$configured_cache_dir/.cache/data"
+git -C "$configured_cache_repo" config --local --add \
+  cleanupRepo.worktreePrunePath .cache
+configured_cache_dry_output=$(git -C "$configured_cache_repo" cleanup-repo \
+  --all --remove-worktrees --dry-run 2>&1)
+_assert_contains "dry run reports repo-local worktree pruning" \
+  "would prune disposable worktree entry: $configured_cache_dir/.cache" \
+  "$configured_cache_dry_output"
+_assert_eq "dry run preserves repo-local prune path" present \
+  "$(if [[ -e "$configured_cache_dir/.cache/data" ]]; then printf 'present'; else printf 'missing'; fi)"
+_assert_eq "dry run preserves repo-local worktree" present \
+  "$(if [[ -e "$configured_cache_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
+configured_cache_output=$(git -C "$configured_cache_repo" cleanup-repo \
+  --all --remove-worktrees 2>&1)
+_assert_contains "repo-local prune path permits worktree removal" \
+  "deleting configured-cache (all)" "$configured_cache_output"
+_assert_eq "repo-local prune path does not strand branch" "" \
+  "$(git -C "$configured_cache_repo" branch --list --format='%(refname:short)' configured-cache)"
+_assert_eq "repo-local prune path does not strand worktree" missing \
+  "$(if [[ -e "$configured_cache_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
+
+# A tag is proof only when its first line carries the exact standard signature.
+# Similar-looking directories remain protected.
+invalid_tag_repo=$(_clone_remote)
+git -C "$invalid_tag_repo" switch --quiet -c invalid-tag
+_commit_file "$invalid_tag_repo" invalid-tag.txt clean "add invalid tag work"
+git -C "$invalid_tag_repo" switch --quiet main
+invalid_tag_dir=$(_tmpdir)
+rm -rf "$invalid_tag_dir"
+git -C "$invalid_tag_repo" worktree add --quiet "$invalid_tag_dir" invalid-tag
+mkdir "$invalid_tag_dir/.cache-data"
+printf '%s\n' 'Signature: not-a-cache-tag' \
+  >"$invalid_tag_dir/.cache-data/CACHEDIR.TAG"
+printf 'local data\n' >"$invalid_tag_dir/.cache-data/data"
+invalid_tag_output=$(git -C "$invalid_tag_repo" cleanup-repo \
+  --all --remove-worktrees 2>&1)
+_assert_contains "invalid cache tag blocks worktree removal" \
+  "worktree has hidden local content: $invalid_tag_dir" "$invalid_tag_output"
+_assert_eq "invalid cache tag preserves branch" invalid-tag \
+  "$(git -C "$invalid_tag_repo" branch --list --format='%(refname:short)' invalid-tag)"
+_assert_eq "invalid cache tag preserves local data" 'local data' \
+  "$(cat "$invalid_tag_dir/.cache-data/data")"
+
+# Discover every hidden path before pruning anything. An unrelated local file
+# must preserve both itself and an otherwise disposable tagged cache.
+mixed_hidden_repo=$(_clone_remote)
+git -C "$mixed_hidden_repo" switch --quiet -c mixed-hidden
+_commit_file "$mixed_hidden_repo" .gitignore '*.local' \
+  "ignore mixed local files"
+git -C "$mixed_hidden_repo" switch --quiet main
+mixed_hidden_dir=$(_tmpdir)
+rm -rf "$mixed_hidden_dir"
+git -C "$mixed_hidden_repo" worktree add --quiet \
+  "$mixed_hidden_dir" mixed-hidden
+mkdir "$mixed_hidden_dir/.rumdl_cache"
+printf '%s\n' '*' >"$mixed_hidden_dir/.rumdl_cache/.gitignore"
+printf '%s\n' 'Signature: 8a477f597d28d172789f06886806bc55' \
+  >"$mixed_hidden_dir/.rumdl_cache/CACHEDIR.TAG"
+printf 'generated cache\n' >"$mixed_hidden_dir/.rumdl_cache/data"
+printf 'private local data\n' >"$mixed_hidden_dir/notes.local"
+mixed_hidden_output=$(git -C "$mixed_hidden_repo" cleanup-repo \
+  --all --remove-worktrees 2>&1)
+_assert_contains "unknown hidden content still blocks tagged-cache cleanup" \
+  "worktree has hidden local content: $mixed_hidden_dir" "$mixed_hidden_output"
+_assert_not_contains "unknown hidden content prevents partial cache pruning" \
+  "pruning disposable worktree entry" "$mixed_hidden_output"
+_assert_eq "unknown hidden content preserves tagged cache" 'generated cache' \
+  "$(cat "$mixed_hidden_dir/.rumdl_cache/data")"
+_assert_eq "unknown hidden content preserves private file" 'private local data' \
+  "$(cat "$mixed_hidden_dir/notes.local")"
+_assert_eq "unknown hidden content preserves branch" mixed-hidden \
+  "$(git -C "$mixed_hidden_repo" branch --list --format='%(refname:short)' mixed-hidden)"
+
+# Command-line and global config are intentionally too broad to authorize
+# deletion in every repository. Only the target repository's local config is
+# accepted.
+global_prune_repo=$(_clone_remote)
+git -C "$global_prune_repo" switch --quiet -c global-prune
+_commit_file "$global_prune_repo" global.txt clean "add global prune work"
+git -C "$global_prune_repo" switch --quiet main
+global_prune_dir=$(_tmpdir)
+rm -rf "$global_prune_dir"
+git -C "$global_prune_repo" worktree add --quiet \
+  "$global_prune_dir" global-prune
+mkdir "$global_prune_dir/.cache"
+printf 'private data\n' >"$global_prune_dir/.cache/data"
+global_prune_output=$(git -C "$global_prune_repo" \
+  -c cleanupRepo.worktreePrunePath=.cache cleanup-repo \
+  --all --remove-worktrees 2>&1)
+_assert_contains "command config cannot authorize worktree pruning" \
+  "worktree has hidden local content: $global_prune_dir" "$global_prune_output"
+_assert_eq "command config preserves cache data" 'private data' \
+  "$(cat "$global_prune_dir/.cache/data")"
+_assert_eq "command config preserves branch" global-prune \
+  "$(git -C "$global_prune_repo" branch --list --format='%(refname:short)' global-prune)"
+
+# Local opt-ins are literal top-level names. Reject traversal, nested paths,
+# separators with platform-dependent meaning, and Git's own administrative
+# entry before fetching or mutating worktrees.
+for invalid_prune_path in ../outside nested/cache 'nested\cache' .git; do
+  invalid_config_repo=$(_clone_remote)
+  git -C "$invalid_config_repo" switch --quiet -c invalid-config
+  _commit_file "$invalid_config_repo" invalid.txt clean \
+    "add invalid config work"
+  git -C "$invalid_config_repo" switch --quiet main
+  invalid_config_dir=$(_tmpdir)
+  rm -rf "$invalid_config_dir"
+  git -C "$invalid_config_repo" worktree add --quiet \
+    "$invalid_config_dir" invalid-config
+  mkdir "$invalid_config_dir/.cache"
+  printf 'private data\n' >"$invalid_config_dir/.cache/data"
+  git -C "$invalid_config_repo" config --local --add \
+    cleanupRepo.worktreePrunePath "$invalid_prune_path"
+  invalid_config_output=$(git -C "$invalid_config_repo" cleanup-repo \
+    --all --remove-worktrees 2>&1)
+  invalid_config_rc=$?
+  _assert_eq "rejects invalid local prune path $invalid_prune_path" 2 \
+    "$invalid_config_rc"
+  _assert_contains "diagnoses invalid local prune path $invalid_prune_path" \
+    "invalid repository-local worktree prune path" "$invalid_config_output"
+  _assert_eq "invalid local prune path preserves branch $invalid_prune_path" \
+    invalid-config \
+    "$(git -C "$invalid_config_repo" branch --list --format='%(refname:short)' invalid-config)"
+  _assert_eq "invalid local prune path preserves data $invalid_prune_path" \
+    'private data' "$(cat "$invalid_config_dir/.cache/data")"
+done
+
+# Prune configuration is irrelevant unless linked-worktree removal is enabled.
+# Invalid deletion authority must not break ordinary branch-only cleanup.
+unused_config_repo=$(_clone_remote)
+git -C "$unused_config_repo" switch --quiet -c unused-config
+_commit_file "$unused_config_repo" unused-config.txt clean \
+  "add unused config work"
+git -C "$unused_config_repo" switch --quiet main
+git -C "$unused_config_repo" config --local --add \
+  cleanupRepo.worktreePrunePath ../outside
+unused_config_output=$(git -C "$unused_config_repo" cleanup-repo --all 2>&1)
+unused_config_rc=$?
+_assert_eq "ordinary cleanup ignores unused prune configuration" 0 \
+  "$unused_config_rc"
+_assert_contains "ordinary cleanup still deletes selected branch" \
+  "deleting unused-config (all)" "$unused_config_output"
+_assert_eq "unused prune configuration does not strand branch" "" \
+  "$(git -C "$unused_config_repo" branch --list \
+    --format='%(refname:short)' unused-config)"
+
+# Repository-local path authorization must be read as one complete, successful
+# NUL-delimited stream. A producer that emits a valid prefix and then fails must
+# not grant partial deletion authority.
+config_read_repo=$(_clone_remote)
+git -C "$config_read_repo" switch --quiet -c config-read-failure
+_commit_file "$config_read_repo" config-read.txt clean \
+  "add config read failure work"
+git -C "$config_read_repo" switch --quiet main
+config_read_dir=$(_tmpdir)
+rm -rf "$config_read_dir"
+git -C "$config_read_repo" worktree add --quiet \
+  "$config_read_dir" config-read-failure
+mkdir "$config_read_dir/.cache"
+printf 'private data\n' >"$config_read_dir/.cache/data"
+git -C "$config_read_repo" config --local --add \
+  cleanupRepo.worktreePrunePath .cache
+config_read_bin=$(_tmpdir)
+cat >"$config_read_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == config && "${2:-}" == --local &&
+  "${3:-}" == --null ]]; then
+  printf '.cache\0'
+  exit 88
+fi
+exec "$GIT_CONFIG_READ_REAL" "$@"
+EOF
+chmod +x "$config_read_bin/git"
+config_read_output=$(cd "$config_read_repo" &&
+  PATH="$config_read_bin:$PATH" \
+    GIT_CONFIG_READ_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
+    "$ROOT/bin/git-cleanup-repo" --base main --all --remove-worktrees 2>&1)
+config_read_rc=$?
+_assert_eq "partial prune config producer fails cleanup" 2 "$config_read_rc"
+_assert_contains "partial prune config producer is diagnosed" \
+  "could not read repository-local worktree prune paths" "$config_read_output"
+_assert_eq "partial prune config producer preserves branch" config-read-failure \
+  "$(git -C "$config_read_repo" branch --list --format='%(refname:short)' config-read-failure)"
+_assert_eq "partial prune config producer preserves cache" present \
+  "$(if [[ -e "$config_read_dir/.cache/data" ]]; then printf 'present'; else printf 'missing'; fi)"
+_assert_eq "partial prune config producer preserves worktree" present \
+  "$(if [[ -e "$config_read_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
+
+# status.showUntrackedFiles=no is common in large work trees. It must not hide
+# arbitrary untracked data from cleanup's explicit preflight.
+hidden_untracked_repo=$(_clone_remote)
+git -C "$hidden_untracked_repo" switch --quiet -c hidden-untracked
+_commit_file "$hidden_untracked_repo" hidden-untracked.txt clean \
+  "add hidden untracked work"
+git -C "$hidden_untracked_repo" switch --quiet main
+hidden_untracked_dir=$(_tmpdir)
+rm -rf "$hidden_untracked_dir"
+git -C "$hidden_untracked_repo" worktree add --quiet \
+  "$hidden_untracked_dir" hidden-untracked
+printf 'private data\n' >"$hidden_untracked_dir/private-data"
+git -C "$hidden_untracked_repo" config status.showUntrackedFiles no
+hidden_untracked_output=$(git -C "$hidden_untracked_repo" cleanup-repo \
+  --all --remove-worktrees 2>&1)
+_assert_contains "hidden untracked config still protects local data" \
+  "worktree has hidden local content: $hidden_untracked_dir" \
+  "$hidden_untracked_output"
+_assert_not_contains "hidden untracked data is caught before Git removal" \
+  "worktree could not be removed safely" "$hidden_untracked_output"
+_assert_eq "hidden untracked config preserves private data" 'private data' \
+  "$(cat "$hidden_untracked_dir/private-data")"
+
+# A file created outside the configured cache after preflight must survive.
+# The post-prune recheck keeps the branch and worktree even though the explicitly
+# disposable cache itself has already been removed.
+prune_race_repo=$(_clone_remote)
+git -C "$prune_race_repo" switch --quiet -c prune-race
+_commit_file "$prune_race_repo" prune-race.txt clean "add prune race work"
+git -C "$prune_race_repo" switch --quiet main
+prune_race_dir=$(_tmpdir)
+rm -rf "$prune_race_dir"
+git -C "$prune_race_repo" worktree add --quiet "$prune_race_dir" prune-race
+mkdir "$prune_race_dir/.cache"
+printf 'generated cache\n' >"$prune_race_dir/.cache/data"
+git -C "$prune_race_repo" config --local --add \
+  cleanupRepo.worktreePrunePath .cache
+prune_race_bin=$(_tmpdir)
+cat >"$prune_race_bin/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == -C && "${3:-}" == clean ]]; then
+  printf 'late private data\n' >"$GIT_PRUNE_RACE_PATH/private-data"
+fi
+exec "$GIT_PRUNE_RACE_REAL" "$@"
+EOF
+chmod +x "$prune_race_bin/git"
+prune_race_output=$(cd "$prune_race_repo" &&
+  PATH="$prune_race_bin:$PATH" \
+    GIT_PRUNE_RACE_PATH="$prune_race_dir" \
+    GIT_PRUNE_RACE_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
+    "$ROOT/bin/git-cleanup-repo" --base main --all --remove-worktrees 2>&1)
+_assert_contains "post-prune unknown file blocks worktree removal" \
+  "worktree has hidden local content: $prune_race_dir" "$prune_race_output"
+_assert_eq "post-prune unknown file preserves branch" prune-race \
+  "$(git -C "$prune_race_repo" branch --list --format='%(refname:short)' prune-race)"
+_assert_eq "post-prune unknown file survives" 'late private data' \
+  "$(cat "$prune_race_dir/private-data")"
+_assert_eq "explicit cache is pruned before post-prune race is detected" missing \
+  "$(if [[ -e "$prune_race_dir/.cache" ]]; then printf 'present'; else printf 'missing'; fi)"
+
+# A pruning command failure is indeterminate. Preserve the cache, worktree, and
+# branch instead of treating the configured path as if it had disappeared.
+prune_failure_repo=$(_clone_remote)
+git -C "$prune_failure_repo" switch --quiet -c prune-failure
+_commit_file "$prune_failure_repo" prune-failure.txt clean \
+  "add prune failure work"
+git -C "$prune_failure_repo" switch --quiet main
+prune_failure_dir=$(_tmpdir)
+rm -rf "$prune_failure_dir"
+git -C "$prune_failure_repo" worktree add --quiet \
+  "$prune_failure_dir" prune-failure
+mkdir "$prune_failure_dir/.cache"
+printf 'generated cache\n' >"$prune_failure_dir/.cache/data"
+git -C "$prune_failure_repo" config --local --add \
+  cleanupRepo.worktreePrunePath .cache
+prune_failure_bin=$(_tmpdir)
+cat >"$prune_failure_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -C && "${3:-}" == clean ]]; then
+  exit 88
+fi
+exec "$GIT_PRUNE_FAILURE_REAL" "$@"
+EOF
+chmod +x "$prune_failure_bin/git"
+prune_failure_output=$(cd "$prune_failure_repo" &&
+  PATH="$prune_failure_bin:$PATH" \
+    GIT_PRUNE_FAILURE_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
+    "$ROOT/bin/git-cleanup-repo" --base main --all --remove-worktrees 2>&1)
+_assert_contains "prune failure blocks worktree removal" \
+  "disposable entry could not be pruned safely: $prune_failure_dir" \
+  "$prune_failure_output"
+_assert_eq "prune failure preserves branch" prune-failure \
+  "$(git -C "$prune_failure_repo" branch --list --format='%(refname:short)' prune-failure)"
+_assert_eq "prune failure preserves cache data" 'generated cache' \
+  "$(cat "$prune_failure_dir/.cache/data")"
+_assert_eq "prune failure preserves worktree" present \
+  "$(if [[ -e "$prune_failure_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
+
+# A configured name is a literal entry, not a Git pathspec pattern. If a file
+# appears after preflight, metacharacters in the configured name must not let
+# the bounded clean consume that unrelated file.
+literal_prune_repo=$(_clone_remote)
+git -C "$literal_prune_repo" switch --quiet -c literal-prune
+_commit_file "$literal_prune_repo" literal-prune.txt clean \
+  "add literal prune work"
+git -C "$literal_prune_repo" switch --quiet main
+literal_prune_dir=$(_tmpdir)
+rm -rf "$literal_prune_dir"
+git -C "$literal_prune_repo" worktree add --quiet \
+  "$literal_prune_dir" literal-prune
+mkdir "$literal_prune_dir/:(top)"
+printf 'generated cache\n' >"$literal_prune_dir/:(top)/data"
+git -C "$literal_prune_repo" config --local --add \
+  cleanupRepo.worktreePrunePath ':(top)'
+literal_prune_bin=$(_tmpdir)
+cat >"$literal_prune_bin/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == -C && "${3:-}" == clean ]]; then
+  mkdir "$GIT_LITERAL_PRUNE_PATH/cache-secret"
+  printf 'late private data\n' \
+    >"$GIT_LITERAL_PRUNE_PATH/cache-secret/private-data"
+fi
+exec "$GIT_LITERAL_PRUNE_REAL" "$@"
+EOF
+chmod +x "$literal_prune_bin/git"
+literal_prune_output=$(cd "$literal_prune_repo" &&
+  PATH="$literal_prune_bin:$PATH" \
+    GIT_LITERAL_PRUNE_PATH="$literal_prune_dir" \
+    GIT_LITERAL_PRUNE_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
+    "$ROOT/bin/git-cleanup-repo" --base main --all --remove-worktrees 2>&1)
+_assert_contains "post-preflight pathspec neighbor blocks removal" \
+  "worktree has hidden local content: $literal_prune_dir" \
+  "$literal_prune_output"
+_assert_eq "literal prune preserves pathspec neighbor" 'late private data' \
+  "$(cat "$literal_prune_dir/cache-secret/private-data" 2>/dev/null)"
+_assert_eq "literal prune removes only configured entry" missing \
+  "$(if [[ -e "$literal_prune_dir/:(top)" ]]; then printf 'present'; else printf 'missing'; fi)"
+_assert_eq "literal prune preserves branch after race" literal-prune \
+  "$(git -C "$literal_prune_repo" branch --list --format='%(refname:short)' literal-prune)"
 
 # Index flags can hide modified tracked files from status. Both skip-worktree
 # and assume-unchanged must make automatic worktree removal ineligible.

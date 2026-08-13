@@ -399,13 +399,38 @@ git cleanup-repo --all
 
 Branches checked out or reserved by another worktree are skipped by default.
 Use `--remove-worktrees` to remove a linked worktree before deleting its branch.
-Only worktrees with no uncommitted, ignored, or index-hidden local content and
-no active rebase/merge/cherry-pick/revert/bisect operation are eligible, and
-removal never uses `--force`:
+Only worktrees with no tracked changes, index-hidden local content, or active
+rebase/merge/cherry-pick/revert/bisect operation are eligible. Unknown
+untracked or ignored content still blocks removal, and removal never uses
+`--force`:
 
 ```sh
 git cleanup-repo --all --remove-worktrees
 ```
+
+Before removing an otherwise eligible worktree, the command can prune two
+explicit classes of disposable top-level entries:
+
+- A real top-level directory whose real `CACHEDIR.TAG` file begins with the
+  standard `Signature: 8a477f597d28d172789f06886806bc55` line.
+- A literal top-level entry named by the target repository's local
+  `cleanupRepo.worktreePrunePath` configuration.
+
+For example, a repository that intentionally creates a disposable `.cache`
+entry in its linked worktrees can opt in with:
+
+```sh
+git config --local --add cleanupRepo.worktreePrunePath .cache
+```
+
+This setting is deletion authorization. Values must be single top-level names;
+absolute, nested, traversal, `.git`, newline-bearing, and path-separator values
+are rejected. Global and command-line configuration cannot grant this
+authorization. Pruning uses a path-limited `git clean -fdx` and then repeats the
+full tracked, untracked, ignored, and index-hidden checks. If unknown content is
+already present at preflight, no disposable entry is pruned. Content observed
+by the post-prune recheck stops worktree and branch removal. Dry-run reports the
+entries it would prune without changing them.
 
 Useful options:
 

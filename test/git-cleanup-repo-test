@@ -2267,24 +2267,31 @@ printf 'private data\n' >"$config_read_dir/.cache/data"
 git -C "$config_read_repo" config --local --add \
   cleanupRepo.worktreePrunePath .cache
 config_read_bin=$(_tmpdir)
+config_read_sentinel_capture=$config_read_bin/sentinel
 cat >"$config_read_bin/git" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == config && "${2:-}" == --local &&
   "${3:-}" == --null ]]; then
+  printf '%s\n' "${sentinel:-unset}" >"$GIT_CONFIG_READ_SENTINEL_CAPTURE"
   printf '.cache\0'
   exit 88
 fi
 exec "$GIT_CONFIG_READ_REAL" "$@"
 EOF
 chmod +x "$config_read_bin/git"
+export sentinel=caller-sentinel
 config_read_output=$(cd "$config_read_repo" &&
   PATH="$config_read_bin:$PATH" \
+    GIT_CONFIG_READ_SENTINEL_CAPTURE="$config_read_sentinel_capture" \
     GIT_CONFIG_READ_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
     "$ROOT/bin/git-cleanup-repo" --base main --all --remove-worktrees 2>&1)
 config_read_rc=$?
+unset sentinel
 _assert_eq "partial prune config producer fails cleanup" 2 "$config_read_rc"
 _assert_contains "partial prune config producer is diagnosed" \
   "could not read repository-local worktree prune paths" "$config_read_output"
+_assert_eq "config completion nonce is not exported to its producer" \
+  caller-sentinel "$(cat "$config_read_sentinel_capture")"
 _assert_eq "partial prune config producer preserves branch" config-read-failure \
   "$(git -C "$config_read_repo" branch --list --format='%(refname:short)' config-read-failure)"
 _assert_eq "partial prune config producer preserves cache" present \

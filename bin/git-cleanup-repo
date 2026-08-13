@@ -326,15 +326,17 @@ _validate_worktree_prune_path() {
 }
 
 _emit_worktree_prune_paths() {
-  local sentinel="$1" status=0
-
+  # Keep the unpredictable completion marker in positional parameters. A
+  # named local can inherit an exported attribute from the caller and leak the
+  # marker to the Git producer's environment on Bash 3.2.
+  set -- "$1" 0
   git config --local --null --get-all \
-    cleanupRepo.worktreePrunePath || status=$?
-  printf '%s:%s\0' "$sentinel" "$status"
+    cleanupRepo.worktreePrunePath || set -- "$1" "$?"
+  printf '%s:%s\0' "$1" "$2"
 }
 
 _load_worktree_prune_paths() {
-  local candidate config_fd="" configured entry existing sentinel status
+  local candidate completion_status="" config_fd="" configured entry existing
   local complete=0 invalid=0 invalid_entry="" malformed=0 saw_entry=0
   local trailing=0
 
@@ -351,8 +353,8 @@ _load_worktree_prune_paths() {
   set -- "${1//[[:space:]]/}"
   [[ ${#1} -eq 33 && "$1" == *x && "${1%x}" != *[!0-9a-f]* ]] ||
     _die "could not create a worktree prune path completion record"
-  sentinel=$'\036git-tools-worktree-prune-paths-complete-'"${1%x}"
-  if ! eval "exec $config_fd< <(_emit_worktree_prune_paths \"\$sentinel\")"; then
+  set -- $'\036git-tools-worktree-prune-paths-complete-'"${1%x}"
+  if ! eval "exec $config_fd< <(_emit_worktree_prune_paths \"\$1\")"; then
     _die "could not read repository-local worktree prune paths"
   fi
 
@@ -362,12 +364,13 @@ _load_worktree_prune_paths() {
   while :; do
     entry=""
     if IFS= read -r -d '' entry <&"$config_fd"; then
-      if [[ "$entry" == "$sentinel":* ]]; then
+      if [[ "$entry" == "$1":* ]]; then
         if [[ "$complete" == 1 ]]; then
           trailing=1
         else
-          status=${entry#"$sentinel":}
-          [[ -n "$status" && "$status" != *[!0-9]* ]] || malformed=1
+          completion_status=${entry#"$1":}
+          [[ -n "$completion_status" &&
+            "$completion_status" != *[!0-9]* ]] || malformed=1
           complete=1
         fi
         continue
@@ -402,7 +405,7 @@ _load_worktree_prune_paths() {
 
   [[ "$complete" == 1 && "$trailing" == 0 && "$malformed" == 0 ]] ||
     _die "could not read repository-local worktree prune paths"
-  case "$status" in
+  case "$completion_status" in
     0) ;;
     1)
       [[ "$saw_entry" == 0 ]] ||
@@ -441,52 +444,71 @@ _worktree_entry_is_disposable() {
   _worktree_entry_has_cache_tag "$path" "$entry"
 }
 
-_classify_worktree_untracked() {
-  local path="$1" entry top has_hidden=0 saw_entry=0
+_classify_worktree_status() {
+  local path="$1" entry record="" top
+  local has_dirty=0 has_disposable=0 has_hidden=0 malformed=0
 
-  while IFS= read -r -d '' entry; do
-    saw_entry=1
-    top=${entry%%/*}
-    if ! _worktree_entry_is_disposable "$path" "$top"; then
-      has_hidden=1
+  while :; do
+    record=""
+    if IFS= read -r -d '' record; then
+      # A rename or copy has a second, headerless pathname record. Once any
+      # tracked status is present, the worktree is ineligible; drain the rest
+      # without interpreting continuation records or risking producer SIGPIPE.
+      [[ "$has_dirty" == 0 ]] || continue
+      case "$record" in
+        '?? '* | '!! '*)
+          entry=${record#???}
+          if [[ -z "$entry" ]]; then
+            malformed=1
+            continue
+          fi
+          top=${entry%%/*}
+          if _worktree_entry_is_disposable "$path" "$top"; then
+            has_disposable=1
+          else
+            has_hidden=1
+          fi
+          ;;
+        ??' '*) has_dirty=1 ;;
+        *) malformed=1 ;;
+      esac
+      continue
     fi
+    [[ -z "$record" ]] || malformed=1
+    break
   done
-  # Drain the entire NUL stream even after finding protected content. Returning
-  # early could give the Git producer SIGPIPE and turn a safe "hidden" result
-  # into an ambiguous inspection failure under pipefail.
-  if [[ "$has_hidden" == 1 ]]; then
+
+  [[ "$malformed" == 0 ]] || return 1
+  if [[ "$has_dirty" == 1 ]]; then
+    printf 'dirty\n'
+  elif [[ "$has_hidden" == 1 ]]; then
     printf 'hidden\n'
-  elif [[ "$saw_entry" == 1 ]]; then
+  elif [[ "$has_disposable" == 1 ]]; then
     printf 'disposable\n'
   else
     printf 'clean\n'
   fi
 }
 
-_worktree_untracked_state() {
+_worktree_status_state() {
   local path="$1" state status=0
 
   state=$(
     set -o pipefail
-    {
-      gt_git_without_local_env -C "$path" ls-files -z \
-        --others --exclude-standard || exit 1
-      gt_git_without_local_env -C "$path" ls-files -z \
-        --others --ignored --exclude-standard || exit 1
-    } | _classify_worktree_untracked "$path"
+    GIT_OPTIONAL_LOCKS=0 gt_git_without_local_env -C "$path" status \
+      --porcelain=v1 -z --ignored=matching --untracked-files=all \
+      2>/dev/null | _classify_worktree_status "$path"
   ) || status=$?
   [[ "$status" == 0 ]] || return 1
   printf '%s\n' "$state"
 }
 
 _worktree_dirty_state() {
-  local path="$1" entry index_state output state
+  local path="$1" entry index_state state
 
-  if ! output=$(GIT_OPTIONAL_LOCKS=0 \
-    gt_git_without_local_env -C "$path" status --porcelain \
-    --untracked-files=no 2>/dev/null); then
+  if ! state=$(_worktree_status_state "$path"); then
     printf 'unknown\n'
-  elif [[ -n "$output" ]]; then
+  elif [[ "$state" == dirty ]]; then
     printf 'dirty\n'
   elif ! index_state=$(GIT_OPTIONAL_LOCKS=0 \
     gt_git_without_local_env -C "$path" ls-files -v 2>/dev/null); then
@@ -500,11 +522,7 @@ _worktree_dirty_state() {
           ;;
       esac
     done <<<"$index_state"
-    if ! state=$(_worktree_untracked_state "$path"); then
-      printf 'unknown\n'
-    else
-      printf '%s\n' "$state"
-    fi
+    printf '%s\n' "$state"
   fi
 }
 

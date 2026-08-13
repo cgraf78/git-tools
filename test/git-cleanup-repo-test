@@ -317,17 +317,28 @@ _commit_file "$repo" keep.txt keep "add keep"
 git -C "$repo" push -u origin keep >/dev/null 2>&1
 git -C "$repo" switch --quiet main
 
+git -C "$repo" switch --quiet -c local-only
+_commit_file "$repo" local-only.txt local "add local-only branch"
+git -C "$repo" switch --quiet main
+
 result=$(git -C "$repo" cleanup-repo 2>&1)
 _assert_contains "deletes exact merged branch" "deleting merged (merged)" "$result"
+_assert_contains "diagnoses a gone upstream without claiming it exists" \
+  "keeping gone; merge not proven; upstream is gone; --gone selects it for cleanup" \
+  "$result"
+_assert_contains "diagnoses an existing upstream" \
+  "keeping keep; merge not proven; upstream still exists" "$result"
+_assert_contains "diagnoses a branch without an upstream" \
+  "keeping local-only; merge not proven; no upstream is configured" "$result"
 _assert_contains "reports deletion summary" \
-  "deleted 1 local branch(es), skipped 2" "$result"
-expected="$(printf 'gone\nkeep\nmain')"
+  "deleted 1 local branch(es), skipped 3" "$result"
+expected="$(printf 'gone\nkeep\nlocal-only\nmain')"
 _assert_eq "default cleanup deletes merged branch" "$expected" "$(_branches "$repo")"
 result=$(git -C "$repo" cleanup-repo --gone 2>&1)
 _assert_contains "gone deletes removed-upstream branches" \
   "deleting gone (upstream gone)" "$result"
 _assert_eq "gone mode deletes gone branch" \
-  "$(printf 'keep\nmain')" "$(_branches "$repo")"
+  "$(printf 'keep\nlocal-only\nmain')" "$(_branches "$repo")"
 
 squash_repo=$(_clone_remote)
 git -C "$squash_repo" switch --quiet -c squashed
@@ -957,7 +968,7 @@ git -C "$unmerged_repo" switch --quiet main
 _commit_file "$unmerged_repo" other.txt other "add unrelated commit"
 result=$(git -C "$unmerged_repo" cleanup-repo 2>&1)
 _assert_contains "keeps branches that are not content-merged" \
-  "keeping partial; not merged" "$result"
+  "keeping partial; merge not proven" "$result"
 _assert_eq "unmerged branch survives default cleanup" \
   "$(printf 'main\npartial')" "$(_branches "$unmerged_repo")"
 
@@ -971,7 +982,7 @@ git -C "$rebase_partial_repo" switch --quiet main
 git -C "$rebase_partial_repo" cherry-pick rebased-extra~1 >/dev/null 2>&1
 result=$(git -C "$rebase_partial_repo" cleanup-repo 2>&1)
 _assert_contains "keeps a partially rebase-merged branch with an extra commit" \
-  "keeping rebased-extra; not merged" "$result"
+  "keeping rebased-extra; merge not proven" "$result"
 _assert_eq "partially rebase-merged branch survives" \
   "$(printf 'main\nrebased-extra')" "$(_branches "$rebase_partial_repo")"
 
@@ -992,7 +1003,7 @@ _commit_file "$squash_partial_repo" se3.txt three "squashed-extra step 3 (unmerg
 git -C "$squash_partial_repo" switch --quiet main
 result=$(git -C "$squash_partial_repo" cleanup-repo 2>&1)
 _assert_contains "keeps a squash-merged branch with an extra unmerged commit" \
-  "keeping squashed-extra; not merged" "$result"
+  "keeping squashed-extra; merge not proven" "$result"
 _assert_eq "squash-merged branch with extra work survives" \
   "$(printf 'main\nsquashed-extra')" "$(_branches "$squash_partial_repo")"
 
@@ -1009,9 +1020,34 @@ git -C "$whitespace_repo" add whitespace.txt
 git -C "$whitespace_repo" commit --quiet -m "add main whitespace"
 result=$(git -C "$whitespace_repo" cleanup-repo 2>&1)
 _assert_contains "keeps patch-equivalent byte-distinct content" \
-  "keeping whitespace-distinct; not merged" "$result"
+  "keeping whitespace-distinct; merge not proven" "$result"
 _assert_eq "byte-distinct branch survives default cleanup" \
   "$(printf 'main\nwhitespace-distinct')" "$(_branches "$whitespace_repo")"
+
+# A patch ID can identify several commits because it ignores whitespace. An
+# inexact candidate must not hide a later candidate whose raw delta is exact.
+multiple_candidate_repo=$(_clone_remote)
+git -C "$multiple_candidate_repo" switch --quiet -c exact-after-inexact
+printf 'alpha beta\n' >"$multiple_candidate_repo/multiple.txt"
+git -C "$multiple_candidate_repo" add multiple.txt
+git -C "$multiple_candidate_repo" commit --quiet -m "add exact branch bytes"
+git -C "$multiple_candidate_repo" switch --quiet main
+printf 'alpha beta\n' >"$multiple_candidate_repo/multiple.txt"
+git -C "$multiple_candidate_repo" add multiple.txt
+git -C "$multiple_candidate_repo" commit --quiet -m "add exact bytes earlier"
+git -C "$multiple_candidate_repo" rm --quiet multiple.txt
+git -C "$multiple_candidate_repo" commit --quiet -m "remove exact bytes"
+printf 'alpha    beta\n' >"$multiple_candidate_repo/multiple.txt"
+git -C "$multiple_candidate_repo" add multiple.txt
+git -C "$multiple_candidate_repo" commit --quiet -m "add inexact whitespace later"
+printf 'edited later\n' >"$multiple_candidate_repo/multiple.txt"
+git -C "$multiple_candidate_repo" add multiple.txt
+git -C "$multiple_candidate_repo" commit --quiet -m "edit exact bytes later"
+multiple_candidate_output=$(git -C "$multiple_candidate_repo" cleanup-repo 2>&1)
+_assert_contains "searches past a newer inexact historical candidate" \
+  "deleting exact-after-inexact (content-merged)" "$multiple_candidate_output"
+_assert_eq "older exact candidate permits cleanup" main \
+  "$(_branches "$multiple_candidate_repo")"
 
 # Failure to produce either exact delta is not proof of a merge.
 whitespace_branch_oid=$(git -C "$whitespace_repo" rev-parse whitespace-distinct)
@@ -1029,13 +1065,13 @@ for failure_side in base branch; do
       GIT_DIFF_TREE_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
       "$ROOT/bin/git-cleanup-repo" 2>&1)
   _assert_contains "keeps branch after $failure_side delta producer failure" \
-    "keeping whitespace-distinct; not merged" "$diff_failure_output"
+    "keeping whitespace-distinct; merge not proven" "$diff_failure_output"
   _assert_eq "$failure_side delta producer failure preserves branch" \
     "$whitespace_branch_oid" \
     "$(git -C "$whitespace_repo" rev-parse refs/heads/whitespace-distinct)"
 done
 
-# Exact comparison covers tree modes and later same-path edits, not only bytes.
+# Exact comparison covers tree modes, not only bytes.
 tree_repo=$(_clone_remote)
 git -C "$tree_repo" switch --quiet -c mode-distinct
 printf 'same bytes\n' >"$tree_repo/mode.txt"
@@ -1048,7 +1084,7 @@ git -C "$tree_repo" add mode.txt
 git -C "$tree_repo" commit --quiet -m "add regular file"
 result=$(git -C "$tree_repo" cleanup-repo 2>&1)
 _assert_contains "keeps mode-distinct tree entry" \
-  "keeping mode-distinct; not merged" "$result"
+  "keeping mode-distinct; merge not proven" "$result"
 
 later_repo=$(_clone_remote)
 git -C "$later_repo" switch --quiet -c landed-then-edited
@@ -1061,13 +1097,132 @@ printf '%s\n' later >"$later_repo/shared.txt"
 git -C "$later_repo" add shared.txt
 git -C "$later_repo" commit --quiet -m "edit landed path later"
 result=$(git -C "$later_repo" cleanup-repo 2>&1)
-_assert_contains "keeps landed branch after later same-path edit" \
-  "keeping landed-then-edited; not merged" "$result"
+_assert_contains "deletes exact squash branch after later same-path edit" \
+  "deleting landed-then-edited (content-merged)" "$result"
+_assert_eq "later same-path edit does not strand squash-merged branch" \
+  "main" "$(_branches "$later_repo")"
+
+# A first-parent merge transition can carry the same exact collapsed delta as
+# a squash commit. The side commit is intentionally not on the first-parent
+# walk; the merge's first-parent-to-commit transition is the historical proof.
+merge_transition_repo=$(_clone_remote)
+merge_transition_root=$(git -C "$merge_transition_repo" rev-parse main)
+git -C "$merge_transition_repo" switch --quiet -c transition-base \
+  "$merge_transition_root"
+_commit_file "$merge_transition_repo" side.txt side \
+  "advance the transition side"
+transition_side=$(git -C "$merge_transition_repo" rev-parse HEAD)
+git -C "$merge_transition_repo" switch --quiet -c merged-via-transition \
+  "$transition_side"
+_commit_file "$merge_transition_repo" transition.txt landed \
+  "add transition content"
+git -C "$merge_transition_repo" switch --quiet main
+_commit_file "$merge_transition_repo" mainline.txt mainline \
+  "advance main before transition merge"
+git -C "$merge_transition_repo" merge --quiet --no-ff --no-commit \
+  transition-base
+git -C "$merge_transition_repo" rm --force --quiet side.txt
+_commit_file "$merge_transition_repo" transition.txt landed \
+  "merge exact transition"
+_commit_file "$merge_transition_repo" transition.txt later \
+  "edit transition path later"
+for diff_merges in off combined; do
+  git -C "$merge_transition_repo" config log.diffMerges "$diff_merges"
+  merge_transition_config_output=$(git -C "$merge_transition_repo" \
+    cleanup-repo --dry-run 2>&1)
+  _assert_contains "inherited $diff_merges merge display keeps exact proof" \
+    "would delete merged-via-transition at " \
+    "$merge_transition_config_output"
+done
+git -C "$merge_transition_repo" config --unset log.diffMerges
+merge_transition_output=$(git -C "$merge_transition_repo" cleanup-repo 2>&1)
+_assert_contains "deletes squash branch carried by a first-parent merge transition" \
+  "deleting merged-via-transition (content-merged)" \
+  "$merge_transition_output"
+_assert_eq "later edit does not strand a merge-transition squash" \
+  "main" "$(_branches "$merge_transition_repo")"
+
+# Default path-history simplification must not hide a merge transition whose
+# result is tree-same to its second parent. The first-parent transition is still
+# the exact historical squash evidence cleanup needs.
+treesame_transition_repo=$(_clone_remote)
+treesame_transition_root=$(git -C "$treesame_transition_repo" rev-parse main)
+git -C "$treesame_transition_repo" switch --quiet \
+  -c merged-via-treesame-transition "$treesame_transition_root"
+_commit_file "$treesame_transition_repo" treesame.txt landed \
+  "add tree-same victim content"
+git -C "$treesame_transition_repo" switch --quiet \
+  -c treesame-carrier "$treesame_transition_root"
+_commit_file "$treesame_transition_repo" treesame.txt landed \
+  "carry tree-same transition content"
+git -C "$treesame_transition_repo" switch --quiet main
+_commit_file "$treesame_transition_repo" mainline.txt mainline \
+  "advance main before tree-same merge"
+git -C "$treesame_transition_repo" merge --quiet --no-ff treesame-carrier \
+  -m "merge tree-same transition"
+_commit_file "$treesame_transition_repo" treesame.txt later \
+  "edit tree-same transition later"
+treesame_transition_output=$(git -C "$treesame_transition_repo" \
+  cleanup-repo 2>&1)
+_assert_contains "deletes squash branch carried by a tree-same merge transition" \
+  "deleting merged-via-treesame-transition (content-merged)" \
+  "$treesame_transition_output"
+_assert_eq "later edit does not strand a tree-same merge-transition squash" \
+  "main" "$(_branches "$treesame_transition_repo")"
+
+# Only first-parent transitions count as historical replay evidence. An exact
+# side-branch commit that a merge conflict discards is reachable from main, but
+# its delta never became a mainline transition.
+discarded_repo=$(_clone_remote)
+git -C "$discarded_repo" config rerere.enabled false
+_commit_file "$discarded_repo" shared.txt base "add shared base"
+discarded_base=$(git -C "$discarded_repo" rev-parse main)
+git -C "$discarded_repo" switch --quiet -c unlanded
+_commit_file "$discarded_repo" shared.txt topic "add unlanded topic"
+git -C "$discarded_repo" switch --quiet -c discarded-copy "$discarded_base"
+_commit_file "$discarded_repo" shared.txt topic "add independent topic copy"
+git -C "$discarded_repo" switch --quiet main
+_commit_file "$discarded_repo" shared.txt mainline "edit mainline differently"
+if git -C "$discarded_repo" merge --no-ff discarded-copy \
+  -m "merge while discarding topic" >/dev/null 2>&1; then
+  _fail "discarded side-branch fixture produces a conflict"
+fi
+printf '%s\n' mainline >"$discarded_repo/shared.txt"
+git -C "$discarded_repo" add shared.txt
+git -C "$discarded_repo" commit --quiet -m "merge while discarding topic"
+discarded_output=$(git -C "$discarded_repo" cleanup-repo 2>&1)
+_assert_contains "keeps a delta discarded by mainline conflict resolution" \
+  "keeping unlanded; merge not proven" "$discarded_output"
+_assert_eq "discarded side delta does not prove the branch merged" \
+  "$(printf 'main\nunlanded')" "$(_branches "$discarded_repo")"
+
+# A merge base can sit on a merged side branch instead of main's first-parent
+# chain. In that graph, revision exclusion still exposes unrelated mainline
+# commits from before the branch point. Even an exact one cannot prove this
+# branch landed because it predates the branch's actual base.
+predated_repo=$(_clone_remote)
+predated_root=$(git -C "$predated_repo" rev-parse main)
+git -C "$predated_repo" switch --quiet -c side-base "$predated_root"
+_commit_file "$predated_repo" side.txt side "advance side base"
+git -C "$predated_repo" switch --quiet -c predated-victim
+_commit_file "$predated_repo" shared.txt topic "add victim topic"
+git -C "$predated_repo" switch --quiet main
+_commit_file "$predated_repo" shared.txt topic "independently add topic earlier"
+predated_candidate=$(git -C "$predated_repo" rev-parse HEAD)
+git -C "$predated_repo" revert --no-edit "$predated_candidate" >/dev/null
+git -C "$predated_repo" merge --quiet --no-ff side-base \
+  -m "merge side base after reverted topic"
+predated_output=$(git -C "$predated_repo" cleanup-repo 2>&1)
+_assert_contains "keeps an exact candidate that predates the real branch base" \
+  "keeping predated-victim; merge not proven" "$predated_output"
+_assert_eq "pre-branch candidate cannot prove later branch cleanup" \
+  "$(printf 'main\npredated-victim')" "$(_branches "$predated_repo")"
 
 # Exact squash merges still match with modes, symlinks, binary data, unusual
-# path syntax, and a file without a final newline.
+# path syntax, a newline in a path, and a file without a final newline.
 exact_repo=$(_clone_remote)
 exact_weird=':(literal)name.txt'
+exact_newline=$'line\nbreak.txt'
 _commit_file "$exact_repo" delete-me.txt obsolete "add file for exact deletion"
 git -C "$exact_repo" switch --quiet -c exact-tree
 git -C "$exact_repo" rm --quiet delete-me.txt
@@ -1077,6 +1232,7 @@ ln -s executable "$exact_repo/exact-link"
 printf '\000exact bytes\377' >"$exact_repo/exact.dat"
 printf 'exact no final newline' >"$exact_repo/exact-eof.txt"
 printf '%s\n' pathspec >"$exact_repo/$exact_weird"
+printf '%s\n' newline >"$exact_repo/$exact_newline"
 git -C "$exact_repo" add --all
 git -C "$exact_repo" commit --quiet -m "add exact branch tree"
 _commit_file "$exact_repo" exact-step2.txt second "add exact second step"
@@ -1088,6 +1244,7 @@ ln -s executable "$exact_repo/exact-link"
 printf '\000exact bytes\377' >"$exact_repo/exact.dat"
 printf 'exact no final newline' >"$exact_repo/exact-eof.txt"
 printf '%s\n' pathspec >"$exact_repo/$exact_weird"
+printf '%s\n' newline >"$exact_repo/$exact_newline"
 printf '%s\n' second >"$exact_repo/exact-step2.txt"
 git -C "$exact_repo" add --all
 git -C "$exact_repo" commit --quiet -m "squash exact branch tree"
@@ -1097,6 +1254,126 @@ _assert_contains "deletes exact rich-tree squash merge" \
   "deleting exact-tree (content-merged)" "$result"
 _assert_eq "exact rich-tree branch is deleted" "main" "$(_branches "$exact_repo")"
 git -C "$exact_repo" branch exact-tree "$exact_tree_oid"
+
+# Normal-sized proofs restrict the base walk with NUL-safe literal pathspecs.
+# Record arguments with NUL delimiters so the assertion itself preserves the
+# newline-bearing path.
+pathspec_bin=$(_tmpdir)
+pathspec_log=$(_tmpdir)/git-log-args
+cat >"$pathspec_bin/git" <<'EOF'
+#!/usr/bin/env bash
+for arg; do
+  if [[ "$arg" == log ]]; then
+    printf '%s\0' "$@" >"$GIT_PATHSPEC_LOG"
+    break
+  fi
+done
+exec "$GIT_PATHSPEC_REAL" "$@"
+EOF
+chmod +x "$pathspec_bin/git"
+mkdir "$exact_repo/invocation-subdir"
+pathspec_output=$(cd "$exact_repo/invocation-subdir" &&
+  PATH="$pathspec_bin:$PATH" \
+    GIT_PATHSPEC_LOG="$pathspec_log" \
+    GIT_PATHSPEC_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
+    "$ROOT/bin/git-cleanup-repo" --base main 2>&1)
+_assert_contains "path-limited proof still deletes exact rich tree" \
+  "deleting exact-tree (content-merged)" "$pathspec_output"
+literal_magic_seen=0
+literal_newline_seen=0
+ancestry_path_seen=0
+pathspec_arg=""
+while IFS= read -r -d '' pathspec_arg; do
+  [[ "$pathspec_arg" == ":(top,literal)$exact_weird" ]] && literal_magic_seen=1
+  [[ "$pathspec_arg" == ":(top,literal)$exact_newline" ]] && literal_newline_seen=1
+  [[ "$pathspec_arg" == --ancestry-path ]] && ancestry_path_seen=1
+done <"$pathspec_log"
+[[ -z "$pathspec_arg" ]] || _fail "pathspec argument log is NUL terminated"
+_assert_eq "top-level literal pathspec protects pathspec-magic filename" 1 \
+  "$literal_magic_seen"
+_assert_eq "top-level literal pathspec preserves newline-bearing filename" 1 \
+  "$literal_newline_seen"
+_assert_contains "nested invocation still finds historical squash candidate" \
+  "deleting exact-tree (content-merged)" "$pathspec_output"
+_assert_eq "base walk restricts candidates to the ancestry path" 1 \
+  "$ancestry_path_seen"
+git -C "$exact_repo" branch exact-tree "$exact_tree_oid"
+
+_literal_arg_count() {
+  local log_path="$1" arg="" count=0
+
+  while IFS= read -r -d '' arg; do
+    [[ "$arg" == ":(top,literal)"* ]] && count=$((count + 1))
+  done <"$log_path"
+  [[ -z "$arg" ]] || return 1
+  printf '%s\n' "$count"
+}
+
+# Bound pathspec argv by both count and bytes. Larger branches conservatively
+# fall back to the full first-parent scan instead of risking ARG_MAX failures.
+count_fallback_repo=$(_clone_remote)
+git -C "$count_fallback_repo" switch --quiet -c count-fallback
+mkdir "$count_fallback_repo/count-paths"
+count_index=1
+while ((count_index <= 257)); do
+  printf '%s\n' "$count_index" \
+    >"$count_fallback_repo/count-paths/$count_index.txt"
+  count_index=$((count_index + 1))
+done
+git -C "$count_fallback_repo" add count-paths
+git -C "$count_fallback_repo" commit --quiet -m "add many branch paths"
+git -C "$count_fallback_repo" switch --quiet main
+mkdir "$count_fallback_repo/count-paths"
+count_index=1
+while ((count_index <= 257)); do
+  printf '%s\n' "$count_index" \
+    >"$count_fallback_repo/count-paths/$count_index.txt"
+  count_index=$((count_index + 1))
+done
+git -C "$count_fallback_repo" add count-paths
+git -C "$count_fallback_repo" commit --quiet -m "squash many branch paths"
+count_fallback_output=$(cd "$count_fallback_repo" &&
+  PATH="$pathspec_bin:$PATH" \
+    GIT_PATHSPEC_LOG="$pathspec_log" \
+    GIT_PATHSPEC_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
+    "$ROOT/bin/git-cleanup-repo" --base main 2>&1)
+_assert_contains "count fallback retains exact squash proof" \
+  "deleting count-fallback (content-merged)" "$count_fallback_output"
+_assert_eq "257 paths fall back to an unfiltered base walk" 0 \
+  "$(_literal_arg_count "$pathspec_log")"
+
+byte_fallback_repo=$(_clone_remote)
+git -C "$byte_fallback_repo" switch --quiet -c byte-fallback
+mkdir "$byte_fallback_repo/byte-paths"
+byte_index=1
+while ((byte_index <= 150)); do
+  printf -v byte_name '%0220d' "$byte_index"
+  printf '%s\n' "$byte_index" \
+    >"$byte_fallback_repo/byte-paths/$byte_name"
+  byte_index=$((byte_index + 1))
+done
+git -C "$byte_fallback_repo" add byte-paths
+git -C "$byte_fallback_repo" commit --quiet -m "add long branch paths"
+git -C "$byte_fallback_repo" switch --quiet main
+mkdir "$byte_fallback_repo/byte-paths"
+byte_index=1
+while ((byte_index <= 150)); do
+  printf -v byte_name '%0220d' "$byte_index"
+  printf '%s\n' "$byte_index" \
+    >"$byte_fallback_repo/byte-paths/$byte_name"
+  byte_index=$((byte_index + 1))
+done
+git -C "$byte_fallback_repo" add byte-paths
+git -C "$byte_fallback_repo" commit --quiet -m "squash long branch paths"
+byte_fallback_output=$(cd "$byte_fallback_repo" &&
+  PATH="$pathspec_bin:$PATH" \
+    GIT_PATHSPEC_LOG="$pathspec_log" \
+    GIT_PATHSPEC_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
+    "$ROOT/bin/git-cleanup-repo" --base main 2>&1)
+_assert_contains "byte fallback retains exact squash proof" \
+  "deleting byte-fallback (content-merged)" "$byte_fallback_output"
+_assert_eq "large path bytes fall back to an unfiltered base walk" 0 \
+  "$(_literal_arg_count "$pathspec_log")"
 
 # Gitlinks participate in the same exact raw-tree proof. An identical target
 # is accepted, while a different commit at the same path is not.
@@ -1113,8 +1390,9 @@ git -C "$gitlink_repo" update-index --add \
   --cacheinfo "160000,$gitlink_target,vendor-link"
 git -C "$gitlink_repo" commit --quiet -m "squash exact gitlink"
 mkdir "$gitlink_repo/vendor-link"
+git -C "$gitlink_repo" config diff.ignoreSubmodules all
 gitlink_output=$(git -C "$gitlink_repo" cleanup-repo 2>&1)
-_assert_contains "deletes exact gitlink squash merge" \
+_assert_contains "deletes exact gitlink squash despite ignore configuration" \
   "deleting exact-gitlink (content-merged)" "$gitlink_output"
 _assert_eq "exact gitlink branch is deleted" "main" "$(_branches "$gitlink_repo")"
 
@@ -1133,20 +1411,21 @@ git -C "$gitlink_distinct_repo" update-index --add \
   --cacheinfo "160000,$gitlink_base_target,vendor-link"
 git -C "$gitlink_distinct_repo" commit --quiet -m "add distinct base gitlink"
 mkdir "$gitlink_distinct_repo/vendor-link"
+git -C "$gitlink_distinct_repo" config diff.ignoreSubmodules all
 gitlink_distinct_output=$(git -C "$gitlink_distinct_repo" cleanup-repo 2>&1)
-_assert_contains "keeps same-path distinct gitlink target" \
-  "keeping distinct-gitlink; not merged" "$gitlink_distinct_output"
+_assert_contains "keeps distinct gitlink despite ignore configuration" \
+  "keeping distinct-gitlink; merge not proven" "$gitlink_distinct_output"
 
-# Every streamed squash-proof producer is mandatory. A failed diff, log, or
-# patch-id command must not fall through to a false merged result.
+# Every streamed squash-proof producer is mandatory. A failure must not fall
+# through to a false merged result.
 for proof_failure in diff log patch-id; do
   proof_bin=$(_tmpdir)
   proof_tmp=$(_tmpdir)
   cat >"$proof_bin/git" <<'EOF'
 #!/usr/bin/env bash
-if [[ "${1:-}" == "$GIT_SQUASH_PROOF_FAILURE" ]]; then
-  exit 88
-fi
+for arg; do
+  [[ "$arg" == "$GIT_SQUASH_PROOF_FAILURE" ]] && exit 88
+done
 exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
 EOF
   chmod +x "$proof_bin/git"
@@ -1156,11 +1435,49 @@ EOF
       GIT_SQUASH_PROOF_FAILURE="$proof_failure" \
       "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1)
   _assert_contains "$proof_failure failure is not accepted as a squash proof" \
-    "keeping readonly-squash; not merged" "$proof_output"
+    "keeping readonly-squash; merge not proven" "$proof_output"
   _assert_eq "$proof_failure failure preserves the squash branch" \
     "$(printf 'main\nreadonly-squash')" "$(_branches "$readonly_repo")"
   _assert_eq "$proof_failure failure removes private workspace" "" \
     "$(_tool_artifacts "$proof_tmp")"
+done
+
+# The path-limiting producer is separately mandatory, and a successful command
+# with an unterminated trailing record is malformed rather than a partial path
+# inventory that may be trusted.
+path_producer_bin=$(_tmpdir)
+cat >"$path_producer_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == diff ]]; then
+  for arg; do
+    if [[ "$arg" == --name-only ]]; then
+      case "$GIT_PATH_PRODUCER_MODE" in
+        failure) exit 88 ;;
+        unterminated)
+          "$GIT_PATH_PRODUCER_REAL" "$@" || exit $?
+          printf '%s' trailing-path-data
+          exit 0
+          ;;
+        *) exit 89 ;;
+      esac
+    fi
+  done
+fi
+exec "$GIT_PATH_PRODUCER_REAL" "$@"
+EOF
+chmod +x "$path_producer_bin/git"
+for path_producer_mode in failure unterminated; do
+  path_producer_tmp=$(_tmpdir)
+  path_producer_output=$(cd "$readonly_repo" &&
+    PATH="$path_producer_bin:$PATH" \
+      TMPDIR="$path_producer_tmp" \
+      GIT_PATH_PRODUCER_MODE="$path_producer_mode" \
+      GIT_PATH_PRODUCER_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
+      "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1)
+  _assert_contains "$path_producer_mode path inventory is not merge proof" \
+    "keeping readonly-squash; merge not proven" "$path_producer_output"
+  _assert_eq "$path_producer_mode path inventory removes private workspace" \
+    "" "$(_tool_artifacts "$path_producer_tmp")"
 done
 
 # Successful producers with malformed trailing data are operational failures,
@@ -1204,7 +1521,7 @@ for malformed_mode in one-char mixed-width extra unterminated foreign-width; do
       GIT_MALFORMED_PROOF_MODE="$malformed_mode" \
       "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1)
   _assert_contains "$malformed_mode patch-id record is not accepted as merged" \
-    "keeping readonly-squash; not merged" "$malformed_output"
+    "keeping readonly-squash; merge not proven" "$malformed_output"
   _assert_eq "$malformed_mode patch-id fails before cherry fallback" "" \
     "$(if [[ -e "$malformed_log" ]]; then printf invoked; fi)"
 done
@@ -1241,7 +1558,7 @@ mktemp_failure_output=$(cd "$readonly_repo" &&
     GIT_PATCH_REAL_MKTEMP="$mktemp_failure_real" \
     "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1)
 _assert_contains "mktemp failure is not accepted as a squash proof" \
-  "keeping readonly-squash; not merged" "$mktemp_failure_output"
+  "keeping readonly-squash; merge not proven" "$mktemp_failure_output"
 
 # Cleanup failure is also unknown. Leave the injected workspace in place long
 # enough to verify restrictive directory and file modes under umask 000.
@@ -1265,7 +1582,7 @@ cleanup_failure_output=$(cd "$readonly_repo" &&
       "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1
   ))
 _assert_contains "workspace cleanup failure is not accepted as merged" \
-  "keeping readonly-squash; not merged" "$cleanup_failure_output"
+  "keeping readonly-squash; merge not proven" "$cleanup_failure_output"
 cleanup_artifacts=$(_tool_artifacts "$cleanup_tmp")
 cleanup_artifact_count=$(printf '%s\n' "$cleanup_artifacts" |
   awk 'NF { count++ } END { print count + 0 }')
@@ -1278,8 +1595,20 @@ if [[ -n "$cleanup_artifacts" ]]; then
     "$(_mode "$cleanup_artifacts/branch.patch-ids")"
   _assert_eq "base patch-id file is private" "600" \
     "$(_mode "$cleanup_artifacts/base.patch-ids")"
+  _assert_eq "branch path file is private" "600" \
+    "$(_mode "$cleanup_artifacts/branch.paths")"
+  _assert_eq "branch raw-delta file is private" "600" \
+    "$(_mode "$cleanup_artifacts/branch.raw")"
+  _assert_eq "candidate raw-delta file is private" "600" \
+    "$(_mode "$cleanup_artifacts/candidate.raw")"
+  _assert_eq "comparison diagnostic file is private" "600" \
+    "$(_mode "$cleanup_artifacts/comparison.stderr")"
   "$cleanup_real_rm" -f "$cleanup_artifacts/branch.patch-ids" \
-    "$cleanup_artifacts/base.patch-ids"
+    "$cleanup_artifacts/base.patch-ids" \
+    "$cleanup_artifacts/branch.paths" \
+    "$cleanup_artifacts/branch.raw" \
+    "$cleanup_artifacts/candidate.raw" \
+    "$cleanup_artifacts/comparison.stderr"
   rmdir "$cleanup_artifacts"
 fi
 
@@ -1360,7 +1689,9 @@ _assert_eq "setup-time TERM fails squash proof conservatively" interrupted \
 _assert_eq "setup-time TERM removes squash workspace" "" \
   "$(_tool_artifacts "$signal_setup_tmp")"
 
-# Every producer in the exact-tree proof must complete successfully.
+# Every producer in the current-snapshot fallback must complete successfully.
+# Use the multi-commit replay fixture: an exact historical squash now returns
+# before this fallback by design.
 for proof_failure in sort comm; do
   proof_bin=$(_tmpdir)
   cat >"$proof_bin/$proof_failure" <<'EOF'
@@ -1368,13 +1699,99 @@ for proof_failure in sort comm; do
 exit 88
 EOF
   chmod +x "$proof_bin/$proof_failure"
-  proof_output=$(cd "$exact_repo" &&
+  proof_output=$(cd "$rebase_repo" &&
     PATH="$proof_bin:$PATH" "$ROOT/bin/git-cleanup-repo" 2>&1)
   _assert_contains "$proof_failure failure is not accepted as merged" \
-    "keeping exact-tree; not merged" "$proof_output"
+    "keeping rebased; merge not proven" "$proof_output"
   _assert_eq "$proof_failure failure preserves branch" \
-    "$(printf 'exact-tree\nmain')" "$(_branches "$exact_repo")"
+    "$(printf 'main\nrebased')" "$(_branches "$rebase_repo")"
 done
+
+# Exact raw-delta equality must not add a dependency on cmp: some supported
+# minimal distributions do not install it.
+cmp_failure_bin=$(_tmpdir)
+cat >"$cmp_failure_bin/cmp" <<'EOF'
+#!/usr/bin/env bash
+exit 127
+EOF
+chmod +x "$cmp_failure_bin/cmp"
+cmp_failure_output=$(cd "$readonly_repo" &&
+  PATH="$cmp_failure_bin:$PATH" \
+    "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1)
+_assert_contains "historical squash proof does not require cmp" \
+  "would delete readonly-squash at " "$cmp_failure_output"
+_assert_eq "cmp-free dry run preserves the squash branch" \
+  "$(printf 'main\nreadonly-squash')" "$(_branches "$readonly_repo")"
+
+# Exact raw-delta equality is mandatory; an indeterminate Git comparison is
+# not a historical squash proof and must keep the branch.
+comparison_failure_bin=$(_tmpdir)
+comparison_failure_log=$(_tmpdir)/git-invocations
+cat >"$comparison_failure_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == diff ]]; then
+  for arg in "$@"; do
+    if [[ "$arg" == --no-index ]]; then
+      printf '%s\n' comparison >>"$GIT_COMPARISON_FAILURE_LOG"
+      printf '%s\n' 'error: simulated comparator access failure' >&2
+      exit 1
+    fi
+  done
+fi
+if [[ -e "$GIT_COMPARISON_FAILURE_LOG" ]]; then
+  for arg in "$@"; do
+    if [[ "$arg" == diff-tree || "$arg" == cherry ]]; then
+      printf '%s\n' fallback >>"$GIT_COMPARISON_FAILURE_LOG"
+      break
+    fi
+  done
+fi
+exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
+EOF
+chmod +x "$comparison_failure_bin/git"
+comparison_failure_output=$(cd "$readonly_repo" &&
+  PATH="$comparison_failure_bin:$PATH" \
+    GIT_COMPARISON_FAILURE_LOG="$comparison_failure_log" \
+    "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1)
+_assert_contains "raw comparison failure is not accepted as squash proof" \
+  "keeping readonly-squash; merge not proven" "$comparison_failure_output"
+_assert_eq "raw comparison failure stops before replay fallback" comparison \
+  "$(<"$comparison_failure_log")"
+_assert_eq "raw comparison failure preserves the squash branch" \
+  "$(printf 'main\nreadonly-squash')" "$(_branches "$readonly_repo")"
+
+# Failure to open the comparison diagnostic must be distinguishable from
+# Git's ordinary status-1 non-match. Exercise both the current direct
+# redirection and the separately checked descriptor used by the implementation.
+# A self-referential symlink fails even as root while remaining size-false, so
+# the old ambiguous status-1 path cannot pass the later diagnostic-size check.
+comparison_open_tmp=$(_tmpdir)
+comparison_open_output=$(cd "$readonly_repo" &&
+  TMPDIR="$comparison_open_tmp" bash -c '
+    source "$1/lib/git-tools-base.sh"
+    set -T
+    trap '\''
+      case "$BASH_COMMAND" in
+        exec\ 3\>* | git\ diff\ --no-index*)
+          trap - DEBUG
+          rm -f "$_gt_squash_comparison_error_file"
+          ln -s "$_gt_squash_comparison_error_file" \
+            "$_gt_squash_comparison_error_file"
+          ;;
+      esac
+    '\'' DEBUG
+    branch=$(git rev-parse refs/heads/readonly-squash)
+    base=$(git rev-parse refs/heads/main)
+    merge_base=$(git merge-base "$base" "$branch") || exit 3
+    status=0
+    _gt_squash_patch_merged "$branch" "$base" "$merge_base" || status=$?
+    trap - DEBUG
+    printf "status=%s\n" "$status"
+  ' _ "$ROOT" 2>&1)
+_assert_contains "comparison diagnostic open failure is indeterminate" \
+  "status=2" "$comparison_open_output"
+_assert_eq "comparison diagnostic open failure removes workspace" "" \
+  "$(_tool_artifacts "$comparison_open_tmp")"
 
 # An operational ancestry failure is unknown, not evidence that content proof
 # should run. Keep this fault separate from the cherry producer fault.
@@ -1394,7 +1811,7 @@ ancestor_output=$(cd "$exact_repo" &&
     GIT_ANCESTOR_FAIL_TARGET="$exact_branch_oid" \
     "$ROOT/bin/git-cleanup-repo" 2>&1)
 _assert_contains "ancestry failure is not accepted as merged" \
-  "keeping exact-tree; not merged" "$ancestor_output"
+  "keeping exact-tree; merge not proven" "$ancestor_output"
 _assert_eq "ancestry failure preserves branch" \
   "$(printf 'exact-tree\nmain')" "$(_branches "$exact_repo")"
 
@@ -1420,7 +1837,7 @@ cherry_output=$(cd "$rebase_repo" &&
     GIT_CHERRY_PROOF_LOG="$cherry_log" \
     "$ROOT/bin/git-cleanup-repo" 2>&1)
 _assert_contains "cherry failure is not accepted as merged" \
-  "keeping rebased; not merged" "$cherry_output"
+  "keeping rebased; merge not proven" "$cherry_output"
 _assert_contains "cherry fault test exercises ancestry" ancestry \
   "$(<"$cherry_log")"
 _assert_contains "cherry fault test reaches git cherry" cherry \
@@ -1441,7 +1858,7 @@ chmod +x "$grep_failure_bin/grep"
 grep_failure_output=$(cd "$rebase_repo" &&
   PATH="$grep_failure_bin:$PATH" "$ROOT/bin/git-cleanup-repo" 2>&1)
 _assert_contains "grep failure is not accepted as merged" \
-  "keeping rebased; not merged" "$grep_failure_output"
+  "keeping rebased; merge not proven" "$grep_failure_output"
 _assert_eq "grep failure preserves branch" \
   "$(printf 'main\nrebased')" "$(_branches "$rebase_repo")"
 

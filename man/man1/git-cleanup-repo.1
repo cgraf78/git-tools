@@ -1,4 +1,4 @@
-.TH GIT-CLEANUP-REPO 1 "2026-07-31" "git-tools" "User Commands"
+.TH GIT-CLEANUP-REPO 1 "2026-08-12" "git-tools" "User Commands"
 .SH NAME
 git-cleanup-repo \- delete safely merged local branches
 .SH SYNOPSIS
@@ -12,16 +12,19 @@ branches whose exact object IDs are proven merged.
 .PP
 By default it deletes local branches that are already merged into the base
 branch. This includes squash-, rebase-, and cherry-pick-merged branches: patch
-IDs identify candidate matches, and the exact net tree delta must also be
-present in a pinned base snapshot. A clean squash merge is recognized even
-though its commits are not ancestors of the base, while byte-, mode-, or later
-same-path differences are excluded. Branch and upstream-state enumeration must
-complete and validate before the first deletion. Each candidate is rechecked,
-and its ref is deleted only if it still has the exact proven object ID. It can
-also delete branches whose existing upstream tracking state is gone or every
-local branch except the base branch. The command does not execute configured
-fetch or prune mappings; other remote-tracking state must be refreshed
-separately when needed.
+IDs locate candidates, but exact raw-delta evidence is also required. A squash
+candidate must be a transition after the branch merge base on the pinned base's
+first-parent history. Its first-parent-to-commit delta must exactly match the
+branch's net delta; this includes transitions introduced by merge commits.
+Later mainline edits do not erase that historical proof; byte, mode, path,
+deletion, or gitlink differences still reject it. Multi-commit rebase and cherry-pick
+matches retain an exact-current-snapshot check. Branch and upstream-state
+enumeration must complete and validate before the first deletion. Each
+candidate is rechecked, and its ref is deleted only if it still has the exact
+proven object ID. It can also select branches whose existing upstream tracking
+state is gone or every local branch except the base branch. The command does not
+execute configured fetch or prune mappings; other remote-tracking state must be
+refreshed separately when needed.
 .PP
 Base selection does not depend on configured fetch refspecs or short ref names.
 The command fetches exactly
@@ -47,7 +50,7 @@ Remote fetch endpoint to resolve and fetch from. Defaults to
 .BR origin .
 .TP
 .B \-\-gone
-Also delete branches whose upstream is gone.
+Also select branches whose upstream is gone for cleanup.
 .TP
 .BR \-a ", " \-\-all
 Delete all local branches except the base branch.

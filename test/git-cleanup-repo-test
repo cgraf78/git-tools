@@ -2010,6 +2010,30 @@ _assert_not_contains "does not let git worktree remove reject dirty worktrees" \
 _assert_eq "dirty worktree branch remains" \
   "$(printf 'dirty-work\nmain')" "$(_branches "$dirty_worktree_repo")"
 
+# Porcelain v1 emits a second, headerless NUL record for renames. Preserve a
+# renamed worktree without mistaking that continuation record for hidden data
+# or a clean checkout.
+renamed_worktree_repo=$(_clone_remote)
+git -C "$renamed_worktree_repo" switch --quiet -c renamed-work
+_commit_file "$renamed_worktree_repo" old-name.txt clean \
+  "add rename work"
+git -C "$renamed_worktree_repo" switch --quiet main
+renamed_worktree_dir=$(_tmpdir)
+rm -rf "$renamed_worktree_dir"
+git -C "$renamed_worktree_repo" worktree add --quiet \
+  "$renamed_worktree_dir" renamed-work
+git -C "$renamed_worktree_dir" mv old-name.txt new-name.txt
+renamed_worktree_output=$(git -C "$renamed_worktree_repo" cleanup-repo \
+  --all --remove-worktrees 2>&1)
+_assert_contains "tracked rename prevents worktree removal" \
+  "skipping renamed-work; worktree has uncommitted changes: $renamed_worktree_dir" \
+  "$renamed_worktree_output"
+_assert_eq "tracked rename preserves branch" renamed-work \
+  "$(git -C "$renamed_worktree_repo" branch --list \
+    --format='%(refname:short)' renamed-work)"
+_assert_eq "tracked rename preserves linked checkout" present \
+  "$(if [[ -e "$renamed_worktree_dir/new-name.txt" ]]; then printf 'present'; else printf 'missing'; fi)"
+
 # Ignored files are local content even though ordinary porcelain status omits
 # them. Never remove a worktree that contains such files.
 ignored_worktree_repo=$(_clone_remote)

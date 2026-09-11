@@ -17,6 +17,14 @@ pull request fields are left empty.
 .PP
 When GitHub data is available, view and checks queries are pinned to the current
 checkout repository rather than ambient GitHub CLI routing.
+.PP
+The repository identity lookup is cached for one hour under
+.B $XDG_CACHE_HOME/git-tools/repo-identity
+(or
+.B ~/.cache
+when unset). Entries are keyed by the repository path and its configured
+remotes, so renaming the checkout or editing remotes invalidates the cache
+immediately; only successful lookups are cached.
 .SH OPTIONS
 .TP
 .B \-\-porcelain

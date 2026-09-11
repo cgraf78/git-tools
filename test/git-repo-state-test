@@ -35,6 +35,24 @@ _assert_contains() {
   fi
 }
 
+_assert_equal() {
+  local name="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [[ "$expected" == "$actual" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected:\n%s\n' "$expected" >&2
+    printf '  actual:\n%s\n' "$actual" >&2
+  fi
+}
+
+_repo_view_count() {
+  grep -c '^repo view' "$GH_CALL_LOG" 2>/dev/null || true
+}
+
 _git_init() {
   local repo="$1"
   git init -q --initial-branch=main "$repo"
@@ -51,6 +69,10 @@ _write_gh_stub() {
   cat >"$bin" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
+if [[ -n "${GH_CALL_LOG:-}" ]]; then
+  printf '%s\n' "$*" >>"$GH_CALL_LOG"
+fi
 
 if [[ "$1 $2" == "auth status" ]]; then
   exit 0
@@ -95,6 +117,12 @@ EOF
 
 echo "=== git repo-state ==="
 
+# Keep the identity cache hermetic: every repo-state invocation below resolves
+# XDG_CACHE_HOME to this scratch dir instead of the developer's real cache.
+XDG_CACHE_HOME="$(_tmpdir)/xdg"
+export XDG_CACHE_HOME
+mkdir -p "$XDG_CACHE_HOME"
+
 repo=$(_tmpdir)
 bin_dir=$(_tmpdir)
 _git_init "$repo"
@@ -133,6 +161,75 @@ _assert_contains "works without authenticated gh" "pr_available=false" "$result"
 outside=$(_tmpdir)
 result=$(PATH="$bin_dir:$PATH" git -C "$outside" repo-state 2>&1 || true)
 _assert_contains "requires git repo" "not inside a git repository" "$result"
+
+# Detached HEAD still reports DETACHED (status -b header parsing).
+detached=$(_tmpdir)
+_git_init "$detached"
+git -C "$detached" checkout -q --detach HEAD
+result=$(PATH="$bin_dir:$PATH" git -C "$detached" repo-state --porcelain 2>&1)
+_assert_contains "detached HEAD reports DETACHED branch" "branch=DETACHED" "$result"
+
+# Bare repositories keep their dedicated error.
+bare_parent=$(_tmpdir)
+git init -q --bare "$bare_parent/bare.git"
+result=$(PATH="$bin_dir:$PATH" git -C "$bare_parent/bare.git" repo-state 2>&1 || true)
+_assert_contains "bare repo reports unsupported" "bare repositories are not supported" "$result"
+
+# Subdirectory invocation reports the worktree root.
+mkdir -p "$repo/sub/dir"
+result=$(PATH="$bin_dir:$PATH" git -C "$repo/sub/dir" repo-state --porcelain 2>&1)
+_assert_contains "subdir reports repo root" "repo=$repo" "$result"
+_assert_contains "subdir reports branch" "branch=feature/state" "$result"
+
+# Identity cache: byte-identical reports with a single `gh repo view`.
+cache_repo=$(_tmpdir)
+_git_init "$cache_repo"
+export GH_CALL_LOG="$cache_repo/gh-calls.log"
+: >"$GH_CALL_LOG"
+miss_porcelain=$(PATH="$bin_dir:$PATH" git -C "$cache_repo" repo-state --porcelain 2>&1)
+miss_json=$(PATH="$bin_dir:$PATH" git -C "$cache_repo" repo-state --json 2>&1)
+miss_human=$(PATH="$bin_dir:$PATH" git -C "$cache_repo" repo-state 2>&1)
+_assert_contains "cache miss reports PR" "pr_number=7" "$miss_porcelain"
+hit_porcelain=$(PATH="$bin_dir:$PATH" git -C "$cache_repo" repo-state --porcelain 2>&1)
+hit_json=$(PATH="$bin_dir:$PATH" git -C "$cache_repo" repo-state --json 2>&1)
+hit_human=$(PATH="$bin_dir:$PATH" git -C "$cache_repo" repo-state 2>&1)
+_assert_equal "cache hit porcelain identical" "$miss_porcelain" "$hit_porcelain"
+_assert_equal "cache hit json identical" "$miss_json" "$hit_json"
+_assert_equal "cache hit human identical" "$miss_human" "$hit_human"
+_assert_equal "cache hit skips gh repo view" "1" "$(_repo_view_count)"
+
+# Remote edits invalidate the cache key; restoring remotes hits again.
+git -C "$cache_repo" remote add origin https://github.test/example/repo.git
+remote_porcelain=$(PATH="$bin_dir:$PATH" git -C "$cache_repo" repo-state --porcelain 2>&1)
+_assert_equal "remote add keeps report identical" "$miss_porcelain" "$remote_porcelain"
+_assert_equal "remote add refetches identity" "2" "$(_repo_view_count)"
+git -C "$cache_repo" remote set-url origin https://github.test/example/other.git
+PATH="$bin_dir:$PATH" git -C "$cache_repo" repo-state --porcelain >/dev/null 2>&1
+_assert_equal "remote set-url refetches identity" "3" "$(_repo_view_count)"
+git -C "$cache_repo" remote remove origin
+restored_porcelain=$(PATH="$bin_dir:$PATH" git -C "$cache_repo" repo-state --porcelain 2>&1)
+_assert_equal "remote remove keeps report identical" "$miss_porcelain" "$restored_porcelain"
+_assert_equal "remote remove hits original entry" "3" "$(_repo_view_count)"
+
+# Expired and corrupt entries fall back to live resolution.
+ttl_repo=$(_tmpdir)
+_git_init "$ttl_repo"
+ttl_before=$(_repo_view_count)
+ttl_miss=$(PATH="$bin_dir:$PATH" git -C "$ttl_repo" repo-state --porcelain 2>&1)
+_assert_equal "ttl repo fetches identity" "$((ttl_before + 1))" "$(_repo_view_count)"
+ttl_entry=$(grep -l -F "$ttl_repo" "$XDG_CACHE_HOME"/git-tools/repo-identity/*)
+{
+  printf '1\n'
+  tail -n +2 "$ttl_entry"
+} >"$ttl_entry.stale"
+mv -f "$ttl_entry.stale" "$ttl_entry"
+ttl_refetch=$(PATH="$bin_dir:$PATH" git -C "$ttl_repo" repo-state --porcelain 2>&1)
+_assert_equal "expired entry refetches" "$((ttl_before + 2))" "$(_repo_view_count)"
+_assert_equal "expired entry keeps report identical" "$ttl_miss" "$ttl_refetch"
+printf 'garbage\n' >"$ttl_entry"
+ttl_corrupt=$(PATH="$bin_dir:$PATH" git -C "$ttl_repo" repo-state --porcelain 2>&1)
+_assert_equal "corrupt entry refetches" "$((ttl_before + 3))" "$(_repo_view_count)"
+_assert_equal "corrupt entry keeps report identical" "$ttl_miss" "$ttl_corrupt"
 
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2

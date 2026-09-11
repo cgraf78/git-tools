@@ -306,17 +306,20 @@ gt_pr_repo_identity_from_url() {
   printf '%s\n' "$GT_PR_URL_IDENTITY"
 }
 
-# @brief Load the repository selected by gh for the current checkout.
-gt_load_current_repo_identity() {
-  local output name url extra identity normalized_name identity_name
-
-  [[ -z "${GT_CURRENT_REPO_IDENTITY:-}" ]] || return 0
-  output=$(
+# @brief Print the raw gh-resolved repository identity TSV for this checkout.
+_gt_fetch_repo_identity_tsv() {
+  (
     unset GH_REPO GH_HOST
     gh repo view \
       --json nameWithOwner,url \
       --jq '[.nameWithOwner,.url] | @tsv'
-  ) || return 1
+  )
+}
+
+# @brief Validate one raw identity TSV record and publish the globals.
+_gt_apply_repo_identity_tsv() {
+  local output="$1" name url extra identity normalized_name identity_name
+
   IFS=$'\t' read -r name url extra <<<"$output"
   [[ -n "$name" && -n "$url" && -z "$extra" ]] || return 1
   [[ "$output" != *$'\n'* ]] || return 1
@@ -328,6 +331,134 @@ gt_load_current_repo_identity() {
   GT_CURRENT_REPO_IDENTITY=$identity
   GT_CURRENT_REPO_HOST=${identity%%/*}
   GT_CURRENT_REPO_SPEC=$identity
+}
+
+# @brief Load the repository selected by gh for the current checkout.
+gt_load_current_repo_identity() {
+  local output
+
+  [[ -z "${GT_CURRENT_REPO_IDENTITY:-}" ]] || return 0
+  output=$(_gt_fetch_repo_identity_tsv) || return 1
+  _gt_apply_repo_identity_tsv "$output"
+}
+
+# Identity cache entry lifetime in seconds. A GitHub-side rename serves the
+# previous name until the entry expires; the TTL bounds that staleness while
+# local renames and remote edits miss immediately via the cache key.
+GT_REPO_IDENTITY_CACHE_TTL=3600
+
+# @brief Load the gh-resolved repository identity with an XDG file cache.
+# @param repo_root Absolute worktree root identifying this checkout.
+# Read-only callers (repo-state) only. Mutation paths keep resolving live so a
+# stale rename can never redirect a push or a PR operation.
+# The cache key binds the absolute repo root plus the normalized `git remote
+# -v` output, so editing remotes or renaming the checkout misses; the key
+# material is stored in the entry and re-verified on read, so even a cksum
+# filename collision cannot poison another repository. Only successful
+# resolutions are cached; every cache failure falls back to live resolution.
+gt_load_current_repo_identity_cached() {
+  local repo_root="$1"
+  local cache_base cache_dir remotes key_material key_hash cache_file now
+  local output
+
+  [[ -z "${GT_CURRENT_REPO_IDENTITY:-}" ]] || return 0
+  cache_base="${XDG_CACHE_HOME:-}"
+  if [[ -z "$cache_base" && -n "${HOME:-}" ]]; then
+    cache_base="$HOME/.cache"
+  fi
+  if [[ -z "$cache_base" || "$repo_root" == *$'\n'* ]]; then
+    gt_load_current_repo_identity
+    return "$?"
+  fi
+  remotes=$(git remote -v 2>/dev/null | LC_ALL=C sort -u) || {
+    gt_load_current_repo_identity
+    return "$?"
+  }
+  key_material="$repo_root"$'\n'"$remotes"
+  key_hash=$(printf '%s' "$key_material" | cksum) || key_hash=""
+  key_hash=${key_hash%% *}
+  [[ "$key_hash" =~ ^[0-9]+$ ]] || {
+    gt_load_current_repo_identity
+    return "$?"
+  }
+  cache_dir="$cache_base/git-tools/repo-identity"
+  cache_file="$cache_dir/$key_hash"
+  now=$(date +%s 2>/dev/null) || now=""
+  if [[ "$now" =~ ^[0-9]+$ && -f "$cache_file" ]] &&
+    output=$(_gt_read_repo_identity_cache "$cache_file" "$key_material" "$now") &&
+    [[ -n "$output" ]]; then
+    _gt_apply_repo_identity_tsv "$output"
+    return "$?"
+  fi
+  output=$(_gt_fetch_repo_identity_tsv) || return 1
+  _gt_apply_repo_identity_tsv "$output" || return 1
+  if [[ "$now" =~ ^[0-9]+$ ]] &&
+    { [[ -d "$cache_dir" ]] || mkdir -p "$cache_dir" 2>/dev/null; }; then
+    _gt_write_repo_identity_cache "$cache_file" "$key_material" "$now" "$output" ||
+      true
+  fi
+  return 0
+}
+
+# @brief Print the cached identity TSV when the entry is fresh and keyed.
+# Entry layout: write epoch, key-material line count, key-material lines,
+# identity TSV. Prints nothing and returns 1 on any mismatch or expiry.
+_gt_read_repo_identity_cache() {
+  local cache_file="$1" key_material="$2" now="$3"
+  local line written count stored_material identity index
+
+  written=""
+  count=""
+  stored_material=""
+  identity=""
+  index=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$index" == 0 ]]; then
+      written=$line
+    elif [[ "$index" == 1 ]]; then
+      count=$line
+    elif [[ "$count" =~ ^[0-9]+$ ]] && ((index - 2 < count)); then
+      if [[ -z "$stored_material" && "$index" == 2 ]]; then
+        stored_material=$line
+      else
+        stored_material="$stored_material"$'\n'"$line"
+      fi
+    elif [[ -z "$identity" ]]; then
+      identity=$line
+    else
+      return 1
+    fi
+    index=$((index + 1))
+  done <"$cache_file"
+  [[ "$written" =~ ^[0-9]+$ ]] || return 1
+  [[ "$count" =~ ^[0-9]+$ ]] || return 1
+  ((index == count + 3)) || return 1
+  [[ -n "$identity" ]] || return 1
+  ((now - written >= 0 && now - written < GT_REPO_IDENTITY_CACHE_TTL)) ||
+    return 1
+  [[ "$stored_material" == "$key_material" ]] || return 1
+  printf '%s\n' "$identity"
+}
+
+# @brief Persist one cache entry atomically. Best-effort; callers ignore failure.
+_gt_write_repo_identity_cache() {
+  local cache_file="$1" key_material="$2" now="$3" output="$4"
+  local tmp_file line_count
+
+  line_count=$(printf '%s\n' "$key_material" | wc -l)
+  line_count=${line_count//[[:space:]]/}
+  [[ "$line_count" =~ ^[0-9]+$ && "$line_count" -ge 1 ]] || return 1
+  tmp_file=$(mktemp "${cache_file}.tmp.XXXXXX") || return 1
+  {
+    printf '%s\n' "$now"
+    printf '%s\n' "$line_count"
+    printf '%s\n' "$key_material"
+    printf '%s\n' "$output"
+  } >"$tmp_file" || {
+    rm -f -- "$tmp_file"
+    return 1
+  }
+  mv -f -- "$tmp_file" "$cache_file"
 }
 
 # @brief Load the structured default branch for the already-validated checkout

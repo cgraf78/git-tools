@@ -84,14 +84,44 @@ _operation() {
   fi
 }
 
+# @brief Derive the branch display name from a `status -b` header payload.
+# The payload follows the leading `## `: `main`, `main...origin/main [ahead 1]`,
+# `No commits yet on main`, or `HEAD (no branch)` when detached. Branch names
+# cannot contain spaces or `...`, so those splits are unambiguous.
+_status_branch() {
+  local payload="$1"
+
+  case "$payload" in
+    'HEAD ('*)
+      printf 'DETACHED\n'
+      return 0
+      ;;
+  esac
+  payload=${payload#'No commits yet on '}
+  case "$payload" in
+    *...*) payload=${payload%%...*} ;;
+    *' '*) payload=${payload%%' '*} ;;
+  esac
+  printf '%s\n' "$payload"
+}
+
 _count_status() {
   _dirty=false
   _staged=0
   _unstaged=0
   _untracked=0
+  _branch=""
+  _saw_branch=false
 
   while IFS= read -r _line; do
     [[ -n "$_line" ]] || continue
+    case "$_line" in
+      '## '*)
+        _saw_branch=true
+        _branch=$(_status_branch "${_line#'## '}")
+        continue
+        ;;
+    esac
     _dirty=true
     case "$_line" in
       '??'*)
@@ -104,7 +134,10 @@ _count_status() {
         [[ "$_y" == " " ]] || _unstaged=$((_unstaged + 1))
         ;;
     esac
-  done < <(git status --porcelain)
+  done < <(git status -b --porcelain)
+  if [[ "$_saw_branch" == false ]]; then
+    _branch=$(git symbolic-ref -q --short HEAD 2>/dev/null || printf 'DETACHED')
+  fi
 }
 
 _upstream_state() {
@@ -133,7 +166,7 @@ _try_pr_state() {
   _pr_checks=""
 
   command -v gh >/dev/null 2>&1 || return 0
-  gt_load_current_repo_identity >/dev/null 2>&1 || return 0
+  gt_load_current_repo_identity_cached "$_repo_root" >/dev/null 2>&1 || return 0
   GH_REPO="$GT_CURRENT_REPO_SPEC" GH_HOST="$GT_CURRENT_REPO_HOST" \
     gh auth status --hostname "$GT_CURRENT_REPO_HOST" >/dev/null 2>&1 || return 0
 
@@ -237,11 +270,21 @@ _print_json() {
   printf '}\n'
 }
 
-gt_require_repo
-
-_repo_root=$(git rev-parse --show-toplevel)
-_git_dir=$(git rev-parse --git-dir)
-_branch=$(git symbolic-ref -q --short HEAD 2>/dev/null || printf 'DETACHED')
+# One rev-parse answers the repo, bare, toplevel, and git-dir questions that
+# used to take four calls. Flag order matters: --show-toplevel fails in a bare
+# repository, so it runs last and the git-dir/is-bare lines still parse.
+_repo_probe=$(git rev-parse --git-dir --is-bare-repository --show-toplevel 2>/dev/null || true)
+_git_dir=""
+_is_bare=""
+_repo_root=""
+{
+  IFS= read -r _git_dir || true
+  IFS= read -r _is_bare || true
+  IFS= read -r _repo_root || true
+} <<<"$_repo_probe"
+[[ -n "$_git_dir" ]] || gt_usage_error "not inside a git repository"
+[[ "$_is_bare" == "false" ]] || gt_usage_error "bare repositories are not supported"
+[[ -n "$_repo_root" ]] || gt_usage_error "could not resolve repository root"
 # An unresolvable default branch is informational here, not fatal. repo-state
 # has always reported origin's default, so name the remote explicitly.
 _default=$(gt_default_branch origin || printf 'unknown')

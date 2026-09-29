@@ -31,7 +31,8 @@ current branch.
 
 Options:
       --porcelain       Print stable key=value output and tab-separated records.
-      --required-only   Only include checks required by branch protection.
+      --required-only, --required
+                        Only include checks required by branch protection.
   -w, --watch           Wait for checks to finish before summarizing.
   -i, --interval <sec>  Refresh interval in seconds for --watch (default: 10).
   -h, --help            Show this help.

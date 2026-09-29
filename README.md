@@ -502,9 +502,9 @@ git resolve-base --short
 ```
 
 By default the merge-base commit (the branch point) is printed. Use `--ref` to
-print the base ref that resolution selected instead. This is the single source
-of branch-base detection that `git absorb-and-rebase` and other commands
-compose, so the inference logic lives in one place.
+print the base ref that resolution selected instead. It shares its inference
+with `git absorb-and-rebase` through the `gt_resolve_base` library function, so
+the logic lives in one place.
 
 ### `git absorb-and-rebase`
 
@@ -588,7 +588,13 @@ embedding contract.
 
 - Bash
 - Git
-- [`git-absorb`](https://github.com/tummychow/git-absorb)
+- [`gh`](https://cli.github.com/), authenticated for the repository's GitHub
+  host, for the `git pr-*` commands; `git repo-state`, `git branch-audit`, and
+  `git worktree-audit` also use it when available to show PR details
+- [`git-absorb`](https://github.com/tummychow/git-absorb) for
+  `git absorb-and-rebase`
+- Optional: [`fzf`](https://github.com/junegunn/fzf) for the shell integration
+  pickers
 
 ## Install
 
@@ -670,19 +676,12 @@ test/run
 The runner uses four workers by default. Set `GIT_TOOLS_TEST_JOBS` to a
 positive integer to tune concurrency, or to `1` for serial execution.
 
-Or run the focused command test directly:
+Or run a focused suite directly. Each command has a `test/<command>-test`
+suite, and shared behavior such as installation, launchers, extras, and shell
+integration has its own `test/*-test` suite:
 
 ```sh
-test/extras-test
-test/git-absorb-and-rebase-test
-test/git-resolve-base-test
-test/git-cleanup-repo-test
-test/git-pr-land-test
 test/git-pr-land-stack-test
-test/git-pr-ready-test
-test/git-pr-restack-test
-test/git-pr-stack-test
-test/git-pr-submit-test
 test/shell-integration-test
 ```
 

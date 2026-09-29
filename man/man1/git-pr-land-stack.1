@@ -52,6 +52,15 @@ Pass
 to
 .BR git-pr-land (1).
 .TP
+.BI "\-\-check\-timeout " seconds
+Maximum seconds to wait for each restacked child to become mergeable (checks
+passing, merge state clean) before landing it.
+The default is 900.
+.TP
+.BI "\-\-check\-interval " seconds
+Seconds between polls while waiting for a restacked child to become mergeable.
+The default is 10.
+.TP
 .BR \-n ", " \-\-dry\-run
 Print actions without changing anything.
 .TP

@@ -7,6 +7,8 @@ end
 complete -c git-pr-land-stack -f
 complete -c git-pr-land-stack -s m -l method -r -a "squash merge rebase" -d "Merge method"
 complete -c git-pr-land-stack -l keep-branch -d "Pass --keep-branch to git pr-land"
+complete -c git-pr-land-stack -l check-timeout -r -d "Maximum seconds to wait for each restacked child to become mergeable"
+complete -c git-pr-land-stack -l check-interval -r -d "Seconds between mergeability polls"
 complete -c git-pr-land-stack -s n -l dry-run -d "Print actions without changing anything"
 complete -c git-pr-land-stack -s h -l help -d "Show help"
 complete -c git-pr-land-stack -a "(__git_pr_land_stack_refs)" -d "Pull request branch"

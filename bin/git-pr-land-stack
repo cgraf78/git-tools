@@ -64,8 +64,9 @@ automatically.
 Options:
   -m, --method <method>   Merge method: squash, merge, or rebase (default: squash).
       --keep-branch       Pass --keep-branch to git pr-land.
-      --check-timeout <s>  Seconds to wait after restacking for checks (default: 900).
-      --check-interval <s> Seconds between check polls (default: 10).
+      --check-timeout <s>  Max seconds to wait for a restacked PR to become
+                           mergeable (default: 900).
+      --check-interval <s> Seconds between mergeability polls (default: 10).
   -n, --dry-run           Print actions without changing anything.
   -h, --help              Show this help.
 

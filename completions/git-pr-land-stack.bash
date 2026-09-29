@@ -16,10 +16,13 @@ _git_pr_land_stack() {
       COMPREPLY=($(compgen -W "squash merge rebase" -- "$cur"))
       return
       ;;
+    --check-timeout | --check-interval)
+      return
+      ;;
   esac
 
   if [[ "$cur" == -* ]]; then
-    COMPREPLY=($(compgen -W "-m --method --keep-branch -n --dry-run -h --help" -- "$cur"))
+    COMPREPLY=($(compgen -W "-m --method --keep-branch --check-timeout --check-interval -n --dry-run -h --help" -- "$cur"))
     return
   fi
 

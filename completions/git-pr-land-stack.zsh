@@ -11,6 +11,8 @@ _git_pr_land_stack() {
   _arguments -s \
     '(-m --method)'{-m,--method}'[Merge method]:method:(squash merge rebase)' \
     '--keep-branch[Pass --keep-branch to git pr-land]' \
+    '--check-timeout[Maximum seconds to wait for each restacked child to become mergeable]:seconds' \
+    '--check-interval[Seconds between mergeability polls]:seconds' \
     '(-n --dry-run)'{-n,--dry-run}'[Print actions without changing anything]' \
     '(-h --help)'{-h,--help}'[Show help]' \
     '1:pull request number, URL, or branch:_git_pr_land_stack_refs'

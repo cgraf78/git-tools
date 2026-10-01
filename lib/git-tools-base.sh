@@ -779,6 +779,25 @@ _gt_materialize_worktree_list() {
   eval "exec $list_fd<&-"
 }
 
+# @brief Set GT_WORKTREE_PATH to the repository's main worktree.
+# Git always lists the main worktree first, including when invoked from a
+# linked worktree. For a bare repository this is the bare directory itself.
+gt_find_main_worktree() {
+  local field
+
+  GT_WORKTREE_PATH=""
+  _gt_materialize_worktree_list || return 1
+  for field in ${_GT_WORKTREE_FIELDS[@]+"${_GT_WORKTREE_FIELDS[@]}"}; do
+    case "$field" in
+      "worktree "*)
+        GT_WORKTREE_PATH=${field#worktree }
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
 # @brief Set GT_WORKTREE_PATH to the worktree that has a branch checked out.
 # The global result avoids command substitution, which cannot preserve trailing
 # newlines. An empty result means the branch is not checked out.

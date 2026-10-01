@@ -30,9 +30,20 @@ Base selection does not depend on configured fetch refspecs or short ref names.
 The command fetches exactly
 .BR refs/heads/ base
 without tags, validates and pins its native SHA-1 or SHA-256 object ID, and
-checks the local fast-forward relationship before switching branches. It then
+checks the local fast-forward relationship before changing anything. It then
 creates or fast-forwards the base using that same object ID. A divergent base
-fails before the current branch or local base is changed. Dry-run uses isolated
+fails before the current branch or local base is changed. A worktree that has
+the base checked out is fast-forwarded in place with
+.BR "git merge \-\-ff\-only" ;
+another worktree that has local changes or an active operation, or cannot be
+inspected, is left alone, and
+merges are then proven against the unchanged local base. Otherwise the main
+worktree switches to the base. A linked worktree never switches to the base;
+it advances only the base ref with an expected-old-value
+.BR "git update\-ref" ,
+by fast-forward only, and leaves the base alone when a rebase or bisect
+reserves it or worktrees cannot be inspected; without a local base, it stops
+instead. Dry-run uses isolated
 temporary object storage.
 .PP
 The command retains the single raw configured fetch URL for both remote
@@ -57,7 +68,9 @@ Delete all local branches except the base branch.
 .TP
 .B \-\-remove\-worktrees
 Remove eligible, operation-free linked worktrees for branches selected for
-deletion. Removal never uses
+deletion. The current worktree and the main worktree are never removed, so a
+branch still checked out in either after the base update is kept. Removal never
+uses
 .BR \-\-force .
 .TP
 .BR \-n ", " \-\-dry\-run

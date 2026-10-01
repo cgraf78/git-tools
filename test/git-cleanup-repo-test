@@ -31,6 +31,18 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Run every case against the real Git with private configuration. A Git
+# launcher earlier on PATH, or the caller's global, system, or XDG settings
+# (hooks, ignore rules, default branch), must not influence fixtures or the tool.
+_hermetic_bin="$_suite_tmp_root/bin"
+mkdir "$_hermetic_bin" "$_suite_tmp_root/home" || exit 1
+ln -s "$GIT_TOOLS_TEST_REAL_GIT" "$_hermetic_bin/git" || exit 1
+export HOME="$_suite_tmp_root/home"
+export XDG_CONFIG_HOME="$HOME/.config"
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
+PATH="$_hermetic_bin:$ROOT/bin:$PATH"
+
 _pass() {
   printf 'ok - %s\n' "$1"
 }
@@ -2493,6 +2505,481 @@ _assert_contains "refuses dirty worktrees" "worktree must be clean" "$result"
 result=$(git -C "$dirty_repo" cleanup-repo --dry-run 2>&1)
 _assert_contains "dry run can inspect dirty worktrees" \
   "real cleanup would stop before changing refs" "$result"
+
+# A linked worktree must never take over the base branch. Switching it to the
+# base would leave its own branch unreserved, so cleanup would delete the branch
+# the caller is working on, and the main checkout could no longer use the base.
+
+# Build a clone whose remote base has merged `feat` while local main is still
+# behind. Prints the main checkout path.
+_merged_feature_repo() {
+  local repo
+
+  repo=$(_clone_remote) || return 1
+  git -C "$repo" switch --quiet -c feat
+  _commit_file "$repo" feat.txt feat "add feat"
+  git -C "$repo" switch --quiet --detach main
+  git -C "$repo" merge --quiet --no-ff feat -m "merge feat"
+  git -C "$repo" push --quiet origin HEAD:main
+  git -C "$repo" switch --quiet main
+  printf '%s\n' "$repo"
+}
+
+_head_ref() {
+  git -C "$1" symbolic-ref -q HEAD || printf 'detached\n'
+}
+
+# The base checked out in the main worktree is fast-forwarded there.
+lw_main_repo=$(_merged_feature_repo)
+lw_main_remote=$(git -C "$lw_main_repo" rev-parse refs/remotes/origin/main)
+lw_main_feat=$(git -C "$lw_main_repo" rev-parse refs/heads/feat)
+lw_main_linked="$(_tmpdir)/linked"
+git -C "$lw_main_repo" worktree add --quiet "$lw_main_linked" feat
+lw_main_rc=0
+result=$(git -C "$lw_main_linked" cleanup-repo 2>&1) || lw_main_rc=$?
+_assert_eq "linked cleanup succeeds when the main worktree holds base" \
+  0 "$lw_main_rc"
+_assert_eq "main worktree base is fast-forwarded in place" \
+  "$lw_main_remote" "$(git -C "$lw_main_repo" rev-parse HEAD)"
+_assert_eq "main worktree stays on base" \
+  refs/heads/main "$(_head_ref "$lw_main_repo")"
+_assert_eq "main worktree files follow the base fast-forward" "" \
+  "$(git -C "$lw_main_repo" status --porcelain)"
+_assert_eq "linked worktree keeps its own branch checked out" \
+  refs/heads/feat "$(_head_ref "$lw_main_linked")"
+_assert_eq "linked worktree's merged branch is kept" \
+  "$lw_main_feat" "$(git -C "$lw_main_repo" rev-parse refs/heads/feat)"
+_assert_contains "reports keeping the current worktree's branch" \
+  "keeping feat; checked out in the current worktree" "$result"
+
+# The base checked out in another linked worktree is fast-forwarded there.
+lw_other_repo=$(_merged_feature_repo)
+lw_other_remote=$(git -C "$lw_other_repo" rev-parse refs/remotes/origin/main)
+git -C "$lw_other_repo" switch --quiet -c other
+lw_other_base="$(_tmpdir)/base"
+lw_other_linked="$(_tmpdir)/linked"
+git -C "$lw_other_repo" worktree add --quiet "$lw_other_base" main
+git -C "$lw_other_repo" worktree add --quiet "$lw_other_linked" feat
+lw_other_old=$(git -C "$lw_other_repo" rev-parse refs/heads/main)
+result=$(git -C "$lw_other_linked" cleanup-repo --dry-run 2>&1)
+_assert_contains "linked dry run reports the base worktree fast-forward" \
+  "would run: git -C $lw_other_base merge --quiet --ff-only $lw_other_remote" \
+  "$result"
+_assert_eq "linked dry run leaves the base worktree unchanged" \
+  "$lw_other_old" "$(git -C "$lw_other_base" rev-parse HEAD)"
+lw_other_rc=0
+result=$(git -C "$lw_other_linked" cleanup-repo 2>&1) || lw_other_rc=$?
+_assert_eq "linked cleanup succeeds when another linked worktree holds base" \
+  0 "$lw_other_rc"
+_assert_eq "base worktree is fast-forwarded in place" \
+  "$lw_other_remote" "$(git -C "$lw_other_base" rev-parse HEAD)"
+_assert_eq "base worktree stays on base" \
+  refs/heads/main "$(_head_ref "$lw_other_base")"
+_assert_eq "base worktree files follow the fast-forward" "" \
+  "$(git -C "$lw_other_base" status --porcelain)"
+_assert_eq "invoking linked worktree stays on its branch" \
+  refs/heads/feat "$(_head_ref "$lw_other_linked")"
+_assert_eq "main worktree stays on its branch" \
+  refs/heads/other "$(_head_ref "$lw_other_repo")"
+_assert_eq "branches checked out elsewhere are all kept" \
+  "$(printf 'feat\nmain\nother')" "$(_branches "$lw_other_repo")"
+
+# With the base checked out nowhere, a linked worktree advances only the ref.
+lw_ref_repo=$(_merged_feature_repo)
+lw_ref_old=$(git -C "$lw_ref_repo" rev-parse refs/heads/main)
+lw_ref_remote=$(git -C "$lw_ref_repo" rev-parse refs/remotes/origin/main)
+git -C "$lw_ref_repo" switch --quiet -c other
+lw_ref_linked="$(_tmpdir)/linked"
+git -C "$lw_ref_repo" worktree add --quiet "$lw_ref_linked" feat
+result=$(git -C "$lw_ref_linked" cleanup-repo --dry-run 2>&1)
+_assert_contains "linked dry run reports a guarded ref fast-forward" \
+  "git update-ref -m cleanup-repo:\\ fast-forward\\ main\\ to\\ origin/main refs/heads/main $lw_ref_remote $lw_ref_old" \
+  "$result"
+_assert_not_contains "linked dry run does not switch branches" \
+  "git switch" "$result"
+_assert_eq "linked dry run leaves the base ref unchanged" \
+  "$lw_ref_old" "$(git -C "$lw_ref_repo" rev-parse refs/heads/main)"
+lw_ref_rc=0
+result=$(git -C "$lw_ref_linked" cleanup-repo 2>&1) || lw_ref_rc=$?
+_assert_eq "linked cleanup succeeds with an unchecked-out base" 0 "$lw_ref_rc"
+_assert_eq "unchecked-out base ref is fast-forwarded" \
+  "$lw_ref_remote" "$(git -C "$lw_ref_repo" rev-parse refs/heads/main)"
+_assert_eq "base ref update is recorded in the reflog" \
+  "cleanup-repo: fast-forward main to origin/main" \
+  "$(git -C "$lw_ref_repo" reflog -1 --format=%gs refs/heads/main)"
+_assert_eq "linked worktree is not switched to base" \
+  refs/heads/feat "$(_head_ref "$lw_ref_linked")"
+_assert_eq "linked worktree has no stray changes" "" \
+  "$(git -C "$lw_ref_linked" status --porcelain)"
+_assert_eq "main worktree is not switched to base" \
+  refs/heads/other "$(_head_ref "$lw_ref_repo")"
+_assert_eq "branches checked out by worktrees are kept" \
+  "$(printf 'feat\nmain\nother')" "$(_branches "$lw_ref_repo")"
+
+# A missing local base is created at the pinned remote OID with its upstream.
+lw_create_repo=$(_merged_feature_repo)
+lw_create_remote=$(git -C "$lw_create_repo" rev-parse refs/remotes/origin/main)
+git -C "$lw_create_repo" switch --quiet -c other
+git -C "$lw_create_repo" branch --quiet -D main
+git -C "$lw_create_repo" config --unset-all branch.main.remote
+git -C "$lw_create_repo" config --unset-all branch.main.merge
+lw_create_linked="$(_tmpdir)/linked"
+git -C "$lw_create_repo" worktree add --quiet "$lw_create_linked" feat
+lw_create_rc=0
+git -C "$lw_create_linked" cleanup-repo >/dev/null 2>&1 || lw_create_rc=$?
+_assert_eq "linked cleanup creates a missing base" 0 "$lw_create_rc"
+_assert_eq "created base points at the pinned remote OID" \
+  "$lw_create_remote" "$(git -C "$lw_create_repo" rev-parse refs/heads/main)"
+_assert_eq "created base records its upstream remote" origin \
+  "$(git -C "$lw_create_repo" config branch.main.remote)"
+_assert_eq "created base records its upstream branch" refs/heads/main \
+  "$(git -C "$lw_create_repo" config branch.main.merge)"
+_assert_eq "creating the base does not switch the linked worktree" \
+  refs/heads/feat "$(_head_ref "$lw_create_linked")"
+
+# A local base already ahead of the remote is not moved.
+lw_ahead_repo=$(_merged_feature_repo)
+git -C "$lw_ahead_repo" merge --quiet --ff-only refs/remotes/origin/main
+_commit_file "$lw_ahead_repo" ahead.txt ahead "local-only base work"
+lw_ahead_oid=$(git -C "$lw_ahead_repo" rev-parse refs/heads/main)
+git -C "$lw_ahead_repo" switch --quiet -c other
+lw_ahead_linked="$(_tmpdir)/linked"
+git -C "$lw_ahead_repo" worktree add --quiet "$lw_ahead_linked" feat
+lw_ahead_rc=0
+git -C "$lw_ahead_linked" cleanup-repo >/dev/null 2>&1 || lw_ahead_rc=$?
+_assert_eq "linked cleanup accepts a local base ahead of remote" \
+  0 "$lw_ahead_rc"
+_assert_eq "ahead base ref is left in place" \
+  "$lw_ahead_oid" "$(git -C "$lw_ahead_repo" rev-parse refs/heads/main)"
+
+# A divergent local base is never moved non-fast-forward.
+lw_diverged_repo=$(_merged_feature_repo)
+_commit_file "$lw_diverged_repo" diverged.txt local "divergent base work"
+lw_diverged_oid=$(git -C "$lw_diverged_repo" rev-parse refs/heads/main)
+git -C "$lw_diverged_repo" switch --quiet -c other
+lw_diverged_linked="$(_tmpdir)/linked"
+git -C "$lw_diverged_repo" worktree add --quiet "$lw_diverged_linked" feat
+lw_diverged_rc=0
+result=$(git -C "$lw_diverged_linked" cleanup-repo 2>&1) ||
+  lw_diverged_rc=$?
+_assert_eq "linked cleanup rejects a divergent base" 2 "$lw_diverged_rc"
+_assert_contains "divergent base is diagnosed" \
+  "local base cannot be fast-forwarded to origin/main" "$result"
+_assert_eq "divergent base ref is left in place" \
+  "$lw_diverged_oid" "$(git -C "$lw_diverged_repo" rev-parse refs/heads/main)"
+_assert_eq "divergent base leaves the linked worktree on its branch" \
+  refs/heads/feat "$(_head_ref "$lw_diverged_linked")"
+
+# --remove-worktrees never removes the invoking worktree.
+lw_remove_repo=$(_merged_feature_repo)
+lw_remove_linked="$(_tmpdir)/linked"
+git -C "$lw_remove_repo" worktree add --quiet "$lw_remove_linked" feat
+lw_remove_rc=0
+result=$(git -C "$lw_remove_linked" cleanup-repo --remove-worktrees 2>&1) ||
+  lw_remove_rc=$?
+_assert_eq "linked cleanup with --remove-worktrees succeeds" 0 "$lw_remove_rc"
+_assert_eq "invoking worktree is not removed" present \
+  "$(if [[ -d "$lw_remove_linked" ]]; then printf present; else printf absent; fi)"
+_assert_eq "invoking worktree keeps its branch with --remove-worktrees" \
+  refs/heads/feat "$(_head_ref "$lw_remove_linked")"
+_assert_contains "reports keeping the invoking worktree's branch" \
+  "keeping feat; checked out in the current worktree" "$result"
+
+# --remove-worktrees never prunes or removes the main worktree. Before Git
+# rejected the removal, cache pruning used to run inside the main checkout.
+lw_mainwt_repo=$(_merged_feature_repo)
+git -C "$lw_mainwt_repo" switch --quiet feat
+mkdir "$lw_mainwt_repo/.build-cache"
+printf '%s\n' 'Signature: 8a477f597d28d172789f06886806bc55' \
+  >"$lw_mainwt_repo/.build-cache/CACHEDIR.TAG"
+lw_mainwt_linked="$(_tmpdir)/linked"
+git -C "$lw_mainwt_repo" worktree add --quiet "$lw_mainwt_linked" main
+lw_mainwt_rc=0
+result=$(git -C "$lw_mainwt_linked" cleanup-repo --remove-worktrees 2>&1) ||
+  lw_mainwt_rc=$?
+_assert_eq "linked cleanup beside a merged main worktree succeeds" \
+  0 "$lw_mainwt_rc"
+_assert_contains "reports skipping the main worktree's branch" \
+  "skipping feat; checked out in the main worktree $lw_mainwt_repo" "$result"
+_assert_eq "main worktree cache is not pruned" present \
+  "$(if [[ -f "$lw_mainwt_repo/.build-cache/CACHEDIR.TAG" ]]; then printf present; else printf absent; fi)"
+_assert_eq "main worktree branch is kept" \
+  refs/heads/feat "$(_head_ref "$lw_mainwt_repo")"
+
+# Running from the main worktree keeps the historical switch-and-delete flow,
+# even when a linked worktree exists.
+lw_primary_repo=$(_merged_feature_repo)
+lw_primary_remote=$(git -C "$lw_primary_repo" rev-parse refs/remotes/origin/main)
+git -C "$lw_primary_repo" switch --quiet feat
+git -C "$lw_primary_repo" branch side
+lw_primary_side="$(_tmpdir)/side"
+git -C "$lw_primary_repo" worktree add --quiet "$lw_primary_side" side
+_commit_file "$lw_primary_side" side.txt side "add side work"
+result=$(git -C "$lw_primary_repo" cleanup-repo --dry-run 2>&1)
+_assert_contains "main worktree dry run still switches to base" \
+  "git switch --quiet --no-guess main" "$result"
+_assert_contains "main worktree dry run still merges the pinned OID" \
+  "git merge --quiet --ff-only $lw_primary_remote" "$result"
+result=$(git -C "$lw_primary_repo" cleanup-repo 2>&1)
+_assert_eq "main worktree switches to base" \
+  refs/heads/main "$(_head_ref "$lw_primary_repo")"
+_assert_eq "main worktree base is fast-forwarded" \
+  "$lw_primary_remote" "$(git -C "$lw_primary_repo" rev-parse HEAD)"
+_assert_contains "main worktree deletes its former merged branch" \
+  "deleting feat (merged)" "$result"
+_assert_eq "main worktree cleanup keeps the linked worktree's branch" \
+  "$(printf 'main\nside')" "$(_branches "$lw_primary_repo")"
+
+# A detached linked worktree updates the base elsewhere and stays detached.
+lw_detached_repo=$(_merged_feature_repo)
+lw_detached_remote=$(git -C "$lw_detached_repo" rev-parse refs/remotes/origin/main)
+lw_detached_feat=$(git -C "$lw_detached_repo" rev-parse refs/heads/feat)
+lw_detached_linked="$(_tmpdir)/linked"
+git -C "$lw_detached_repo" worktree add --quiet --detach \
+  "$lw_detached_linked" feat
+lw_detached_rc=0
+result=$(git -C "$lw_detached_linked" cleanup-repo 2>&1) || lw_detached_rc=$?
+_assert_eq "detached linked cleanup succeeds" 0 "$lw_detached_rc"
+_assert_eq "detached linked cleanup fast-forwards the main worktree base" \
+  "$lw_detached_remote" "$(git -C "$lw_detached_repo" rev-parse HEAD)"
+_assert_eq "detached linked worktree stays detached" \
+  detached "$(_head_ref "$lw_detached_linked")"
+_assert_eq "detached linked worktree stays at its commit" \
+  "$lw_detached_feat" "$(git -C "$lw_detached_linked" rev-parse HEAD)"
+_assert_contains "merged branch checked out nowhere is still deleted" \
+  "deleting feat (merged)" "$result"
+
+lw_detref_repo=$(_merged_feature_repo)
+lw_detref_remote=$(git -C "$lw_detref_repo" rev-parse refs/remotes/origin/main)
+git -C "$lw_detref_repo" switch --quiet -c other
+lw_detref_linked="$(_tmpdir)/linked"
+git -C "$lw_detref_repo" worktree add --quiet --detach \
+  "$lw_detref_linked" feat
+lw_detref_rc=0
+git -C "$lw_detref_linked" cleanup-repo >/dev/null 2>&1 || lw_detref_rc=$?
+_assert_eq "detached linked cleanup with unchecked-out base succeeds" \
+  0 "$lw_detref_rc"
+_assert_eq "detached linked cleanup advances the unchecked-out base ref" \
+  "$lw_detref_remote" "$(git -C "$lw_detref_repo" rev-parse refs/heads/main)"
+_assert_eq "detached linked worktree is not switched to base" \
+  detached "$(_head_ref "$lw_detref_linked")"
+
+# A dirty worktree holding the base is skipped rather than merged into.
+lw_dirty_repo=$(_merged_feature_repo)
+lw_dirty_old=$(git -C "$lw_dirty_repo" rev-parse refs/heads/main)
+printf '%s\n' "local edit" >"$lw_dirty_repo/README.md"
+lw_dirty_linked="$(_tmpdir)/linked"
+git -C "$lw_dirty_repo" worktree add --quiet "$lw_dirty_linked" feat
+lw_dirty_rc=0
+result=$(git -C "$lw_dirty_linked" cleanup-repo 2>&1) || lw_dirty_rc=$?
+_assert_eq "linked cleanup beside a dirty base worktree succeeds" \
+  0 "$lw_dirty_rc"
+_assert_contains "dirty base worktree update is skipped with a message" \
+  "not updating main; worktree has local changes: $lw_dirty_repo" \
+  "$result"
+_assert_eq "dirty base worktree is not fast-forwarded" \
+  "$lw_dirty_old" "$(git -C "$lw_dirty_repo" rev-parse refs/heads/main)"
+_assert_eq "dirty base worktree edit is preserved" "local edit" \
+  "$(cat "$lw_dirty_repo/README.md")"
+
+# A worktree that holds the base during an operation is not merged into.
+lw_op_repo=$(_merged_feature_repo)
+lw_op_old=$(git -C "$lw_op_repo" rev-parse refs/heads/main)
+git -C "$lw_op_repo" switch --quiet -c other
+lw_op_base="$(_tmpdir)/base"
+lw_op_linked="$(_tmpdir)/linked"
+git -C "$lw_op_repo" worktree add --quiet "$lw_op_base" main
+git -C "$lw_op_repo" worktree add --quiet "$lw_op_linked" feat
+git -C "$lw_op_base" bisect start >/dev/null
+lw_op_rc=0
+result=$(git -C "$lw_op_linked" cleanup-repo 2>&1) || lw_op_rc=$?
+_assert_eq "linked cleanup beside a bisecting base worktree succeeds" \
+  0 "$lw_op_rc"
+_assert_contains "busy base worktree update is skipped with a message" \
+  "not updating main; worktree has active bisect: $lw_op_base" "$result"
+_assert_eq "busy base worktree is not fast-forwarded" \
+  "$lw_op_old" "$(git -C "$lw_op_repo" rev-parse refs/heads/main)"
+
+# A detached operation that still reserves the base blocks the ref update.
+lw_reserved_repo=$(_merged_feature_repo)
+lw_reserved_old=$(git -C "$lw_reserved_repo" rev-parse refs/heads/main)
+git -C "$lw_reserved_repo" switch --quiet -c other
+lw_reserved_base="$(_tmpdir)/base"
+lw_reserved_linked="$(_tmpdir)/linked"
+git -C "$lw_reserved_repo" worktree add --quiet "$lw_reserved_base" main
+git -C "$lw_reserved_repo" worktree add --quiet "$lw_reserved_linked" feat
+git -C "$lw_reserved_base" bisect start >/dev/null
+git -C "$lw_reserved_base" switch --quiet --detach 2>/dev/null
+lw_reserved_rc=0
+result=$(git -C "$lw_reserved_linked" cleanup-repo 2>&1) || lw_reserved_rc=$?
+_assert_eq "linked cleanup beside a detached base reservation succeeds" \
+  0 "$lw_reserved_rc"
+_assert_contains "reserved base ref update is skipped with a message" \
+  "not updating main; reserved by worktree $lw_reserved_base" "$result"
+_assert_eq "reserved base ref is not moved" \
+  "$lw_reserved_old" "$(git -C "$lw_reserved_repo" rev-parse refs/heads/main)"
+
+# Unknown reservations also block the ref update without aborting cleanup.
+lw_stale_repo=$(_merged_feature_repo)
+lw_stale_old=$(git -C "$lw_stale_repo" rev-parse refs/heads/main)
+git -C "$lw_stale_repo" switch --quiet -c other
+lw_stale_gone="$(_tmpdir)/gone"
+lw_stale_linked="$(_tmpdir)/linked"
+git -C "$lw_stale_repo" worktree add --quiet -b stale "$lw_stale_gone"
+rm -rf "$lw_stale_gone"
+git -C "$lw_stale_repo" worktree add --quiet "$lw_stale_linked" feat
+lw_stale_rc=0
+result=$(git -C "$lw_stale_linked" cleanup-repo 2>&1) || lw_stale_rc=$?
+_assert_eq "linked cleanup beside a missing worktree succeeds" \
+  0 "$lw_stale_rc"
+_assert_contains "uninspectable base reservation is reported" \
+  "not updating main; could not inspect worktree reservations" "$result"
+_assert_eq "uninspectable base reservation leaves the ref in place" \
+  "$lw_stale_old" "$(git -C "$lw_stale_repo" rev-parse refs/heads/main)"
+
+# The main worktree hands the base to its owner instead of failing to switch.
+lw_owner_repo=$(_merged_feature_repo)
+lw_owner_remote=$(git -C "$lw_owner_repo" rev-parse refs/remotes/origin/main)
+git -C "$lw_owner_repo" switch --quiet -c other
+lw_owner_base="$(_tmpdir)/base"
+git -C "$lw_owner_repo" worktree add --quiet "$lw_owner_base" main
+lw_owner_rc=0
+result=$(git -C "$lw_owner_repo" cleanup-repo 2>&1) || lw_owner_rc=$?
+_assert_eq "main worktree cleanup succeeds when a linked worktree holds base" \
+  0 "$lw_owner_rc"
+_assert_eq "main worktree fast-forwards the linked base worktree" \
+  "$lw_owner_remote" "$(git -C "$lw_owner_base" rev-parse HEAD)"
+_assert_eq "main worktree keeps its branch when another worktree holds base" \
+  refs/heads/other "$(_head_ref "$lw_owner_repo")"
+_assert_contains "main worktree reports keeping its own branch" \
+  "keeping other; checked out in the current worktree" "$result"
+
+# A base worktree whose directory is gone is skipped, not fatal.
+lw_gone_repo=$(_merged_feature_repo)
+lw_gone_old=$(git -C "$lw_gone_repo" rev-parse refs/heads/main)
+git -C "$lw_gone_repo" switch --quiet -c other
+lw_gone_base="$(_tmpdir)/base"
+lw_gone_linked="$(_tmpdir)/linked"
+git -C "$lw_gone_repo" worktree add --quiet "$lw_gone_base" main
+git -C "$lw_gone_repo" worktree add --quiet "$lw_gone_linked" feat
+rm -rf "$lw_gone_base"
+lw_gone_rc=0
+result=$(git -C "$lw_gone_linked" cleanup-repo 2>&1) || lw_gone_rc=$?
+_assert_eq "linked cleanup beside a missing base worktree succeeds" \
+  0 "$lw_gone_rc"
+_assert_contains "missing base worktree update is skipped with a message" \
+  "not updating main; could not inspect worktree: $lw_gone_base" "$result"
+_assert_eq "missing base worktree leaves the ref in place" \
+  "$lw_gone_old" "$(git -C "$lw_gone_repo" rev-parse refs/heads/main)"
+
+# Dry run reports the branch the main worktree releases by switching to base.
+lw_dry_repo=$(_merged_feature_repo)
+git -C "$lw_dry_repo" switch --quiet feat
+lw_dry_feat=$(git -C "$lw_dry_repo" rev-parse refs/heads/feat)
+result=$(git -C "$lw_dry_repo" cleanup-repo --dry-run --remove-worktrees 2>&1)
+_assert_contains "main worktree dry run reports deleting the branch it leaves" \
+  "would delete feat at $lw_dry_feat (merged)" "$result"
+_assert_not_contains "main worktree dry run does not plan to remove itself" \
+  "worktree remove" "$result"
+_assert_contains "main worktree dry run summary matches the real run" \
+  "would delete 1 local branch(es), skipped 0" "$result"
+
+# A main checkout with a separate Git directory is still the main worktree.
+lw_sep_remote=$(_tmpdir)
+lw_sep_gitdir="$(_tmpdir)/repo.git"
+lw_sep_repo="$(_tmpdir)/repo"
+git init --quiet --bare --initial-branch=main "$lw_sep_remote"
+git init --quiet --initial-branch=main --separate-git-dir "$lw_sep_gitdir" \
+  "$lw_sep_repo"
+git -C "$lw_sep_repo" config user.email "test@test.com"
+git -C "$lw_sep_repo" config user.name "Test"
+git -C "$lw_sep_repo" config core.hooksPath /dev/null
+_commit_file "$lw_sep_repo" README.md base base
+git -C "$lw_sep_repo" remote add origin "$lw_sep_remote"
+git -C "$lw_sep_repo" push --quiet -u origin main
+git -C "$lw_sep_repo" switch --quiet -c feat
+_commit_file "$lw_sep_repo" feat.txt feat "add feat"
+git -C "$lw_sep_repo" switch --quiet --detach main
+git -C "$lw_sep_repo" merge --quiet --no-ff feat -m "merge feat"
+git -C "$lw_sep_repo" push --quiet origin HEAD:main
+git -C "$lw_sep_repo" switch --quiet feat
+lw_sep_remote_oid=$(git -C "$lw_sep_repo" rev-parse refs/remotes/origin/main)
+lw_sep_rc=0
+result=$(git -C "$lw_sep_repo" cleanup-repo 2>&1) || lw_sep_rc=$?
+_assert_eq "separate Git directory cleanup succeeds" 0 "$lw_sep_rc"
+_assert_eq "separate Git directory main worktree switches to base" \
+  refs/heads/main "$(_head_ref "$lw_sep_repo")"
+_assert_eq "separate Git directory base is fast-forwarded" \
+  "$lw_sep_remote_oid" "$(git -C "$lw_sep_repo" rev-parse HEAD)"
+_assert_contains "separate Git directory main worktree deletes its old branch" \
+  "deleting feat (merged)" "$result"
+
+# Run from a bare repository's explicit work tree, as dotfiles setups do, the
+# checked-out base is still updated in place rather than by ref alone.
+lw_bare_repo=$(_merged_feature_repo)
+lw_bare_old=$(git -C "$lw_bare_repo" rev-parse refs/heads/main)
+lw_bare_remote=$(git -C "$lw_bare_repo" rev-parse refs/remotes/origin/main)
+lw_bare_gitdir="$(_tmpdir)/cfg.git"
+lw_bare_work=$(_tmpdir)
+git clone --quiet --bare "$lw_bare_repo" "$lw_bare_gitdir"
+git --git-dir="$lw_bare_gitdir" config remote.origin.url \
+  "$(git -C "$lw_bare_repo" config remote.origin.url)"
+git --git-dir="$lw_bare_gitdir" update-ref refs/heads/main "$lw_bare_old"
+git --git-dir="$lw_bare_gitdir" --work-tree="$lw_bare_work" \
+  checkout --quiet -f main
+lw_bare_rc=0
+(cd "$lw_bare_work" &&
+  GIT_DIR="$lw_bare_gitdir" GIT_WORK_TREE="$lw_bare_work" \
+    git cleanup-repo >/dev/null 2>&1) || lw_bare_rc=$?
+_assert_eq "explicit work tree cleanup succeeds" 0 "$lw_bare_rc"
+_assert_eq "explicit work tree base is fast-forwarded" \
+  "$lw_bare_remote" "$(git --git-dir="$lw_bare_gitdir" rev-parse refs/heads/main)"
+_assert_eq "explicit work tree follows the base fast-forward" "" \
+  "$(git --git-dir="$lw_bare_gitdir" --work-tree="$lw_bare_work" \
+    status --porcelain)"
+
+# Git before 2.36 cannot list worktrees with -z. The main worktree keeps its
+# historical update, and a linked worktree leaves the base alone.
+lw_oldgit_bin=$(_tmpdir)
+cat >"$lw_oldgit_bin/git" <<'SHIM'
+#!/usr/bin/env bash
+if [[ "${1:-}" == worktree && "${2:-}" == list ]]; then
+  for arg; do
+    if [[ "$arg" == -z ]]; then
+      echo "error: unknown switch \`z'" >&2
+      exit 129
+    fi
+  done
+fi
+exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
+SHIM
+chmod +x "$lw_oldgit_bin/git"
+lw_oldgit_repo=$(_merged_feature_repo)
+lw_oldgit_old=$(git -C "$lw_oldgit_repo" rev-parse refs/heads/main)
+lw_oldgit_remote=$(git -C "$lw_oldgit_repo" rev-parse refs/remotes/origin/main)
+git -C "$lw_oldgit_repo" switch --quiet -c other
+lw_oldgit_linked="$(_tmpdir)/linked"
+git -C "$lw_oldgit_repo" worktree add --quiet "$lw_oldgit_linked" feat
+lw_oldgit_rc=0
+result=$(cd "$lw_oldgit_linked" &&
+  PATH="$lw_oldgit_bin:$PATH" "$ROOT/bin/git-cleanup-repo" 2>&1) ||
+  lw_oldgit_rc=$?
+_assert_eq "linked cleanup without a worktree inventory succeeds" \
+  0 "$lw_oldgit_rc"
+_assert_contains "linked cleanup without an inventory skips the base update" \
+  "not updating main; could not inspect worktrees" "$result"
+_assert_eq "linked cleanup without an inventory leaves the base in place" \
+  "$lw_oldgit_old" "$(git -C "$lw_oldgit_repo" rev-parse refs/heads/main)"
+_assert_eq "linked cleanup without an inventory keeps the linked branch" \
+  refs/heads/feat "$(_head_ref "$lw_oldgit_linked")"
+lw_oldgit_rc=0
+(cd "$lw_oldgit_repo" &&
+  PATH="$lw_oldgit_bin:$PATH" "$ROOT/bin/git-cleanup-repo" >/dev/null 2>&1) ||
+  lw_oldgit_rc=$?
+_assert_eq "main worktree cleanup without a worktree inventory succeeds" \
+  0 "$lw_oldgit_rc"
+_assert_eq "main worktree without an inventory still updates the base" \
+  "$lw_oldgit_remote" "$(git -C "$lw_oldgit_repo" rev-parse refs/heads/main)"
 
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2

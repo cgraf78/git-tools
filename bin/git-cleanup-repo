@@ -253,20 +253,154 @@ _preflight_base() {
   esac
 }
 
+# Record how the invoking checkout relates to the repository. These answers
+# come from HEAD and the Git directory rather than from `git worktree list`
+# paths: that list names a main worktree by its Git directory when the
+# checkout uses a separate Git directory or `core.worktree` (submodules,
+# dotfiles-style repositories), and Git before 2.36 cannot produce it at all.
+_locate_worktrees() {
+  local common_dir git_dir head_status=0
+
+  gt_find_current_worktree || _die "could not resolve current worktree"
+  _current_worktree=$GT_WORKTREE_PATH
+  _current_branch=$(git symbolic-ref -q HEAD) || head_status=$?
+  case "$head_status" in
+    0) _current_branch=${_current_branch#refs/heads/} ;;
+    1) _current_branch="" ;;
+    *) _die "could not inspect current branch" ;;
+  esac
+  git_dir=$(git rev-parse --git-dir) ||
+    _die "could not resolve repository Git directory"
+  common_dir=$(git rev-parse --git-common-dir) ||
+    _die "could not resolve repository common Git directory"
+  _in_main_worktree=0
+  [[ ! "$git_dir" -ef "$common_dir" ]] || _in_main_worktree=1
+  _switched_to_base=0
+}
+
+_record_base_config() {
+  _run git config --local --replace-all "branch.$_base.remote" "$_remote"
+  _run git config --local --replace-all \
+    "branch.$_base.merge" "refs/heads/$_base"
+}
+
+# Leave the local base where it is. Merges are then proven against that older
+# base, which can only keep more branches. Without a local base there is
+# nothing to prove against, so that case cannot be skipped.
+_skip_base_update() {
+  [[ "$_base_local_exists" == 1 ]] ||
+    _die "could not create local base branch $_base; $*"
+  _say "not updating $_base; $*"
+  _planned_base_oid=$_local_base_oid
+}
+
+# Check out and fast-forward the base in the invoking worktree. This is the
+# historical behavior and stays reserved for the main worktree or a worktree
+# that already has the base checked out, where it cannot steal the base from
+# another worktree or orphan a linked worktree's own branch.
+_switch_to_base() {
+  if [[ "$_base_local_exists" == 1 ]]; then
+    _run git switch --quiet --no-guess "$_base"
+  else
+    _run git switch --quiet -c "$_base" "$_remote_oid"
+    _record_base_config
+  fi
+  _run git merge --quiet --ff-only "$_remote_oid"
+  _switched_to_base=1
+}
+
+# Another worktree owns the base, so only that worktree can advance it without
+# leaving its index and files behind the moved ref. Its pending edits belong to
+# the user, so skip the update rather than merge into them.
+_fast_forward_base_worktree() {
+  local path="$1" operation status
+
+  [[ "$_planned_base_oid" != "$_local_base_oid" ]] || return 0
+  if ! operation=$(gt_worktree_operation "$path"); then
+    _skip_base_update "could not inspect worktree: $path"
+    return 0
+  fi
+  if [[ -n "$operation" ]]; then
+    _skip_base_update "worktree has active $operation: $path"
+    return 0
+  fi
+  if ! status=$(GIT_OPTIONAL_LOCKS=0 gt_git_without_local_env -C "$path" \
+    status --porcelain 2>/dev/null); then
+    _skip_base_update "could not inspect worktree: $path"
+    return 0
+  fi
+  if [[ -n "$status" ]]; then
+    _skip_base_update "worktree has local changes: $path"
+    return 0
+  fi
+  # Report the user-visible command; the real run clears this worktree's
+  # inherited Git environment so the merge happens in the base worktree.
+  if [[ "$_dry_run" == 1 ]]; then
+    _run git -C "$path" merge --quiet --ff-only "$_remote_oid"
+    return 0
+  fi
+  gt_git_without_local_env -C "$path" merge --quiet --ff-only "$_remote_oid" ||
+    _die "could not fast-forward $_base in worktree $path"
+}
+
+# No worktree has the base checked out, so a linked worktree can advance the
+# ref directly instead of switching away from its own branch. Preflight proved
+# the move is a fast-forward; the old-value guard keeps a concurrent ref update
+# from being overwritten.
+_fast_forward_base_ref() {
+  local message="cleanup-repo: fast-forward $_base to $_remote/$_base"
+
+  if [[ "$_base_local_exists" == 0 ]]; then
+    _run git update-ref -m "$message" "refs/heads/$_base" "$_remote_oid" "" ||
+      _die "could not create local base branch: $_base"
+    _record_base_config
+    return 0
+  fi
+  [[ "$_planned_base_oid" != "$_local_base_oid" ]] || return 0
+  # A rebase or bisect can reserve the base while its HEAD is detached, and
+  # moving the ref underneath it would corrupt that operation. A worktree whose
+  # directory is gone makes reservations uninspectable until it is pruned.
+  if ! gt_find_worktree_reserving_branch "$_base"; then
+    _skip_base_update "could not inspect worktree reservations" \
+      "(see git worktree prune)"
+    return 0
+  fi
+  if [[ -n "$GT_WORKTREE_PATH" ]]; then
+    _skip_base_update "reserved by worktree $GT_WORKTREE_PATH"
+    return 0
+  fi
+  _run git update-ref -m "$message" "refs/heads/$_base" \
+    "$_planned_base_oid" "$_local_base_oid" ||
+    _die "could not fast-forward local base branch: $_base"
+}
+
 _update_base() {
   _pin_remote_base
   _resolve_local_base
   _preflight_base
 
-  if [[ "$_base_local_exists" == 1 ]]; then
-    _run git switch --quiet --no-guess "$_base"
+  # Only the worktree that has the base checked out may advance it with a
+  # merge, and only the main worktree may take the base over. A linked
+  # worktree that switched to the base would release its own branch for
+  # deletion and lock the main worktree out of the base.
+  if [[ -n "$_current_branch" && "$_current_branch" == "$_base" ]]; then
+    _switch_to_base
+  elif ! gt_find_worktree_for_branch "$_base" 2>/dev/null; then
+    # Without an inventory (for example Git before 2.36), the main worktree
+    # keeps its historical switch, which Git itself refuses when another
+    # worktree has the base checked out.
+    if [[ "$_in_main_worktree" == 1 ]]; then
+      _switch_to_base
+    elif [[ "$_planned_base_oid" != "$_local_base_oid" ]]; then
+      _skip_base_update "could not inspect worktrees"
+    fi
+  elif [[ -n "$GT_WORKTREE_PATH" ]]; then
+    _fast_forward_base_worktree "$GT_WORKTREE_PATH"
+  elif [[ "$_in_main_worktree" == 1 ]]; then
+    _switch_to_base
   else
-    _run git switch --quiet -c "$_base" "$_remote_oid"
-    _run git config --local --replace-all "branch.$_base.remote" "$_remote"
-    _run git config --local --replace-all \
-      "branch.$_base.merge" "refs/heads/$_base"
+    _fast_forward_base_ref
   fi
-  _run git merge --quiet --ff-only "$_remote_oid"
 
   if [[ "$_dry_run" == 1 ]]; then
     _base_oid=$_planned_base_oid
@@ -590,8 +724,34 @@ _remove_branch_worktree_if_needed() {
   path=$GT_WORKTREE_PATH
   [[ -n "$path" ]] || return 0
 
+  # A dry run does not really switch to the base, but the real run releases
+  # the branch the current worktree leaves, so report that outcome.
+  if [[ "$_dry_run" == 1 && "$_switched_to_base" == 1 &&
+    -n "$_current_branch" && "$branch" == "$_current_branch" ]]; then
+    return 0
+  fi
+  # Removing the invoking worktree would delete the caller's own checkout,
+  # and Git refuses to remove the main worktree only after cache pruning has
+  # already touched it. Neither is eligible, even with --remove-worktrees. The
+  # branch-name check covers checkouts listed under their Git directory.
+  if [[ "$path" -ef "$_current_worktree" ]] ||
+    [[ "$_switched_to_base" != 1 && -n "$_current_branch" &&
+      "$branch" == "$_current_branch" ]]; then
+    _say "keeping $branch; checked out in the current worktree"
+    return 1
+  fi
   if [[ "$_remove_worktrees" != 1 ]]; then
     _say "skipping $branch; checked out in worktree $path"
+    return 1
+  fi
+  # Both paths come from the same inventory, so they agree even when the main
+  # worktree is listed by its Git directory.
+  if ! gt_find_main_worktree; then
+    _say "skipping $branch; could not inspect worktrees"
+    return 1
+  fi
+  if [[ "$path" == "$GT_WORKTREE_PATH" || "$path" -ef "$GT_WORKTREE_PATH" ]]; then
+    _say "skipping $branch; checked out in the main worktree $path"
     return 1
   fi
 
@@ -837,6 +997,7 @@ else
   _worktree_prune_paths=()
 fi
 _resolve_remote
+_locate_worktrees
 
 # A non-writing hash probe detects the native SHA width without requiring the
 # newer rev-parse --show-object-format option.

@@ -381,14 +381,28 @@ Base updates do not depend on configured fetch refspecs or short ref names. The
 command pins exactly `refs/heads/<base>` from the resolved endpoint, fetches it
 without tags or remote-tracking ref updates, validates its native SHA-1 or
 SHA-256 object ID, and checks the local fast-forward relationship before
-switching branches. It then creates or
-fast-forwards the base using that same OID. A divergent base fails before the
-current branch or local base is changed. Dry-run uses isolated temporary object
-storage, so it leaves no permanent objects or refs behind. The command retains
-the single raw configured fetch URL for both remote inspection and fetch, which
-lets Git apply any `insteadOf` rewrite exactly once per operation. Remotes with
-zero or multiple fetch URLs are rejected because there is no single endpoint to
-pin.
+changing anything. It then creates or fast-forwards the base using that same
+OID. A divergent base fails before the current branch or local base is changed.
+Where the update happens depends on which worktree owns the base:
+
+- If a worktree has the base checked out, the base is fast-forwarded there
+  with `git merge --ff-only`. Another worktree that has local changes or an
+  active operation, or cannot be inspected, is left alone, and cleanup proves
+  merges against the unchanged local base.
+- Otherwise, when run from the main worktree, it switches to the base.
+- Otherwise a linked worktree advances only the base ref with a guarded
+  `git update-ref`, and only by fast-forward. It never switches to the base, so
+  it never releases its own branch for deletion or locks the main worktree out
+  of the base. If a rebase or bisect reserves the base, or worktrees cannot be
+  inspected (for example a deleted worktree that was never pruned, or Git
+  older than 2.36), the base is left alone; without a local base, cleanup
+  stops instead.
+
+Dry-run uses isolated temporary object storage, so it leaves no permanent
+objects or refs behind. The command retains the single raw configured fetch URL
+for both remote inspection and fetch, which lets Git apply any `insteadOf`
+rewrite exactly once per operation. Remotes with zero or multiple fetch URLs are
+rejected because there is no single endpoint to pin.
 
 Use `--all` to delete every local branch except the base branch regardless of
 merge state:
@@ -399,10 +413,11 @@ git cleanup-repo --all
 
 Branches checked out or reserved by another worktree are skipped by default.
 Use `--remove-worktrees` to remove a linked worktree before deleting its branch.
-Only worktrees with no tracked changes, index-hidden local content, or active
-rebase/merge/cherry-pick/revert/bisect operation are eligible. Unknown
-untracked or ignored content still blocks removal, and removal never uses
-`--force`:
+It never removes the current worktree or the main worktree, so a branch still
+checked out in either after the base update is kept. Only worktrees with no tracked changes, index-hidden
+local content, or active rebase/merge/cherry-pick/revert/bisect operation are
+eligible. Unknown untracked or ignored content still blocks removal, and removal
+never uses `--force`:
 
 ```sh
 git cleanup-repo --all --remove-worktrees

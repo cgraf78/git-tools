@@ -61,8 +61,11 @@ The branch checked out in the current checkout is never deleted. When the base
 update is skipped, the command still exits 0, but its final summary line ends
 with
 .RI "" base " not updated (" reason )
-so the base is not mistaken for current. Dry-run uses
-isolated temporary object storage.
+so the base is not mistaken for current. A dry run stops with exit status 2
+and
+.B would refuse:
+and the reason wherever the real run refuses before changing anything. Dry-run
+uses isolated temporary object storage.
 .PP
 The command retains the single raw configured fetch URL for both remote
 inspection and fetch, allowing Git to apply any

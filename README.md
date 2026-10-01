@@ -441,6 +441,10 @@ comes from remote-tracking refs as of the last fetch. When a worktree cannot
 be inspected, cleanup prints once how to prune it (and unlock it first if it
 is locked).
 
+A dry run stops, with exit status 2 and `would refuse: <reason>`, wherever the
+real run refuses before changing anything (a dirty worktree, an active
+operation, or a local base that cannot fast-forward), instead of describing a
+cleanup that would not happen.
 Dry-run uses isolated temporary object storage, so it leaves no permanent
 objects or refs behind. The command retains the single raw configured fetch URL
 for both remote inspection and fetch, which lets Git apply any `insteadOf`

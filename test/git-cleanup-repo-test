@@ -2539,9 +2539,34 @@ dirty_repo=$(_clone_remote)
 printf 'dirty\n' >"$dirty_repo/dirty.txt"
 result=$(git -C "$dirty_repo" cleanup-repo 2>&1 || true)
 _assert_contains "refuses dirty worktrees" "worktree must be clean" "$result"
-result=$(git -C "$dirty_repo" cleanup-repo --dry-run 2>&1)
-_assert_contains "dry run can inspect dirty worktrees" \
-  "real cleanup would stop before changing refs" "$result"
+dirty_rc=0
+result=$(git -C "$dirty_repo" cleanup-repo --dry-run 2>&1) || dirty_rc=$?
+_assert_eq "dry run refuses a dirty worktree like the real run" 2 "$dirty_rc"
+_assert_contains "dry run reports the refusal it would make" \
+  "would refuse: worktree must be clean before cleanup" "$result"
+_assert_not_contains "dry run plans nothing for a dirty worktree" \
+  "would delete" "$result"
+
+# Every refusal the real run makes before changing anything is a dry-run
+# refusal with the same exit status, such as an active operation.
+op_repo=$(_clone_remote)
+git -C "$op_repo" switch --quiet -c topic
+git -C "$op_repo" commit --quiet --allow-empty -m one
+git -C "$op_repo" rebase --quiet --exec false HEAD~1 >/dev/null 2>&1
+for op_mode in real dry; do
+  op_args=()
+  op_prefix=""
+  if [[ "$op_mode" == dry ]]; then
+    op_args=(--dry-run)
+    op_prefix="would refuse: "
+  fi
+  op_rc=0
+  result=$(git -C "$op_repo" cleanup-repo ${op_args[@]+"${op_args[@]}"} 2>&1) ||
+    op_rc=$?
+  _assert_eq "active operation: $op_mode run exits 2" 2 "$op_rc"
+  _assert_contains "active operation: $op_mode run reports why" \
+    "${op_prefix}repository already has an active rebase" "$result"
+done
 
 # A linked worktree must never take over the base branch. Switching it to the
 # base would leave its own branch unreserved, so cleanup would delete the branch
@@ -2565,6 +2590,15 @@ _merged_feature_repo() {
 _head_ref() {
   git -C "$1" symbolic-ref -q HEAD || printf 'detached\n'
 }
+
+# A divergent base is a dry-run refusal with the real run's exit status too.
+dv2_repo=$(_merged_feature_repo)
+_commit_file "$dv2_repo" local.txt local "divergent local base"
+dv2_rc=0
+result=$(git -C "$dv2_repo" cleanup-repo --dry-run 2>&1) || dv2_rc=$?
+_assert_eq "divergent base: dry run exits 2 like the real run" 2 "$dv2_rc"
+_assert_contains "divergent base: dry run reports the refusal" \
+  "would refuse: local base cannot be fast-forwarded to origin/main" "$result"
 
 # The base checked out in the main worktree is fast-forwarded there.
 lw_main_repo=$(_merged_feature_repo)

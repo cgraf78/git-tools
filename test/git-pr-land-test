@@ -1675,6 +1675,63 @@ _assert_eq "external main checkout with a divergent base still lands" \
 _assert_eq "external main checkout keeps its divergent base" "$df_local" \
   "$(git --git-dir="$df_gitdir" rev-parse refs/heads/main)"
 
+# Run by name, a command's `git` can be a dotfiles launcher that routes any
+# directory under $HOME, and `git -C $HOME`, into the dotfiles repository even
+# after GIT_DIR is cleared. Landing from there must still refuse.
+launcher_bin=$(_tmpdir)
+cat >"$launcher_bin/git" <<'SHIM'
+#!/usr/bin/env bash
+# Route like a dotfiles Git launcher: a command aimed at SHIM_HOME or a plain
+# directory below it (by cwd or -C) runs against SHIM_GITDIR with SHIM_HOME as
+# its work tree, even when the caller cleared GIT_DIR.
+dir=$PWD
+args=("$@")
+i=0
+while ((i < ${#args[@]})); do
+  case "${args[i]}" in
+    -C)
+      dir=${args[i + 1]}
+      break
+      ;;
+    -c) i=$((i + 2)) ;;
+    -*) i=$((i + 1)) ;;
+    *) break ;;
+  esac
+done
+case "$dir" in
+  "$SHIM_HOME" | "$SHIM_HOME"/Downloads)
+    exec env GIT_DIR="$SHIM_GITDIR" GIT_WORK_TREE="$SHIM_HOME" \
+      "$SHIM_REAL_GIT" "$@"
+    ;;
+esac
+exec "$SHIM_REAL_GIT" "$@"
+SHIM
+chmod +x "$launcher_bin/git"
+_dotfiles_fixture
+mkdir "$df_home/Downloads"
+df_log=$(_tmpdir)/gh.log
+df_head=$(_head_state "$df_gitdir")
+df_files=$(_tree_fingerprint "$df_home")
+df_rc=0
+result=$(cd "$df_home/Downloads" && SHIM_HOME="$df_home" \
+  SHIM_GITDIR="$df_gitdir" SHIM_REAL_GIT="$bin_dir/git" GH_LOG="$df_log" \
+  GH_TEST_REPO="$df_home" GH_PR_HEAD_OID="$(git --git-dir="$df_gitdir" \
+    rev-parse refs/remotes/origin/feature)" \
+  PATH="$launcher_bin:$bin_dir:$PATH" "$ROOT/bin/git-pr-land" 4 2>&1) ||
+  df_rc=$?
+_assert_eq "launcher-routed external checkout refuses to land" 1 "$df_rc"
+_assert_contains "launcher-routed external checkout explains the refusal" \
+  "refusing to land from $df_home" "$result"
+if [[ -s "$df_log" ]]; then
+  _fail "launcher-routed external checkout refuses before merging"
+else
+  _pass "launcher-routed external checkout refuses before merging"
+fi
+_assert_eq "launcher-routed external checkout keeps its HEAD" "$df_head" \
+  "$(_head_state "$df_gitdir")"
+_assert_eq "launcher-routed external checkout keeps its files" "$df_files" \
+  "$(_tree_fingerprint "$df_home")"
+
 # A bare repository driven by GIT_DIR and GIT_WORK_TREE, the classic dotfiles
 # setup, is the same kind of checkout: landing from its work tree refuses
 # before merging even though the base lives in a linked worktree.

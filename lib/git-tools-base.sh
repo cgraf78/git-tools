@@ -741,6 +741,10 @@ gt_find_current_worktree() {
 _gt_work_tree_reaches_git_dir() {
   local top="$1" git_dir="$2" found
 
+  # The `.git` entry is checked on disk first: when a command is run by name,
+  # `git` on PATH can be a launcher that routes `git -C $HOME` back into the
+  # dotfiles repository, so asking Git alone would report that it leads back.
+  [[ -e "$top/.git" || -L "$top/.git" ]] || return 1
   found=$(gt_git_without_local_env -C "$top" rev-parse --git-dir \
     2>/dev/null) || return 1
   [[ "$found" == /* ]] || found=$top/$found

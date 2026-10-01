@@ -3053,18 +3053,22 @@ _assert_eq "explicit work tree stays clean" "" \
 # launcher routes any directory there): the base it has checked out is never
 # merged into, but branches already merged into that local base are still
 # deleted.
-hx_repo=$(_merged_feature_repo)
-hx_old=$(git -C "$hx_repo" rev-parse refs/heads/main)
-git -C "$hx_repo" branch done-already "$hx_old"
-hx_gitdir="$(_tmpdir)/dotfiles"
-hx_home=$(_tmpdir)
-git clone --quiet --bare "$hx_repo" "$hx_gitdir"
-git --git-dir="$hx_gitdir" config remote.origin.url \
-  "$(git -C "$hx_repo" config remote.origin.url)"
-git --git-dir="$hx_gitdir" update-ref refs/heads/main "$hx_old"
-git --git-dir="$hx_gitdir" config core.bare false
-git --git-dir="$hx_gitdir" config core.worktree "$hx_home"
-git --git-dir="$hx_gitdir" checkout --quiet -f main
+# Sets hx_repo, hx_old, hx_gitdir, and hx_home.
+_hx_fixture() {
+  hx_repo=$(_merged_feature_repo) || return 1
+  hx_old=$(git -C "$hx_repo" rev-parse refs/heads/main)
+  git -C "$hx_repo" branch done-already "$hx_old"
+  hx_gitdir="$(_tmpdir)/dotfiles"
+  hx_home=$(_tmpdir)
+  git clone --quiet --bare "$hx_repo" "$hx_gitdir"
+  git --git-dir="$hx_gitdir" config remote.origin.url \
+    "$(git -C "$hx_repo" config remote.origin.url)"
+  git --git-dir="$hx_gitdir" update-ref refs/heads/main "$hx_old"
+  git --git-dir="$hx_gitdir" config core.bare false
+  git --git-dir="$hx_gitdir" config core.worktree "$hx_home"
+  git --git-dir="$hx_gitdir" checkout --quiet -f main
+}
+_hx_fixture
 hx_before=$(_worktree_snapshot "$hx_home")
 hx_rc=0
 result=$(cd "$hx_home" && GIT_DIR="$hx_gitdir" git cleanup-repo 2>&1) ||
@@ -3100,6 +3104,53 @@ _assert_contains "external main checkout keeps its own merged branch" \
   "keeping feat; checked out in the current worktree" "$result"
 _assert_eq "external main checkout's own branch still exists" \
   "$hx_feat" "$(git --git-dir="$hx_gitdir" rev-parse refs/heads/feat)"
+
+# Run by name, cleanup's `git` can be a dotfiles launcher that routes
+# `git -C $HOME` into the dotfiles repository even after GIT_DIR is cleared.
+# The checkout must still be recognized and left alone.
+launcher_bin=$(_tmpdir)
+cat >"$launcher_bin/git" <<'SHIM'
+#!/usr/bin/env bash
+# Route like a dotfiles Git launcher: a command aimed at SHIM_HOME or a plain
+# directory below it (by cwd or -C) runs against SHIM_GITDIR with SHIM_HOME as
+# its work tree, even when the caller cleared GIT_DIR.
+dir=$PWD
+args=("$@")
+i=0
+while ((i < ${#args[@]})); do
+  case "${args[i]}" in
+    -C)
+      dir=${args[i + 1]}
+      break
+      ;;
+    -c) i=$((i + 2)) ;;
+    -*) i=$((i + 1)) ;;
+    *) break ;;
+  esac
+done
+case "$dir" in
+  "$SHIM_HOME" | "$SHIM_HOME"/Downloads)
+    exec env GIT_DIR="$SHIM_GITDIR" GIT_WORK_TREE="$SHIM_HOME" \
+      "$SHIM_REAL_GIT" "$@"
+    ;;
+esac
+exec "$SHIM_REAL_GIT" "$@"
+SHIM
+chmod +x "$launcher_bin/git"
+_hx_fixture
+hx_before=$(_worktree_snapshot "$hx_home")
+hx_rc=0
+result=$(cd "$hx_home" && SHIM_HOME="$hx_home" SHIM_GITDIR="$hx_gitdir" \
+  SHIM_REAL_GIT="$GIT_TOOLS_TEST_REAL_GIT" PATH="$launcher_bin:$PATH" \
+  "$ROOT/bin/git-cleanup-repo" 2>&1) || hx_rc=$?
+_assert_eq "launcher-routed external checkout cleanup succeeds" 0 "$hx_rc"
+_assert_contains "launcher-routed external checkout is not merged into" \
+  "not updating main in $hx_home; update that checkout with its own tooling" \
+  "$result"
+_assert_eq "launcher-routed external checkout keeps its ref" \
+  "$hx_old" "$(git --git-dir="$hx_gitdir" rev-parse refs/heads/main)"
+_assert_eq "launcher-routed external checkout keeps its files" \
+  "$hx_before" "$(_worktree_snapshot "$hx_home")"
 
 # Git before 2.36 cannot list worktrees with -z. The main worktree keeps its
 # historical update, and a linked worktree leaves the base alone.

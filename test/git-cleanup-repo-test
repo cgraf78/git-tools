@@ -1679,7 +1679,7 @@ caller_state_output=$(cd "$readonly_repo" && bash -c '
   gt_branch_content_merged "$branch" "$base" || exit 1
   [[ "$(trap -p TERM)" == "$trap_before" ]] || exit 2
   [[ "$caller_sentinel" == unchanged ]] || exit 3
-  set -o | grep -q "^pipefail[[:space:]]*off$" || exit 4
+  ! shopt -qo pipefail || exit 4
   printf preserved
 ' _ "$ROOT" 2>&1)
 _assert_eq "squash helper preserves caller shell state" preserved \

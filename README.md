@@ -646,7 +646,10 @@ embedding contract.
 ## Requirements
 
 - Bash
-- Git
+- Git. The commands run the `git` binary in Git's own exec path
+  (`git --exec-path`), not whichever `git` comes first on `PATH`, so a
+  launcher or wrapper there cannot redirect their repository operations. If
+  that binary is missing they print a note and use `git` from `PATH`.
 - [`gh`](https://cli.github.com/), authenticated for the repository's GitHub
   host, for the `git pr-*` commands; `git repo-state`, `git branch-audit`, and
   `git worktree-audit` also use it when available to show PR details
@@ -746,3 +749,7 @@ test/shell-integration-test
 
 If `git-absorb` is not installed, the test suite verifies the dependency error
 path and skips rewrite integration cases.
+
+Suites inject failures with fake `git` programs on `PATH`. `test/run` therefore
+exports `GIT_TOOLS_TEST_PATH_GIT=1`, a test-only override that makes the
+commands use `git` from `PATH`; cases that test the exec-path lookup unset it.

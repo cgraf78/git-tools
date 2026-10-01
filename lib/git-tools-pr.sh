@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Shared helpers for GitHub pull-request workflow commands.
 
+# Every `git` this library runs is Git's own binary, not a PATH wrapper.
+_gt_lib_dir=${BASH_SOURCE[0]%/*}
+[[ "$_gt_lib_dir" != "${BASH_SOURCE[0]}" ]] || _gt_lib_dir=.
+# shellcheck source=lib/git-tools-git.sh
+. "$_gt_lib_dir/git-tools-git.sh" || return 1
+unset _gt_lib_dir
+
 gt_command=${gt_command:-git-tools}
 
 # Never trust inherited values for destructive-operation safety checks.

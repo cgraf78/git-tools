@@ -62,6 +62,9 @@ while IFS= read -r _name; do
   esac
 done < <(compgen -e)
 unset BASH_ENV _name
+# Fake `git` programs on PATH inject failures below, so the tools must use PATH
+# Git instead of Git's own binary; the cases that test that lookup unset this.
+export GIT_TOOLS_TEST_PATH_GIT=1
 export HOME="$_suite_tmp_root/home"
 export XDG_CONFIG_HOME="$HOME/.config"
 export GIT_CONFIG_NOSYSTEM=1
@@ -3378,6 +3381,59 @@ _assert_eq "base moved during a refused worktree fast-forward stops cleanup" \
   2 "$race_rc"
 _assert_contains "base moved during a refused worktree fast-forward is reported" \
   "could not fast-forward main in worktree $race_repo" "$result"
+
+# The tools run Git's own binary, never a `git` on PATH that could reroute
+# their commands (as a dotfiles launcher does for $HOME). Started by name, the
+# PATH `git` is asked only for Git's exec path; started by Git, which exports
+# GIT_EXEC_PATH, it is not run at all.
+decoy_bin=$(_tmpdir)
+cat >"$decoy_bin/git" <<'SHIM'
+#!/usr/bin/env bash
+# A PATH launcher that reroutes every command into a decoy repository.
+printf '%s\n' "$*" >>"$DECOY_LOG"
+exec env GIT_DIR="$DECOY_GITDIR" "$DECOY_REAL_GIT" "$@"
+SHIM
+chmod +x "$decoy_bin/git"
+for decoy_case in by-name via-git; do
+  decoy_repo=$(_merged_feature_repo)
+  decoy_remote=$(git -C "$decoy_repo" rev-parse refs/remotes/origin/main)
+  decoy_other=$(_merged_feature_repo)
+  decoy_other_refs=$(git -C "$decoy_other" for-each-ref)
+  decoy_log="$(_tmpdir)/launcher.log"
+  : >"$decoy_log"
+  decoy_exec=""
+  [[ "$decoy_case" != via-git ]] ||
+    decoy_exec=$("$GIT_TOOLS_TEST_REAL_GIT" --exec-path)
+  decoy_rc=0
+  result=$(cd "$decoy_repo" && env -u GIT_TOOLS_TEST_PATH_GIT -u GIT_EXEC_PATH \
+    ${decoy_exec:+GIT_EXEC_PATH="$decoy_exec"} DECOY_LOG="$decoy_log" \
+    DECOY_GITDIR="$decoy_other/.git" DECOY_REAL_GIT="$GIT_TOOLS_TEST_REAL_GIT" \
+    PATH="$decoy_bin:$PATH" "$ROOT/bin/git-cleanup-repo" 2>&1) || decoy_rc=$?
+  _assert_eq "PATH launcher ($decoy_case): cleanup succeeds" 0 "$decoy_rc"
+  _assert_eq "PATH launcher ($decoy_case): the invoked repository is cleaned" \
+    "$decoy_remote main" "$(git -C "$decoy_repo" rev-parse refs/heads/main) $(_branches "$decoy_repo")"
+  _assert_eq "PATH launcher ($decoy_case): the decoy repository is untouched" \
+    "$decoy_other_refs" "$(git -C "$decoy_other" for-each-ref)"
+  if [[ "$decoy_case" == via-git ]]; then
+    _assert_eq "PATH launcher ($decoy_case): is never run" "" "$(cat "$decoy_log")"
+  else
+    _assert_eq "PATH launcher ($decoy_case): is only asked for the exec path" \
+      "--exec-path" "$(cat "$decoy_log")"
+  fi
+done
+
+# Without a Git binary in Git's exec path, the tools say so and use PATH Git.
+nogit_exec=$(_tmpdir)
+nogit_repo=$(_merged_feature_repo)
+nogit_rc=0
+result=$(cd "$nogit_repo" && env -u GIT_TOOLS_TEST_PATH_GIT \
+  GIT_EXEC_PATH="$nogit_exec" "$ROOT/bin/git-cleanup-repo" 2>&1) || nogit_rc=$?
+_assert_eq "missing exec-path Git: cleanup still succeeds" 0 "$nogit_rc"
+_assert_contains "missing exec-path Git: falls back with a note" \
+  "git-tools: note: no git binary in Git exec path $nogit_exec; using git from PATH" \
+  "$result"
+_assert_occurrences "missing exec-path Git: the note is printed once" 1 \
+  "git-tools: note:" "$result"
 
 # A main checkout with a separate Git directory records nowhere where its work
 # tree is, so from a linked worktree it can only be named by its Git directory.

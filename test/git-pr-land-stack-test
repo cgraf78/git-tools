@@ -28,6 +28,9 @@ while IFS= read -r _name; do
   esac
 done < <(compgen -e)
 unset BASH_ENV _name
+# Fake `git` programs on PATH inject failures below, so the tools must use PATH
+# Git instead of Git's own binary; the cases that test that lookup unset this.
+export GIT_TOOLS_TEST_PATH_GIT=1
 HOME=$(_tmpdir) || exit 1
 export HOME
 export XDG_CONFIG_HOME="$HOME/.config"
@@ -1108,6 +1111,33 @@ for dotfiles_args in "" --dry-run; do
   _assert_contains "dotfiles-style stack landing explains ${dotfiles_args:-real run}" \
     "to land from $dotfiles_home" "$result"
 done
+# The stack tool's own Git commands use Git's own binary too: a PATH launcher
+# rerouting into an ordinary decoy repository would hide the dotfiles checkout
+# and let discovery proceed.
+decoy_bin=$(_tmpdir)
+cat >"$decoy_bin/git" <<'SHIM'
+#!/usr/bin/env bash
+# A PATH launcher that reroutes every command into a decoy repository.
+printf '%s\n' "$*" >>"$DECOY_LOG"
+exec env GIT_DIR="$DECOY_GITDIR" "$DECOY_REAL_GIT" "$@"
+SHIM
+chmod +x "$decoy_bin/git"
+decoy_other=$(_tmpdir)
+_git_init "$decoy_other"
+decoy_log="$(_tmpdir)/launcher.log"
+: >"$decoy_log"
+rc=0
+result=$(cd "$dotfiles_home" && env -u GIT_TOOLS_TEST_PATH_GIT -u GIT_EXEC_PATH \
+  GIT_DIR="$dotfiles_gitdir" DECOY_LOG="$decoy_log" \
+  DECOY_GITDIR="$decoy_other/.git" DECOY_REAL_GIT="$_hermetic_bin/git" \
+  PATH="$decoy_bin:$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  STACK_LOG="$dotfiles_log" "$ROOT/bin/git-pr-land-stack" 1 2>&1) || rc=$?
+_assert_eq "PATH launcher: stack still refuses the dotfiles-style checkout" \
+  "1" "$rc"
+_assert_contains "PATH launcher: stack names the real checkout" \
+  "refusing to land from $dotfiles_home" "$result"
+_assert_eq "PATH launcher: stack only asks it for the exec path" \
+  "--exec-path" "$(cat "$decoy_log")"
 _assert_eq "dotfiles-style stack landing runs no stack tool" "" \
   "$(cat "$dotfiles_log" 2>/dev/null)"
 _assert_eq "dotfiles-style stack landing leaves the checkout on its branch" \

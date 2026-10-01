@@ -32,6 +32,9 @@ while IFS= read -r _name; do
   esac
 done < <(compgen -e)
 unset BASH_ENV _name
+# Fake `git` programs on PATH inject failures below, so the tools must use PATH
+# Git instead of Git's own binary; the cases that test that lookup unset this.
+export GIT_TOOLS_TEST_PATH_GIT=1
 HOME=$(_tmpdir) || exit 1
 export HOME
 export XDG_CONFIG_HOME="$HOME/.config"
@@ -2018,6 +2021,54 @@ GH_LOG="$ix_log" PATH="$bin_dir:$PATH" _pr_land "$ix_repo" 4 --dry-run \
   >/dev/null 2>&1
 _assert_eq "dry run leaves every index untouched" "$ix_before" \
   "$(cksum <"$ix_repo/.git/index") $(cksum <"$(git -C "$ix_base" rev-parse --git-path index)")"
+
+# The tools run Git's own binary, never a `git` on PATH that could reroute
+# their commands. Here a PATH launcher reroutes every command into an ordinary
+# decoy repository, which would hide the dotfiles-style checkout the command is
+# run in and let the landing proceed. Started by name, the PATH `git` is asked
+# only for Git's exec path; started by Git, which exports GIT_EXEC_PATH, it is
+# not run at all.
+decoy_bin=$(_tmpdir)
+cat >"$decoy_bin/git" <<'SHIM'
+#!/usr/bin/env bash
+# A PATH launcher that reroutes every command into a decoy repository.
+printf '%s\n' "$*" >>"$DECOY_LOG"
+exec env GIT_DIR="$DECOY_GITDIR" "$DECOY_REAL_GIT" "$@"
+SHIM
+chmod +x "$decoy_bin/git"
+for decoy_case in by-name via-git; do
+  _dotfiles_fixture
+  decoy_other=$(_tmpdir)
+  _init_repo "$decoy_other" "$(_tmpdir)"
+  decoy_log="$(_tmpdir)/launcher.log"
+  decoy_gh_log=$(_tmpdir)/gh.log
+  : >"$decoy_log"
+  decoy_exec=""
+  [[ "$decoy_case" != via-git ]] ||
+    decoy_exec=$("$_hermetic_bin/git" --exec-path)
+  decoy_rc=0
+  result=$(cd "$df_home" && env -u GIT_TOOLS_TEST_PATH_GIT -u GIT_EXEC_PATH \
+    ${decoy_exec:+GIT_EXEC_PATH="$decoy_exec"} GIT_DIR="$df_gitdir" \
+    DECOY_LOG="$decoy_log" DECOY_GITDIR="$decoy_other/.git" \
+    DECOY_REAL_GIT="$_hermetic_bin/git" GH_LOG="$decoy_gh_log" \
+    GH_TEST_REPO="$df_home" GH_PR_HEAD_OID="$df_old" \
+    PATH="$decoy_bin:$bin_dir:$PATH" "$ROOT/bin/git-pr-land" 4 2>&1) ||
+    decoy_rc=$?
+  _assert_eq "PATH launcher ($decoy_case): landing still refuses" 1 "$decoy_rc"
+  _assert_contains "PATH launcher ($decoy_case): names the real checkout" \
+    "refusing to land from $df_home" "$result"
+  if [[ -s "$decoy_gh_log" ]]; then
+    _fail "PATH launcher ($decoy_case): nothing is merged"
+  else
+    _pass "PATH launcher ($decoy_case): nothing is merged"
+  fi
+  if [[ "$decoy_case" == via-git ]]; then
+    _assert_eq "PATH launcher ($decoy_case): is never run" "" "$(cat "$decoy_log")"
+  else
+    _assert_eq "PATH launcher ($decoy_case): is only asked for the exec path" \
+      "--exec-path" "$(cat "$decoy_log")"
+  fi
+done
 
 # Dry runs refuse for local changes, in the base worktree or the current one,
 # exactly where the real run refuses.

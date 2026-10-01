@@ -8,6 +8,13 @@
 # (repo-state). Keeping them side-effect free lets both lib-sourcing commands
 # and standalone scripts compose them.
 
+# Every `git` this library runs is Git's own binary, not a PATH wrapper.
+_gt_lib_dir=${BASH_SOURCE[0]%/*}
+[[ "$_gt_lib_dir" != "${BASH_SOURCE[0]}" ]] || _gt_lib_dir=.
+# shellcheck source=lib/git-tools-git.sh
+. "$_gt_lib_dir/git-tools-git.sh" || return 1
+unset _gt_lib_dir
+
 # Cache Git's documented repository-local environment inventory within this
 # library load. Reset on source so inherited/exported private state cannot skip
 # the safety probe or retain GIT_DIR/GIT_WORK_TREE across repositories.
@@ -720,7 +727,7 @@ gt_git_without_local_env() {
     env_args+=("-u" "$name")
   done <<<"$local_vars"
 
-  env "${env_args[@]}" git "$@"
+  env "${env_args[@]}" "$GT_GIT" "$@"
 }
 
 # @brief Set GT_WORKTREE_PATH to the current worktree without losing newlines.

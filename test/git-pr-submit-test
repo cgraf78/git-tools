@@ -3,6 +3,10 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Signal cases below need INT and TERM deliverable; see default-signals.sh.
+# shellcheck source=test/lib/default-signals.sh
+. "$ROOT/test/lib/default-signals.sh"
+gt_test_default_signals "${BASH_SOURCE[0]}" "$@"
 PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
 
@@ -534,30 +538,36 @@ _assert_not_contains "blank title creates no pull request" \
 # Signals are cancellation, never success. Resolve the editor through a Git
 # wrapper that sends TERM to the submit process, then require both the standard
 # signal exit code and removal of the private draft file.
-signal_repo=$(_tmpdir)/signal-repo
-signal_log=$(_tmpdir)/signal-gh.log
-signal_tmp=$(_tmpdir)
-export GH_LOG="$signal_log"
-_clone_main_repo "$remote" "$signal_repo"
-printf 'first\n' >"$signal_repo/first.txt"
-git -C "$signal_repo" add first.txt
-git -C "$signal_repo" commit -m "First signal commit" >/dev/null
-printf 'second\n' >"$signal_repo/second.txt"
-git -C "$signal_repo" add second.txt
-git -C "$signal_repo" commit -m "Second signal commit" >/dev/null
-signal_head=$(git -C "$signal_repo" rev-parse HEAD)
-status=0
-result=$(cd "$signal_repo" && TMPDIR="$signal_tmp" \
-  GIT_TEST_SIGNAL_ON_EDITOR_RESOLVE=1 PATH="$bin_dir:$PATH" \
-  "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
-_assert_eq "TERM during submission uses the conventional signal status" \
-  "143" "$status"
-_assert_eq "TERM removes the private PR draft" "" \
-  "$(compgen -G "$signal_tmp/git-pr-submit.*" || true)"
-_assert_eq "TERM leaves main and its commits untouched" "$signal_head" \
-  "$(git -C "$signal_repo" rev-parse HEAD)"
-_assert_not_contains "TERM creates no pull request" \
-  "pr create" "$(cat "$signal_log" 2>/dev/null || true)"
+# An inherited ignored TERM that could not be reset never stops the submit
+# process, so the case reports itself skipped instead of failing.
+if gt_test_signal_ignored TERM; then
+  _pass "TERM during submission skipped: TERM is ignored and cannot be reset"
+else
+  signal_repo=$(_tmpdir)/signal-repo
+  signal_log=$(_tmpdir)/signal-gh.log
+  signal_tmp=$(_tmpdir)
+  export GH_LOG="$signal_log"
+  _clone_main_repo "$remote" "$signal_repo"
+  printf 'first\n' >"$signal_repo/first.txt"
+  git -C "$signal_repo" add first.txt
+  git -C "$signal_repo" commit -m "First signal commit" >/dev/null
+  printf 'second\n' >"$signal_repo/second.txt"
+  git -C "$signal_repo" add second.txt
+  git -C "$signal_repo" commit -m "Second signal commit" >/dev/null
+  signal_head=$(git -C "$signal_repo" rev-parse HEAD)
+  status=0
+  result=$(cd "$signal_repo" && TMPDIR="$signal_tmp" \
+    GIT_TEST_SIGNAL_ON_EDITOR_RESOLVE=1 PATH="$bin_dir:$PATH" \
+    "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+  _assert_eq "TERM during submission uses the conventional signal status" \
+    "143" "$status"
+  _assert_eq "TERM removes the private PR draft" "" \
+    "$(compgen -G "$signal_tmp/git-pr-submit.*" || true)"
+  _assert_eq "TERM leaves main and its commits untouched" "$signal_head" \
+    "$(git -C "$signal_repo" rev-parse HEAD)"
+  _assert_not_contains "TERM creates no pull request" \
+    "pr create" "$(cat "$signal_log" 2>/dev/null || true)"
+fi
 
 # Repository auto-merge is advisory outside the managed core set. Creating the
 # PR remains useful, but the diagnostic must make the required manual landing

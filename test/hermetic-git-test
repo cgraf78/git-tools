@@ -9,6 +9,10 @@ unset BASH_ENV
 failures=0
 sandbox=$(mktemp -d "${TMPDIR:-/tmp}/git-tools-hermetic-git-test.XXXXXX") || exit 1
 trap 'rm -rf -- "$sandbox"' EXIT
+# The helper resolves its root with `cd -P`; compare against the same
+# physical path (macOS TMPDIR is /var/..., a symlink to /private/var/...,
+# and often ends in a slash).
+sandbox=$(cd -P -- "$sandbox" && pwd) || exit 1
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM

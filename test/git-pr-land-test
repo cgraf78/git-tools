@@ -1759,6 +1759,90 @@ fi
 _assert_eq "ahead base: the local base is left alone" "$ah_local" \
   "$(git -C "$ah_repo" rev-parse refs/heads/main)"
 
+# From a linked worktree, a missing local base is created at the landed OID
+# with upstream config, even when stale config values were left behind.
+cb_repo=$(_tmpdir)
+cb_remote=$(_tmpdir)
+cb_linked="$(_tmpdir)/linked"
+cb_log=$(_tmpdir)/gh.log
+_init_repo "$cb_repo" "$cb_remote"
+git -C "$cb_repo" switch --quiet --detach
+git -C "$cb_repo" branch --quiet -D main
+git -C "$cb_repo" config --add branch.main.merge refs/heads/stale
+git -C "$cb_repo" worktree add --quiet "$cb_linked" feature
+cb_rc=0
+result=$(GH_LOG="$cb_log" PATH="$bin_dir:$PATH" _pr_land "$cb_linked" 4 2>&1) ||
+  cb_rc=$?
+_assert_eq "linked landing creates a missing base" 0 "$cb_rc"
+_assert_contains "linked landing reports creating the base" \
+  "created main at origin/main; no worktree has it checked out" "$result"
+_assert_eq "created base points at the landed remote OID" \
+  "$(git -C "$cb_remote" rev-parse refs/heads/main)" \
+  "$(git -C "$cb_repo" rev-parse refs/heads/main)"
+_assert_eq "created base replaces stale upstream config" \
+  "origin refs/heads/main" \
+  "$(git -C "$cb_repo" config --get-all branch.main.remote) $(git -C "$cb_repo" config --get-all branch.main.merge)"
+_assert_eq "creating the base keeps the linked worktree on its branch" feature \
+  "$(git -C "$cb_linked" branch --show-current)"
+
+# A bare repository with an index whose HEAD names the base is in use through
+# an external work tree, so a linked worktree leaves that base alone.
+bi_work=$(_tmpdir)
+bi_remote=$(_tmpdir)
+bi_gitdir="$(_tmpdir)/cfg.git"
+bi_linked="$(_tmpdir)/linked"
+bi_log=$(_tmpdir)/gh.log
+_init_repo "$bi_work" "$bi_remote"
+mv "$bi_work/.git" "$bi_gitdir"
+git --git-dir="$bi_gitdir" config core.bare true
+git --git-dir="$bi_gitdir" --work-tree="$bi_work" checkout --quiet -f main
+git --git-dir="$bi_gitdir" worktree add --quiet "$bi_linked" feature
+bi_old=$(git --git-dir="$bi_gitdir" rev-parse refs/heads/main)
+_advance_remote_main "$bi_remote" >/dev/null
+bi_rc=0
+result=$(GH_LOG="$bi_log" GH_PR_HEAD_OID="$(git --git-dir="$bi_gitdir" \
+  rev-parse refs/remotes/origin/feature)" PATH="$bin_dir:$PATH" \
+  _pr_land "$bi_linked" 4 2>&1) || bi_rc=$?
+_assert_eq "linked landing beside a bare external work tree succeeds" 0 "$bi_rc"
+_assert_contains "bare external work tree is reported with the index rule" \
+  "not updating main in $bi_gitdir; update that checkout with its own tooling (a bare repository with an index counts as checked out; remove $bi_gitdir/index if no work tree uses it)" \
+  "$result"
+_assert_eq "bare external work tree base is not moved" "$bi_old" \
+  "$(git --git-dir="$bi_gitdir" rev-parse refs/heads/main)"
+
+# A worktree whose directory is gone makes reservations uninspectable. Real and
+# dry runs refuse alike, with the same pruning advice cleanup gives.
+sw_repo=$(_tmpdir)
+sw_remote=$(_tmpdir)
+sw_linked="$(_tmpdir)/linked"
+sw_gone="$(_tmpdir)/gone"
+sw_log=$(_tmpdir)/gh.log
+_init_repo "$sw_repo" "$sw_remote"
+git -C "$sw_repo" switch --quiet --detach
+git -C "$sw_repo" worktree add --quiet --lock -b stale "$sw_gone"
+rm -rf "$sw_gone"
+git -C "$sw_repo" worktree add --quiet "$sw_linked" feature
+for sw_mode in real dry; do
+  sw_args=()
+  sw_prefix=""
+  if [[ "$sw_mode" == dry ]]; then
+    sw_args=(--dry-run)
+    sw_prefix="would refuse: "
+  fi
+  sw_rc=0
+  result=$(GH_LOG="$sw_log" PATH="$bin_dir:$PATH" \
+    _pr_land "$sw_linked" 4 ${sw_args[@]+"${sw_args[@]}"} 2>&1) || sw_rc=$?
+  _assert_eq "missing worktree: $sw_mode run refuses" 1 "$sw_rc"
+  _assert_contains "missing worktree: $sw_mode run gives pruning advice" \
+    "${sw_prefix}could not inspect worktrees (if worktree $sw_gone was deleted, run git worktree unlock $(printf %q "$sw_gone"), then git worktree prune)" \
+    "$result"
+done
+if [[ -s "$sw_log" ]]; then
+  _fail "missing worktree: nothing is merged"
+else
+  _pass "missing worktree: nothing is merged"
+fi
+
 # Dry runs refuse for local changes, in the base worktree or the current one,
 # exactly where the real run refuses.
 for dl_case in base current; do

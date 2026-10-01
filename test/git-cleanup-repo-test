@@ -355,11 +355,14 @@ _assert_contains "diagnoses a gone upstream without claiming it exists" \
   "keeping gone; merge not proven; upstream is gone; --gone selects it for cleanup" \
   "$result"
 _assert_contains "diagnoses an existing upstream" \
-  "keeping keep; merge not proven; upstream still exists" "$result"
+  "keeping keep; merge not proven; upstream origin/keep still exists as of the last fetch" \
+  "$result"
 _assert_contains "diagnoses a branch without an upstream" \
   "keeping local-only; merge not proven; no upstream is configured" "$result"
 _assert_contains "reports deletion summary" \
   "deleted 1 local branch(es), skipped 3" "$result"
+_assert_not_contains "summary of an updated base reports no skip" \
+  "main not updated" "$result"
 expected="$(printf 'gone\nkeep\nlocal-only\nmain')"
 _assert_eq "default cleanup deletes merged branch" "$expected" "$(_branches "$repo")"
 result=$(git -C "$repo" cleanup-repo --gone 2>&1)
@@ -1915,6 +1918,8 @@ _assert_eq "branch remains while worktree is kept" "$expected" "$(_branches "$wo
 result=$(git -C "$worktree_repo" cleanup-repo --all --remove-worktrees 2>&1)
 _assert_contains "remove-worktrees deletes clean checked-out branch" \
   "deleting work (all)" "$result"
+_assert_contains "remove-worktrees reports each removed worktree" \
+  "removed worktree $worktree_dir" "$result"
 _assert_eq "remove-worktrees deletes worktree branch" "main" \
   "$(_branches "$worktree_repo")"
 _assert_eq "remove-worktrees removes linked checkout" "missing" \
@@ -2788,6 +2793,9 @@ _assert_eq "linked cleanup beside a dirty base worktree succeeds" \
 _assert_contains "dirty base worktree update is skipped with a message" \
   "not updating main; worktree has local changes: $lw_dirty_repo" \
   "$result"
+_assert_contains "summary says the base was not updated and why" \
+  "done; deleted 0 local branch(es), skipped 1; main not updated (worktree has local changes: $lw_dirty_repo)" \
+  "$result"
 _assert_eq "dirty base worktree is not fast-forwarded" \
   "$lw_dirty_old" "$(git -C "$lw_dirty_repo" rev-parse refs/heads/main)"
 _assert_eq "dirty base worktree edit is preserved" "local edit" \
@@ -2845,6 +2853,10 @@ _assert_eq "linked cleanup beside a missing worktree succeeds" \
   0 "$lw_stale_rc"
 _assert_contains "uninspectable base reservation is reported" \
   "not updating main; could not inspect worktree reservations" "$result"
+_assert_contains "missing unlocked worktree hint suggests pruning" \
+  "if worktree $lw_stale_gone was deleted, run git worktree prune" "$result"
+_assert_not_contains "missing unlocked worktree hint does not suggest unlocking" \
+  "git worktree unlock" "$result"
 _assert_eq "uninspectable base reservation leaves the ref in place" \
   "$lw_stale_old" "$(git -C "$lw_stale_repo" rev-parse refs/heads/main)"
 
@@ -2936,6 +2948,8 @@ _assert_eq "linked cleanup beside a missing base worktree succeeds" \
   0 "$lw_gone_rc"
 _assert_contains "missing base worktree update is skipped with a message" \
   "not updating main; could not inspect worktree: $lw_gone_base" "$result"
+_assert_contains "missing base worktree hint suggests pruning" \
+  "if worktree $lw_gone_base was deleted, run git worktree prune" "$result"
 _assert_eq "missing base worktree leaves the ref in place" \
   "$lw_gone_old" "$(git -C "$lw_gone_repo" rev-parse refs/heads/main)"
 
@@ -3196,7 +3210,10 @@ _assert_eq "external main work tree files are untouched" \
 _assert_eq "external main work tree stays clean" "" \
   "$(git --git-dir="$df_gitdir" status --porcelain)"
 _assert_contains "external main work tree skip judges merges by the old base" \
-  "keeping feat; merge not proven" "$result"
+  "keeping feat; merge not proven against the local main, which was not updated" \
+  "$result"
+_assert_contains "external main work tree skip is in the summary" \
+  "main not updated (its checkout is left to its own tooling)" "$result"
 
 # A Git directory named `.git` can still point `core.worktree` elsewhere. Its
 # checkout lives in that other directory, so it is external as well.
@@ -3219,6 +3236,39 @@ _assert_eq "core.worktree under a .git directory keeps its base" \
   "$dg_old" "$(git -C "$dg_repo" rev-parse refs/heads/main)"
 _assert_eq "core.worktree under a .git directory keeps its files" \
   "$dg_home_before" "$(_worktree_snapshot "$dg_home")"
+
+# A main checkout with a separate Git directory records nowhere where its work
+# tree is, so from a linked worktree it can only be named by its Git directory.
+sx_remote=$(_tmpdir)
+sx_gitdir="$(_tmpdir)/repo.git"
+sx_repo="$(_tmpdir)/repo"
+sx_linked="$(_tmpdir)/linked"
+git init --quiet --bare --initial-branch=main "$sx_remote"
+git init --quiet --initial-branch=main --separate-git-dir "$sx_gitdir" \
+  "$sx_repo"
+git -C "$sx_repo" config user.email "test@test.com"
+git -C "$sx_repo" config user.name "Test"
+git -C "$sx_repo" config core.hooksPath /dev/null
+_commit_file "$sx_repo" README.md base base
+git -C "$sx_repo" remote add origin "$sx_remote"
+git -C "$sx_repo" push --quiet -u origin main
+sx_old=$(git -C "$sx_repo" rev-parse HEAD)
+git -C "$sx_repo" branch feat
+git -C "$sx_repo" worktree add --quiet "$sx_linked" feat
+_commit_file "$sx_linked" feat.txt feat "add feat"
+git -C "$sx_linked" push --quiet origin HEAD:main
+sx_before=$(_worktree_snapshot "$sx_repo")
+sx_rc=0
+result=$(git -C "$sx_linked" cleanup-repo 2>&1) || sx_rc=$?
+_assert_eq "linked cleanup beside a separate Git directory main succeeds" \
+  0 "$sx_rc"
+_assert_contains "separate Git directory main is named by its Git directory" \
+  "not updating main; it is checked out in the main worktree, whose work tree location is unknown (Git directory $sx_gitdir)" \
+  "$result"
+_assert_eq "separate Git directory main keeps its base" \
+  "$sx_old" "$(git -C "$sx_repo" rev-parse refs/heads/main)"
+_assert_eq "separate Git directory main keeps its files" \
+  "$sx_before" "$(_worktree_snapshot "$sx_repo")"
 
 # A bare repository whose HEAD names the base and that has an index is in use
 # through an external work tree, even though `git worktree list` shows no
@@ -3332,7 +3382,16 @@ rm -rf "$lk_gone"
 git -C "$lk_repo" worktree add --quiet "$lk_linked" feat
 result=$(git -C "$lk_linked" cleanup-repo 2>&1)
 _assert_contains "missing locked worktree hint mentions unlocking" \
-  "git worktree unlock" "$result"
+  "if worktree $lk_gone was deleted, run git worktree unlock $(printf %q "$lk_gone"), then git worktree prune" \
+  "$result"
+# The same advice comes from the main worktree, where no base reservation scan
+# runs but each branch's reservation check fails on the missing worktree.
+result=$(git -C "$lk_repo" cleanup-repo 2>&1)
+_assert_contains "missing locked worktree hint is the same from the main worktree" \
+  "if worktree $lk_gone was deleted, run git worktree unlock $(printf %q "$lk_gone"), then git worktree prune" \
+  "$result"
+_assert_occurrences "missing locked worktree hint is printed once" 1 \
+  "if worktree $lk_gone was deleted" "$result"
 
 # A main worktree whose path ends in a newline is still an ordinary main
 # worktree, so a linked worktree fast-forwards the base there.

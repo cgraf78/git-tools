@@ -860,8 +860,10 @@ gt_find_main_worktree() {
 #   worktree  ordinary worktree GT_BASE_SYNC_PATH has the base checked out
 #   external  main worktree GT_BASE_SYNC_PATH, whose files live outside its Git
 #             directory, has the base checked out; GT_BASE_SYNC_REASON is
-#             index when that is inferred from a bare repository's index, and
-#             current when it is the invoking checkout
+#             index when that is inferred from a bare repository's index,
+#             current when it is the invoking checkout, and unlocated when
+#             GT_BASE_SYNC_PATH is its Git directory because its work tree
+#             cannot be found (see gt_base_sync_external_message)
 #   reserved  a rebase or bisect in GT_BASE_SYNC_PATH reserves the base
 #   ref       nothing has the base checked out; only the ref may move
 #   unknown   GT_BASE_SYNC_REASON (inventory or reservations) is uninspectable
@@ -940,7 +942,13 @@ gt_plan_base_sync() {
       return 0
     fi
     GT_BASE_SYNC_ACTION=external
-    [[ -z "$top" ]] || GT_BASE_SYNC_PATH=$top
+    if [[ -n "$top" ]]; then
+      GT_BASE_SYNC_PATH=$top
+    else
+      # A separate Git directory or a symlinked `.git` records nothing about
+      # where its work tree is, so only the Git directory can be named.
+      GT_BASE_SYNC_REASON=unlocated
+    fi
     return 0
   fi
   if [[ "$GT_BASE_SYNC_MAY_SWITCH" == 1 && "$scan_main" != 1 ]]; then
@@ -991,6 +999,27 @@ gt_plan_base_sync() {
     fi
   fi
   GT_BASE_SYNC_ACTION=ref
+}
+
+# @brief Print why an `external` base sync leaves the base alone, for the
+# "not updating <base> ..." diagnostics of every base-updating command.
+gt_base_sync_external_message() {
+  local base="$1" path=$GT_BASE_SYNC_PATH
+
+  case "$GT_BASE_SYNC_REASON" in
+    index)
+      printf 'not updating %s in %s; update that checkout with its own tooling (a bare repository with an index counts as checked out; remove %s/index if no work tree uses it)\n' \
+        "$base" "$path" "$path"
+      ;;
+    unlocated)
+      printf 'not updating %s; it is checked out in the main worktree, whose work tree location is unknown (Git directory %s); update that checkout with its own tooling\n' \
+        "$base" "$path"
+      ;;
+    *)
+      printf 'not updating %s in %s; update that checkout with its own tooling\n' \
+        "$base" "$path"
+      ;;
+  esac
 }
 
 # @brief Set GT_WORKTREE_PATH to the worktree that has a branch checked out.
@@ -1050,6 +1079,8 @@ gt_find_worktree_reserving_branch() {
   local -a paths=()
 
   GT_WORKTREE_PATH=""
+  GT_WORKTREE_FAILED_PATH=""
+  GT_WORKTREE_FAILED_LOCKED=0
   _gt_materialize_worktree_list || return 1
 
   for field in "${_GT_WORKTREE_FIELDS[@]}"; do
@@ -1067,7 +1098,8 @@ gt_find_worktree_reserving_branch() {
 
   for path in "${paths[@]}"; do
     for state_file in rebase-merge/head-name rebase-apply/head-name; do
-      _gt_find_worktree_git_path "$path" "$state_file" || return 1
+      _gt_find_worktree_git_path "$path" "$state_file" ||
+        gt_record_uninspectable_worktree "$path" || return 1
       state_file=$GT_GIT_PATH
       [[ -f "$state_file" ]] || continue
       IFS= read -r state_head <"$state_file" || return 1
@@ -1077,7 +1109,8 @@ gt_find_worktree_reserving_branch() {
       fi
     done
 
-    _gt_find_worktree_git_path "$path" BISECT_START || return 1
+    _gt_find_worktree_git_path "$path" BISECT_START ||
+      gt_record_uninspectable_worktree "$path" || return 1
     state_file=$GT_GIT_PATH
     if [[ -f "$state_file" ]]; then
       IFS= read -r state_head <"$state_file" || return 1
@@ -1087,6 +1120,40 @@ gt_find_worktree_reserving_branch() {
       fi
     fi
   done
+}
+
+# @brief Record a worktree that could not be inspected for
+# gt_uninspectable_worktree_hint, noting whether the inventory marks it locked.
+# Always returns 1 so callers can chain it onto the failed inspection.
+gt_record_uninspectable_worktree() {
+  local field path=""
+
+  GT_WORKTREE_FAILED_PATH=$1
+  GT_WORKTREE_FAILED_LOCKED=0
+  for field in ${_GT_WORKTREE_FIELDS[@]+"${_GT_WORKTREE_FIELDS[@]}"}; do
+    case "$field" in
+      "worktree "*) path=${field#worktree } ;;
+      locked | "locked "*)
+        [[ "$path" != "$1" ]] || GT_WORKTREE_FAILED_LOCKED=1
+        ;;
+    esac
+  done
+  return 1
+}
+
+# @brief Print the advice for a worktree a reservation scan could not inspect,
+# usually one whose directory was deleted without `git worktree prune`. Every
+# command gives the same advice, whichever checkout it runs from.
+gt_uninspectable_worktree_hint() {
+  local path=$GT_WORKTREE_FAILED_PATH
+
+  [[ -n "$path" ]] || return 0
+  if [[ "$GT_WORKTREE_FAILED_LOCKED" == 1 ]]; then
+    printf 'if worktree %s was deleted, run git worktree unlock %q, then git worktree prune\n' \
+      "$path" "$path"
+  else
+    printf 'if worktree %s was deleted, run git worktree prune\n' "$path"
+  fi
 }
 
 # @brief Print the worktree path that owns or reserves the given branch.

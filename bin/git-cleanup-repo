@@ -282,7 +282,16 @@ _record_base_config() {
 # nothing to prove against, so that case cannot be skipped.
 _skip_base_update() {
   _keep_local_base "$*"
+  _base_skip_reason=$*
   _say "not updating $_base; $*"
+}
+
+# Remember a worktree a reservation scan could not inspect, so the advice for
+# it is printed once, the same way from every checkout.
+_note_uninspectable_worktree() {
+  [[ -z "$GT_WORKTREE_FAILED_PATH" ]] || {
+    _uninspectable_hint=$(gt_uninspectable_worktree_hint)
+  }
 }
 
 # A main worktree whose files live outside its Git directory belongs to the
@@ -291,17 +300,9 @@ _skip_base_update() {
 # (a Git launcher can route any directory into a dotfiles checkout of $HOME).
 # Branch deletion still proceeds, proven against the unchanged local base.
 _leave_external_base() {
-  local path=$GT_BASE_SYNC_PATH
-
-  _keep_local_base "its checkout in $path has other tooling"
-  if [[ "$GT_BASE_SYNC_REASON" == index ]]; then
-    _say "not updating $_base in $path; update that checkout with its own" \
-      "tooling (a bare repository with an index counts as checked out;" \
-      "remove $path/index if no work tree uses it)"
-  else
-    _say "not updating $_base in $path;" \
-      "update that checkout with its own tooling"
-  fi
+  _keep_local_base "its checkout has other tooling"
+  _base_skip_reason="its checkout is left to its own tooling"
+  _say "$(gt_base_sync_external_message "$_base")"
 }
 
 _keep_local_base() {
@@ -332,6 +333,7 @@ _fast_forward_base_worktree() {
   local path="$1" operation status
 
   if ! operation=$(gt_worktree_operation "$path"); then
+    gt_record_uninspectable_worktree "$path" || _note_uninspectable_worktree
     _skip_base_update "could not inspect worktree: $path"
     return 0
   fi
@@ -413,9 +415,8 @@ _update_base() {
       elif [[ "$GT_BASE_SYNC_REASON" == inventory ]]; then
         _skip_base_update "could not inspect worktrees"
       else
-        _skip_base_update "could not inspect worktree reservations" \
-          "(if a worktree directory was deleted, run git worktree prune," \
-          "after git worktree unlock if it is locked)"
+        _note_uninspectable_worktree
+        _skip_base_update "could not inspect worktree reservations"
       fi
       ;;
     *)
@@ -751,6 +752,7 @@ _remove_branch_worktree_if_needed() {
   local branch="$1" branch_oid="$2" operation path state
 
   if ! gt_find_worktree_reserving_branch "$branch"; then
+    _note_uninspectable_worktree
     _say "skipping $branch; could not inspect worktree reservations"
     return 1
   fi
@@ -858,12 +860,14 @@ _remove_branch_worktree_if_needed() {
     _say "skipping $branch; worktree could not be removed safely: $path"
     return 1
   fi
+  [[ "$_dry_run" == 1 ]] || _say "removed worktree $path"
 }
 
 _delete_branch() {
   local branch="$1" branch_oid="$2" reason="$3"
 
   if ! gt_find_worktree_reserving_branch "$branch"; then
+    _note_uninspectable_worktree
     _say "skipping $branch; could not recheck worktree reservations"
     return 1
   fi
@@ -895,7 +899,7 @@ _inventory_branches() {
   _upstreams=()
   _upstream_tracks=()
   records=$(git for-each-ref \
-    --format='%(refname)%09%(objectname)%09%(upstream)%09%(upstream:track)' \
+    --format='%(refname)%09%(objectname)%09%(upstream:short)%09%(upstream:track)' \
     refs/heads) ||
     _die "could not enumerate branches"
 
@@ -920,9 +924,14 @@ _inventory_branches() {
 }
 
 _cleanup_branches() {
-  local branch branch_oid upstream upstream_track reason index
-  local candidates=0 skipped=0
+  local branch branch_oid upstream upstream_track reason index summary
+  local candidates=0 skipped=0 unproven="merge not proven"
 
+  # Merges are proven against the local base. When its update was skipped,
+  # that base is older than the remote one, so a branch merged only remotely
+  # cannot be proven yet; say which base the proof used.
+  [[ -z "$_base_skip_reason" ]] ||
+    unproven="merge not proven against the local $_base, which was not updated"
   _inventory_branches
   for index in "${!_branches[@]}"; do
     branch=${_branches[$index]}
@@ -931,13 +940,16 @@ _cleanup_branches() {
     upstream_track=${_upstream_tracks[$index]}
 
     reason=$(_delete_reason "$branch_oid" "$upstream_track") || {
+      # Upstream state comes from remote-tracking refs as of the last fetch;
+      # cleanup fetches only the base, so say so rather than claim it is live.
       if [[ "$upstream_track" == "[gone]" ]]; then
-        _say "keeping $branch; merge not proven; upstream is gone;" \
+        _say "keeping $branch; $unproven; upstream is gone;" \
           "--gone selects it for cleanup"
       elif [[ -n "$upstream" ]]; then
-        _say "keeping $branch; merge not proven; upstream still exists"
+        _say "keeping $branch; $unproven; upstream $upstream still" \
+          "exists as of the last fetch"
       else
-        _say "keeping $branch; merge not proven; no upstream is configured"
+        _say "keeping $branch; $unproven; no upstream is configured"
       fi
       skipped=$((skipped + 1))
       continue
@@ -954,11 +966,17 @@ _cleanup_branches() {
     candidates=$((candidates + 1))
   done
 
+  [[ -z "$_uninspectable_hint" ]] || _say "$_uninspectable_hint"
   if [[ "$_dry_run" == 1 ]]; then
-    _say "done; would delete $candidates local branch(es), skipped $skipped"
+    summary="done; would delete $candidates local branch(es), skipped $skipped"
   else
-    _say "done; deleted $candidates local branch(es), skipped $skipped"
+    summary="done; deleted $candidates local branch(es), skipped $skipped"
   fi
+  # Exit 0 still means cleanup did what it safely could; the summary says when
+  # the local base was left behind the remote, so it is not taken as current.
+  [[ -z "$_base_skip_reason" ]] ||
+    summary="$summary; $_base not updated ($_base_skip_reason)"
+  _say "$summary"
 }
 
 _parse_args() {
@@ -1026,6 +1044,9 @@ _parse_args() {
   done
 }
 
+_base_skip_reason=""
+_uninspectable_hint=""
+GT_WORKTREE_FAILED_PATH=""
 _parse_args "$@"
 _ensure_repo_ready
 if [[ "$_remove_worktrees" == 1 ]]; then

@@ -57,7 +57,11 @@ reserves it or worktrees cannot be inspected; without a local base, it stops
 instead. From the main worktree,
 .B git switch
 itself refuses a base that a rebase or bisect reserves. Updates to a checkout other than the current one are always reported.
-The branch checked out in the current checkout is never deleted. Dry-run uses
+The branch checked out in the current checkout is never deleted. When the base
+update is skipped, the command still exits 0, but its final summary line ends
+with
+.RI "" base " not updated (" reason )
+so the base is not mistaken for current. Dry-run uses
 isolated temporary object storage.
 .PP
 The command retains the single raw configured fetch URL for both remote

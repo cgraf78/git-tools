@@ -433,6 +433,14 @@ says so whenever it updates a checkout other than the one it runs in:
   deleted worktree that was never pruned (or is locked), or Git older than
   2.36. Without a local base, cleanup stops instead.
 
+Whenever the base update is skipped, cleanup still exits 0, because it did
+everything it safely could, but its final `done; ...` line ends with
+`<base> not updated (<reason>)`, and branches it keeps are reported as not
+proven against that un-updated local base. Upstream state in those messages
+comes from remote-tracking refs as of the last fetch. When a worktree cannot
+be inspected, cleanup prints once how to prune it (and unlock it first if it
+is locked).
+
 Dry-run uses isolated temporary object storage, so it leaves no permanent
 objects or refs behind. The command retains the single raw configured fetch URL
 for both remote inspection and fetch, which lets Git apply any `insteadOf`

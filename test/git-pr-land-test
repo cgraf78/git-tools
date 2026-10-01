@@ -1976,6 +1976,49 @@ _assert_contains "base diverging after the merge reports incomplete cleanup" \
 _assert_eq "base diverging after the merge keeps the concurrent commit" \
   "$(cat "$dm_advanced")" "$(git -C "$dm_repo" rev-parse refs/heads/main)"
 
+# A remote PR head that no longer matches the PR's head OID refuses in real and
+# dry runs alike.
+mh_repo=$(_tmpdir)
+mh_remote=$(_tmpdir)
+mh_log=$(_tmpdir)/gh.log
+_init_repo "$mh_repo" "$mh_remote"
+mh_stale=$(git -C "$mh_repo" rev-parse main)
+for mh_mode in real dry; do
+  mh_args=()
+  mh_prefix=""
+  if [[ "$mh_mode" == dry ]]; then
+    mh_args=(--dry-run)
+    mh_prefix="would refuse: "
+  fi
+  mh_rc=0
+  result=$(GH_PR_HEAD_OID="$mh_stale" GH_LOG="$mh_log" PATH="$bin_dir:$PATH" \
+    _pr_land "$mh_repo" 4 ${mh_args[@]+"${mh_args[@]}"} 2>&1) || mh_rc=$?
+  _assert_eq "moved remote head: $mh_mode run refuses" 1 "$mh_rc"
+  _assert_contains "moved remote head: $mh_mode run reports why" \
+    "${mh_prefix}remote PR head origin/feature does not match PR #4 head OID" \
+    "$result"
+done
+if [[ -s "$mh_log" ]]; then
+  _fail "moved remote head: nothing is merged"
+else
+  _pass "moved remote head: nothing is merged"
+fi
+
+# A dry run inspects worktree status without refreshing and rewriting any
+# index, so it cannot collide with a concurrent commit on index.lock.
+ix_repo=$(_tmpdir)
+ix_remote=$(_tmpdir)
+ix_base="$(_tmpdir)/base"
+ix_log=$(_tmpdir)/gh.log
+_init_repo "$ix_repo" "$ix_remote"
+git -C "$ix_repo" worktree add --quiet "$ix_base" main
+touch -t 202001010000 "$ix_repo/feature.txt" "$ix_base/README.md"
+ix_before="$(cksum <"$ix_repo/.git/index") $(cksum <"$(git -C "$ix_base" rev-parse --git-path index)")"
+GH_LOG="$ix_log" PATH="$bin_dir:$PATH" _pr_land "$ix_repo" 4 --dry-run \
+  >/dev/null 2>&1
+_assert_eq "dry run leaves every index untouched" "$ix_before" \
+  "$(cksum <"$ix_repo/.git/index") $(cksum <"$(git -C "$ix_base" rev-parse --git-path index)")"
+
 # Dry runs refuse for local changes, in the base worktree or the current one,
 # exactly where the real run refuses.
 for dl_case in base current; do

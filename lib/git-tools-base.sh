@@ -13,6 +13,10 @@
 # the safety probe or retain GIT_DIR/GIT_WORK_TREE across repositories.
 _GT_GIT_LOCAL_ENV_VARS_READY=0
 _GT_GIT_LOCAL_ENV_VARS=""
+# Set by gt_record_uninspectable_worktree for gt_uninspectable_worktree_hint;
+# an inherited value must not name a worktree this run never inspected.
+GT_WORKTREE_FAILED_PATH=""
+GT_WORKTREE_FAILED_LOCKED=0
 
 # @brief Print the repository's default branch short name.
 # @param remote Remote to consult for the default head (defaults to origin).

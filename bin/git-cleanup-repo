@@ -1046,7 +1046,6 @@ _parse_args() {
 
 _base_skip_reason=""
 _uninspectable_hint=""
-GT_WORKTREE_FAILED_PATH=""
 _parse_args "$@"
 _ensure_repo_ready
 if [[ "$_remove_worktrees" == 1 ]]; then

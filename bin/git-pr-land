@@ -156,8 +156,11 @@ _local_branch_exists() {
   gt_find_ref_commit "refs/heads/$1"
 }
 
+# Optional locks off: a plain status refreshes and rewrites the index, which a
+# dry run must not do, and which could make a concurrent commit there fail on
+# index.lock.
 _worktree_status() {
-  gt_git_without_local_env -C "$1" status --porcelain
+  GIT_OPTIONAL_LOCKS=0 gt_git_without_local_env -C "$1" status --porcelain
 }
 
 # Stop before the merge. A dry run makes the same checks as the real run, so it
@@ -384,7 +387,8 @@ _require_expected_topology() {
 gt_require_repo
 gt_refuse_external_checkout "$_dry_run"
 gt_require_gh
-_status=$(git status --porcelain) || gt_die "could not inspect worktree status"
+_status=$(GIT_OPTIONAL_LOCKS=0 git status --porcelain) ||
+  gt_die "could not inspect worktree status"
 [[ -z "$_status" ]] || _refuse "worktree must be clean"
 
 _target_repo_status=0
@@ -453,35 +457,35 @@ if [[ -n "$_expected_base" ]]; then
   fi
 fi
 _preflight_local_plan "$_remote" "$_base_remote_url" "$_sync_base_branch"
-if [[ "$_dry_run" != 1 ]]; then
-  _head_remote=""
-  _head_remote_url=""
-  _head_remote_map_status=0
-  gt_find_pr_head_remote "$_head" "$_head_repo" "$_url" ||
-    _head_remote_map_status=$?
-  case "$_head_remote_map_status" in
+# The live PR head is checked in dry runs as well: it is read-only, and the
+# real run refuses on it before merging.
+_head_remote=""
+_head_remote_url=""
+_head_remote_map_status=0
+gt_find_pr_head_remote "$_head" "$_head_repo" "$_url" ||
+  _head_remote_map_status=$?
+case "$_head_remote_map_status" in
+  0)
+    _head_remote=$GT_PR_HEAD_REMOTE
+    _head_remote_url=$GT_PR_HEAD_REMOTE_URL
+    ;;
+  1) ;;
+  *) gt_die "could not inspect configured remotes for PR head $_head" ;;
+esac
+_remote_head_oid=""
+_remote_head_status=0
+if [[ -n "$_head_remote_url" ]]; then
+  gt_find_remote_ref_exact_url "$_head_remote_url" "refs/heads/$_head" ||
+    _remote_head_status=$?
+  case "$_remote_head_status" in
     0)
-      _head_remote=$GT_PR_HEAD_REMOTE
-      _head_remote_url=$GT_PR_HEAD_REMOTE_URL
+      _remote_head_oid=$GT_REMOTE_REF_OID
+      [[ "$_remote_head_oid" == "$_head_oid" ]] ||
+        _refuse "remote PR head $_head_remote/$_head does not match PR #$_number head OID"
       ;;
-    1) ;;
-    *) gt_die "could not inspect configured remotes for PR head $_head" ;;
+    1) _refuse "remote PR head does not exist: $_head_remote/$_head" ;;
+    *) gt_die "could not snapshot remote branch $_head_remote/$_head" ;;
   esac
-  _remote_head_oid=""
-  _remote_head_status=0
-  if [[ -n "$_head_remote_url" ]]; then
-    gt_find_remote_ref_exact_url "$_head_remote_url" "refs/heads/$_head" ||
-      _remote_head_status=$?
-    case "$_remote_head_status" in
-      0)
-        _remote_head_oid=$GT_REMOTE_REF_OID
-        [[ "$_remote_head_oid" == "$_head_oid" ]] ||
-          gt_die "remote PR head $_head_remote/$_head does not match PR #$_number head OID"
-        ;;
-      1) gt_die "remote PR head does not exist: $_head_remote/$_head" ;;
-      *) gt_die "could not snapshot remote branch $_head_remote/$_head" ;;
-    esac
-  fi
 fi
 _merge_args=(merge "$_number" "--$_method" --match-head-commit "$_head_oid")
 

@@ -3489,6 +3489,21 @@ child_env=$(env -u GIT_TOOLS_TEST_PATH_GIT -u GIT_EXEC_PATH \
 child_exec=$("$GIT_TOOLS_TEST_REAL_GIT" --exec-path)
 _assert_eq "started by name: children inherit Git's exec path and binary" \
   "$child_exec|$child_exec/git|$child_exec/git" "$child_env"
+# With a valid inherited GIT_EXEC_PATH, PATH gets that directory first once,
+# not again when it already leads.
+# shellcheck disable=SC2016 # expanded by the inner shell
+child_env=$(env -u GIT_TOOLS_TEST_PATH_GIT GIT_EXEC_PATH="$child_exec" \
+  PATH="$decoy_bin:$PATH" bash -c '. "$1/lib/git-tools-base.sh"
+    first=${PATH%%:*}; rest=${PATH#*:}
+    printf "%s|%s|%s\n" "$first" "$(type -P git)" "${rest%%:*}"' _ "$ROOT")
+_assert_eq "valid exec path: put first on PATH" \
+  "$child_exec|$child_exec/git|$decoy_bin" "$child_env"
+# shellcheck disable=SC2016 # expanded by the inner shell
+child_env=$(env -u GIT_TOOLS_TEST_PATH_GIT GIT_EXEC_PATH="$child_exec" \
+  PATH="$child_exec:$PATH" bash -c '. "$1/lib/git-tools-base.sh"
+    printf "%s\n" "$PATH"' _ "$ROOT")
+_assert_eq "valid exec path: not prepended again when already first" \
+  "$child_exec:$PATH" "$child_env"
 
 # Without a Git binary in Git's exec path at all, the tools say so once and use
 # PATH Git.
@@ -3510,10 +3525,19 @@ result=$(cd "$nogit_repo" && env -u GIT_TOOLS_TEST_PATH_GIT -u GIT_EXEC_PATH \
   "$ROOT/bin/git-cleanup-repo" 2>&1) || nogit_rc=$?
 _assert_eq "missing exec-path Git: cleanup still succeeds" 0 "$nogit_rc"
 _assert_contains "missing exec-path Git: falls back with a note" \
-  "git-tools: note: no git binary in Git exec path (unknown); using git from PATH" \
+  "git-tools: note: no git binary in Git exec path $nogit_exec; using git from PATH" \
   "$result"
 _assert_occurrences "missing exec-path Git: the note is printed once" 1 \
   "git-tools: note:" "$result"
+# A stale inherited exec path is dropped in fallback mode, so the PATH Git
+# finds its own helpers again.
+# shellcheck disable=SC2016 # expanded by the inner shell
+result=$(env -u GIT_TOOLS_TEST_PATH_GIT GIT_EXEC_PATH="$nogit_exec/gone" \
+  NOGIT_EXEC="$nogit_exec" PATH="$nogit_bin:$PATH" \
+  bash -c '. "$1/lib/git-tools-base.sh" 2>/dev/null
+    printf "%s\n" "${GIT_EXEC_PATH-unset}"' _ "$ROOT")
+_assert_eq "missing exec-path Git: a stale GIT_EXEC_PATH is not passed on" \
+  unset "$result"
 
 # A main checkout with a separate Git directory records nowhere where its work
 # tree is, so from a linked worktree it can only be named by its Git directory.

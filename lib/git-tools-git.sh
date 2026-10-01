@@ -34,8 +34,9 @@ if [[ "${_GT_GIT_RESOLVED:-}" != "$$" ]]; then
       # A stale GIT_EXEC_PATH (inherited from a hook or an editor that Git
       # started, say, after a Git upgrade removed that directory) would only
       # echo back, so ask without it.
-      _gt_git_dir=$(env -u GIT_EXEC_PATH git --exec-path 2>/dev/null) ||
-        _gt_git_dir=""
+      _gt_git_reported=$(env -u GIT_EXEC_PATH git --exec-path 2>/dev/null) ||
+        _gt_git_reported=""
+      _gt_git_dir=$_gt_git_reported
       [[ -n "$_gt_git_dir" && -f "$_gt_git_dir/git" &&
         -x "$_gt_git_dir/git" ]] || _gt_git_dir=""
     fi
@@ -47,10 +48,13 @@ if [[ "${_GT_GIT_RESOLVED:-}" != "$$" ]]; then
         *) export PATH="$_gt_git_dir:$PATH" ;;
       esac
     elif command -v git >/dev/null 2>&1; then
+      # Name the directory Git itself reported, and drop a stale inherited one
+      # so the fallback Git can still find its own helpers.
       printf 'git-tools: note: no git binary in Git exec path %s; using git from PATH\n' \
-        "${GIT_EXEC_PATH:-(unknown)}" >&2
+        "${_gt_git_reported:-${GIT_EXEC_PATH:-(unknown)}}" >&2
+      unset GIT_EXEC_PATH
     fi
-    unset _gt_git_dir
+    unset _gt_git_dir _gt_git_reported
   fi
   _GT_GIT_RESOLVED=$$
 fi

@@ -3456,15 +3456,61 @@ for decoy_case in by-name via-git; do
   fi
 done
 
-# Without a Git binary in Git's exec path, the tools say so and use PATH Git.
+# A stale GIT_EXEC_PATH, inherited after a Git upgrade removed it, is not
+# trusted blindly: the lookup asks Git again without it.
+stale_exec=$(_tmpdir)
+stale_repo=$(_merged_feature_repo)
+stale_log="$(_tmpdir)/launcher.log"
+: >"$stale_log"
+stale_other=$(_merged_feature_repo)
+stale_rc=0
+result=$(cd "$stale_repo" && env -u GIT_TOOLS_TEST_PATH_GIT \
+  GIT_EXEC_PATH="$stale_exec" DECOY_LOG="$stale_log" \
+  DECOY_GITDIR="$stale_other/.git" DECOY_REAL_GIT="$GIT_TOOLS_TEST_REAL_GIT" \
+  PATH="$decoy_bin:$PATH" "$ROOT/bin/git-cleanup-repo" 2>&1) || stale_rc=$?
+_assert_eq "stale exec path: cleanup succeeds" 0 "$stale_rc"
+_assert_not_contains "stale exec path: no fallback note" "git-tools: note:" \
+  "$result"
+_assert_eq "stale exec path: the PATH launcher is only asked for the exec path" \
+  "--exec-path" "$(cat "$stale_log")"
+_assert_eq "stale exec path: the invoked repository is cleaned" main \
+  "$(_branches "$stale_repo")"
+
+# Started by name, a command gets the environment Git gives its subcommands:
+# GIT_EXEC_PATH exported and that directory first on PATH, so its children
+# (other git-tools commands, gh) also reach real Git without another lookup.
+# shellcheck disable=SC2016 # expanded by the inner shell
+child_env=$(env -u GIT_TOOLS_TEST_PATH_GIT -u GIT_EXEC_PATH \
+  DECOY_LOG=/dev/null DECOY_GITDIR=/nonexistent \
+  DECOY_REAL_GIT="$GIT_TOOLS_TEST_REAL_GIT" PATH="$decoy_bin:$PATH" \
+  bash -c '. "$1/lib/git-tools-base.sh"
+    printf "%s|%s|%s\n" "$GIT_EXEC_PATH" "$(type -P git)" "$GT_GIT"' \
+  _ "$ROOT")
+child_exec=$("$GIT_TOOLS_TEST_REAL_GIT" --exec-path)
+_assert_eq "started by name: children inherit Git's exec path and binary" \
+  "$child_exec|$child_exec/git|$child_exec/git" "$child_env"
+
+# Without a Git binary in Git's exec path at all, the tools say so once and use
+# PATH Git.
 nogit_exec=$(_tmpdir)
+nogit_bin=$(_tmpdir)
+cat >"$nogit_bin/git" <<'SHIM'
+#!/usr/bin/env bash
+if [[ "${1:-}" == --exec-path ]]; then
+  printf '%s\n' "$NOGIT_EXEC"
+  exit 0
+fi
+exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
+SHIM
+chmod +x "$nogit_bin/git"
 nogit_repo=$(_merged_feature_repo)
 nogit_rc=0
-result=$(cd "$nogit_repo" && env -u GIT_TOOLS_TEST_PATH_GIT \
-  GIT_EXEC_PATH="$nogit_exec" "$ROOT/bin/git-cleanup-repo" 2>&1) || nogit_rc=$?
+result=$(cd "$nogit_repo" && env -u GIT_TOOLS_TEST_PATH_GIT -u GIT_EXEC_PATH \
+  NOGIT_EXEC="$nogit_exec" PATH="$nogit_bin:$PATH" \
+  "$ROOT/bin/git-cleanup-repo" 2>&1) || nogit_rc=$?
 _assert_eq "missing exec-path Git: cleanup still succeeds" 0 "$nogit_rc"
 _assert_contains "missing exec-path Git: falls back with a note" \
-  "git-tools: note: no git binary in Git exec path $nogit_exec; using git from PATH" \
+  "git-tools: note: no git binary in Git exec path (unknown); using git from PATH" \
   "$result"
 _assert_occurrences "missing exec-path Git: the note is printed once" 1 \
   "git-tools: note:" "$result"

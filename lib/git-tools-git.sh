@@ -11,9 +11,13 @@
 #
 # The binary is resolved once per process when this file is first sourced:
 # from GIT_EXEC_PATH, which Git exports to the commands it runs (so `git
-# pr-land` costs nothing), or else from one `git --exec-path`. Linux, Apple,
-# Homebrew, and Termux Git all ship `git` in that directory. When it is missing
-# there, git-tools says so and falls back to `git` on PATH.
+# pr-land` costs nothing), or else from one `git --exec-path` with any stale
+# GIT_EXEC_PATH cleared. Linux, Apple, Homebrew, and Termux Git all ship `git`
+# in that directory. A command started by name then gets the environment Git
+# gives its subcommands: GIT_EXEC_PATH exported and that directory first on
+# PATH, so child commands (other git-tools, gh) skip the lookup and reach real
+# Git too. When no exec-path binary exists, git-tools says so and falls back to
+# `git` on PATH.
 #
 # GIT_TOOLS_TEST_PATH_GIT=1 is an explicit test override: test suites put fake
 # `git` programs on PATH to inject failures, and this keeps them in the loop.
@@ -22,18 +26,31 @@ if [[ "${_GT_GIT_RESOLVED:-}" != "$$" ]]; then
   # An inherited GT_GIT is never trusted; it is recomputed for this process.
   GT_GIT=git
   if [[ "${GIT_TOOLS_TEST_PATH_GIT:-}" != 1 ]]; then
-    _gt_git_exec_path=${GIT_EXEC_PATH:-}
-    [[ -n "$_gt_git_exec_path" ]] ||
-      _gt_git_exec_path=$(command git --exec-path 2>/dev/null) ||
-      _gt_git_exec_path=""
-    if [[ -n "$_gt_git_exec_path" && -f "$_gt_git_exec_path/git" &&
-      -x "$_gt_git_exec_path/git" ]]; then
-      GT_GIT=$_gt_git_exec_path/git
+    # A usable GIT_EXEC_PATH answers without starting a process.
+    if [[ -n "${GIT_EXEC_PATH:-}" && -f "$GIT_EXEC_PATH/git" &&
+      -x "$GIT_EXEC_PATH/git" ]]; then
+      _gt_git_dir=$GIT_EXEC_PATH
+    else
+      # A stale GIT_EXEC_PATH (inherited from a hook or an editor that Git
+      # started, say, after a Git upgrade removed that directory) would only
+      # echo back, so ask without it.
+      _gt_git_dir=$(env -u GIT_EXEC_PATH git --exec-path 2>/dev/null) ||
+        _gt_git_dir=""
+      [[ -n "$_gt_git_dir" && -f "$_gt_git_dir/git" &&
+        -x "$_gt_git_dir/git" ]] || _gt_git_dir=""
+    fi
+    if [[ -n "$_gt_git_dir" ]]; then
+      GT_GIT=$_gt_git_dir/git
+      export GIT_EXEC_PATH="$_gt_git_dir"
+      case "$PATH" in
+        "$_gt_git_dir" | "$_gt_git_dir":*) ;;
+        *) export PATH="$_gt_git_dir:$PATH" ;;
+      esac
     elif command -v git >/dev/null 2>&1; then
       printf 'git-tools: note: no git binary in Git exec path %s; using git from PATH\n' \
-        "${_gt_git_exec_path:-(unknown)}" >&2
+        "${GIT_EXEC_PATH:-(unknown)}" >&2
     fi
-    unset _gt_git_exec_path
+    unset _gt_git_dir
   fi
   _GT_GIT_RESOLVED=$$
 fi

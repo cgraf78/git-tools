@@ -445,6 +445,7 @@ A dry run stops, with exit status 2 and `would refuse: <reason>`, wherever the
 real run refuses before changing anything (a dirty worktree, an active
 operation, or a local base that cannot fast-forward), instead of describing a
 cleanup that would not happen.
+
 Dry-run uses isolated temporary object storage, so it leaves no permanent
 objects or refs behind. The command retains the single raw configured fetch URL
 for both remote inspection and fetch, which lets Git apply any `insteadOf`
@@ -652,8 +653,10 @@ embedding contract.
 - Bash
 - Git. The commands run the `git` binary in Git's own exec path
   (`git --exec-path`), not whichever `git` comes first on `PATH`, so a
-  launcher or wrapper there cannot redirect their repository operations. If
-  that binary is missing they print a note and use `git` from `PATH`.
+  launcher or wrapper there cannot redirect their repository operations.
+  Started by name, they also export `GIT_EXEC_PATH` and put that directory
+  first on `PATH`, as Git does for its subcommands. If that binary is missing
+  they print a note and use `git` from `PATH`.
 - [`gh`](https://cli.github.com/), authenticated for the repository's GitHub
   host, for the `git pr-*` commands; `git repo-state`, `git branch-audit`, and
   `git worktree-audit` also use it when available to show PR details
@@ -754,6 +757,7 @@ test/shell-integration-test
 If `git-absorb` is not installed, the test suite verifies the dependency error
 path and skips rewrite integration cases.
 
-Suites inject failures with fake `git` programs on `PATH`. `test/run` therefore
-exports `GIT_TOOLS_TEST_PATH_GIT=1`, a test-only override that makes the
-commands use `git` from `PATH`; cases that test the exec-path lookup unset it.
+Suites inject failures with fake `git` programs on `PATH`. `test/run` and the
+shared `test/lib/test-temp.sh` therefore export `GIT_TOOLS_TEST_PATH_GIT=1`, a
+test-only override that makes the commands use `git` from `PATH`; cases that
+test the exec-path lookup unset it.

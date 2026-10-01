@@ -119,7 +119,7 @@ EOF
 chmod +x "$fixture/support/sync-launcher-bootstrap" "$fixture/test/run" \
   "$fixture/test/suite"
 for suite in runner launcher-bootstrap install extras shell-integration \
-  test-temp one two; do
+  test-temp hermetic-git one two; do
   cp "$fixture/test/suite" "$fixture/test/$suite-test"
 done
 
@@ -140,7 +140,7 @@ fi
 previous=0
 ordered=1
 for suite in runner launcher-bootstrap install extras shell-integration \
-  test-temp one two; do
+  test-temp hermetic-git one two; do
   line=$(grep -n -F -x "$suite-output" "$output" | cut -d: -f1)
   if [[ -z "$line" || "$line" -le "$previous" ]]; then
     ordered=0

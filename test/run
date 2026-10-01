@@ -20,6 +20,7 @@ test_files=(
   "$ROOT/test/extras-test"
   "$ROOT/test/shell-integration-test"
   "$ROOT/test/test-temp-test"
+  "$ROOT/test/hermetic-git-test"
 )
 for command in "${commands[@]}"; do
   test_files+=("$ROOT/test/$command-test")

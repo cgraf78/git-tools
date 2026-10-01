@@ -35,16 +35,24 @@ creates or fast-forwards the base using that same object ID. A divergent base
 fails before the current branch or local base is changed. A worktree that has
 the base checked out is fast-forwarded in place with
 .BR "git merge \-\-ff\-only" ;
-another worktree that has local changes or an active operation, or cannot be
-inspected, is left alone, and
-merges are then proven against the unchanged local base. Otherwise the main
-worktree switches to the base. A linked worktree never switches to the base;
-it advances only the base ref with an expected-old-value
+another worktree that has local changes or an active operation, cannot be
+inspected, or refuses the fast-forward is left alone, and merges are then
+proven against the unchanged local base. A main worktree whose files live
+outside its Git directory, such as a
+.B core.worktree
+checkout or a bare repository with an index used through an external work
+tree, is never updated from another checkout; cleanup reports that it is not
+updating the base there and leaves that checkout to its own tooling. Otherwise
+the main worktree switches to the base. A linked worktree never switches to
+the base; it advances only the base ref with an expected-old-value
 .BR "git update\-ref" ,
 by fast-forward only, and leaves the base alone when a rebase or bisect
 reserves it or worktrees cannot be inspected; without a local base, it stops
-instead. Dry-run uses isolated
-temporary object storage.
+instead. From the main worktree,
+.B git switch
+itself refuses a base that a rebase or bisect reserves. Updates to a checkout other than the current one are always reported.
+The branch checked out in the current checkout is never deleted. Dry-run uses
+isolated temporary object storage.
 .PP
 The command retains the single raw configured fetch URL for both remote
 inspection and fetch, allowing Git to apply any

@@ -253,13 +253,12 @@ _preflight_base() {
   esac
 }
 
-# Record how the invoking checkout relates to the repository. These answers
-# come from HEAD and the Git directory rather than from `git worktree list`
-# paths: that list names a main worktree by its Git directory when the
-# checkout uses a separate Git directory or `core.worktree` (submodules,
-# dotfiles-style repositories), and Git before 2.36 cannot produce it at all.
+# Record the invoking checkout and its branch. The branch comes from HEAD
+# rather than from `git worktree list`, which names a main worktree by its Git
+# directory when the checkout uses a separate Git directory or `core.worktree`,
+# omits a bare repository's external work tree, and needs Git 2.36 or newer.
 _locate_worktrees() {
-  local common_dir git_dir head_status=0
+  local head_status=0
 
   gt_find_current_worktree || _die "could not resolve current worktree"
   _current_worktree=$GT_WORKTREE_PATH
@@ -269,12 +268,6 @@ _locate_worktrees() {
     1) _current_branch="" ;;
     *) _die "could not inspect current branch" ;;
   esac
-  git_dir=$(git rev-parse --git-dir) ||
-    _die "could not resolve repository Git directory"
-  common_dir=$(git rev-parse --git-common-dir) ||
-    _die "could not resolve repository common Git directory"
-  _in_main_worktree=0
-  [[ ! "$git_dir" -ef "$common_dir" ]] || _in_main_worktree=1
   _switched_to_base=0
 }
 
@@ -288,9 +281,30 @@ _record_base_config() {
 # base, which can only keep more branches. Without a local base there is
 # nothing to prove against, so that case cannot be skipped.
 _skip_base_update() {
+  _keep_local_base "$*"
+  _say "not updating $_base; $*"
+}
+
+# A main worktree whose files live outside its Git directory belongs to the
+# tooling that manages it, which may validate, back up, or normalize what it
+# checks out, so cleanup never merges into it from another checkout.
+_leave_external_base() {
+  local path=$GT_BASE_SYNC_PATH
+
+  _keep_local_base "its checkout in $path has other tooling"
+  if [[ "$GT_BASE_SYNC_REASON" == index ]]; then
+    _say "not updating $_base in $path; update that checkout with its own" \
+      "tooling (a bare repository with an index counts as checked out;" \
+      "remove $path/index if no work tree uses it)"
+  else
+    _say "not updating $_base in $path;" \
+      "update that checkout with its own tooling"
+  fi
+}
+
+_keep_local_base() {
   [[ "$_base_local_exists" == 1 ]] ||
     _die "could not create local base branch $_base; $*"
-  _say "not updating $_base; $*"
   _planned_base_oid=$_local_base_oid
 }
 
@@ -315,7 +329,6 @@ _switch_to_base() {
 _fast_forward_base_worktree() {
   local path="$1" operation status
 
-  [[ "$_planned_base_oid" != "$_local_base_oid" ]] || return 0
   if ! operation=$(gt_worktree_operation "$path"); then
     _skip_base_update "could not inspect worktree: $path"
     return 0
@@ -339,14 +352,25 @@ _fast_forward_base_worktree() {
     _run git -C "$path" merge --quiet --ff-only "$_remote_oid"
     return 0
   fi
-  gt_git_without_local_env -C "$path" merge --quiet --ff-only "$_remote_oid" ||
-    _die "could not fast-forward $_base in worktree $path"
+  if ! gt_git_without_local_env -C "$path" merge --quiet --ff-only \
+    "$_remote_oid"; then
+    # A fast-forward refuses before changing anything when, for example, an
+    # untracked file hidden by status.showUntrackedFiles is in the way. That
+    # is the same kind of local state as the changes skipped above.
+    if ! _local_branch_exists "$_base" ||
+      [[ "$GT_REF_OID" != "$_local_base_oid" ]]; then
+      _die "could not fast-forward $_base in worktree $path"
+    fi
+    _skip_base_update "could not fast-forward it in worktree $path"
+    return 0
+  fi
+  _say "fast-forwarded $_base in worktree $path"
 }
 
-# No worktree has the base checked out, so a linked worktree can advance the
-# ref directly instead of switching away from its own branch. Preflight proved
-# the move is a fast-forward; the old-value guard keeps a concurrent ref update
-# from being overwritten.
+# Nothing has the base checked out or reserved, so a linked worktree can
+# advance the ref directly instead of switching away from its own branch.
+# Preflight proved the move is a fast-forward; the old-value guard keeps a
+# concurrent ref update from being overwritten.
 _fast_forward_base_ref() {
   local message="cleanup-repo: fast-forward $_base to $_remote/$_base"
 
@@ -354,24 +378,15 @@ _fast_forward_base_ref() {
     _run git update-ref -m "$message" "refs/heads/$_base" "$_remote_oid" "" ||
       _die "could not create local base branch: $_base"
     _record_base_config
-    return 0
-  fi
-  [[ "$_planned_base_oid" != "$_local_base_oid" ]] || return 0
-  # A rebase or bisect can reserve the base while its HEAD is detached, and
-  # moving the ref underneath it would corrupt that operation. A worktree whose
-  # directory is gone makes reservations uninspectable until it is pruned.
-  if ! gt_find_worktree_reserving_branch "$_base"; then
-    _skip_base_update "could not inspect worktree reservations" \
-      "(see git worktree prune)"
-    return 0
-  fi
-  if [[ -n "$GT_WORKTREE_PATH" ]]; then
-    _skip_base_update "reserved by worktree $GT_WORKTREE_PATH"
+    [[ "$_dry_run" == 1 ]] ||
+      _say "created $_base at $_remote/$_base; no worktree has it checked out"
     return 0
   fi
   _run git update-ref -m "$message" "refs/heads/$_base" \
     "$_planned_base_oid" "$_local_base_oid" ||
     _die "could not fast-forward local base branch: $_base"
+  [[ "$_dry_run" == 1 ]] ||
+    _say "fast-forwarded $_base to $_remote/$_base; no worktree has it checked out"
 }
 
 _update_base() {
@@ -379,28 +394,44 @@ _update_base() {
   _resolve_local_base
   _preflight_base
 
-  # Only the worktree that has the base checked out may advance it with a
-  # merge, and only the main worktree may take the base over. A linked
-  # worktree that switched to the base would release its own branch for
-  # deletion and lock the main worktree out of the base.
-  if [[ -n "$_current_branch" && "$_current_branch" == "$_base" ]]; then
-    _switch_to_base
-  elif ! gt_find_worktree_for_branch "$_base" 2>/dev/null; then
-    # Without an inventory (for example Git before 2.36), the main worktree
-    # keeps its historical switch, which Git itself refuses when another
-    # worktree has the base checked out.
-    if [[ "$_in_main_worktree" == 1 ]]; then
-      _switch_to_base
-    elif [[ "$_planned_base_oid" != "$_local_base_oid" ]]; then
-      _skip_base_update "could not inspect worktrees"
-    fi
-  elif [[ -n "$GT_WORKTREE_PATH" ]]; then
-    _fast_forward_base_worktree "$GT_WORKTREE_PATH"
-  elif [[ "$_in_main_worktree" == 1 ]]; then
-    _switch_to_base
-  else
-    _fast_forward_base_ref
-  fi
+  # `git switch` refuses a base another worktree reserves, so the main
+  # worktree does not need the slower reservation scan.
+  gt_plan_base_sync "$_base" || _die "could not inspect current worktree"
+  case "$GT_BASE_SYNC_ACTION" in
+    current | switch) _switch_to_base ;;
+    unknown)
+      # Without an inventory (for example Git before 2.36), the main worktree
+      # keeps its historical switch, which Git itself refuses when another
+      # worktree has the base checked out or reserved.
+      if [[ "$GT_BASE_SYNC_REASON" == inventory &&
+        "$GT_BASE_SYNC_IN_MAIN" == 1 ]]; then
+        _switch_to_base
+      elif [[ "$_planned_base_oid" == "$_local_base_oid" ]]; then
+        :
+      elif [[ "$GT_BASE_SYNC_REASON" == inventory ]]; then
+        _skip_base_update "could not inspect worktrees"
+      else
+        _skip_base_update "could not inspect worktree reservations" \
+          "(if a worktree directory was deleted, run git worktree prune," \
+          "after git worktree unlock if it is locked)"
+      fi
+      ;;
+    *)
+      # Everything else leaves the invoking checkout alone, so there is
+      # nothing to do unless the base ref has to move.
+      if [[ "$_planned_base_oid" != "$_local_base_oid" ]]; then
+        case "$GT_BASE_SYNC_ACTION" in
+          worktree) _fast_forward_base_worktree "$GT_BASE_SYNC_PATH" ;;
+          ref) _fast_forward_base_ref ;;
+          reserved)
+            _skip_base_update "reserved by worktree $GT_BASE_SYNC_PATH"
+            ;;
+          external) _leave_external_base ;;
+          *) _die "could not plan the base update" ;;
+        esac
+      fi
+      ;;
+  esac
 
   if [[ "$_dry_run" == 1 ]]; then
     _base_oid=$_planned_base_oid
@@ -722,7 +753,6 @@ _remove_branch_worktree_if_needed() {
     return 1
   fi
   path=$GT_WORKTREE_PATH
-  [[ -n "$path" ]] || return 0
 
   # A dry run does not really switch to the base, but the real run releases
   # the branch the current worktree leaves, so report that outcome.
@@ -730,20 +760,25 @@ _remove_branch_worktree_if_needed() {
     -n "$_current_branch" && "$branch" == "$_current_branch" ]]; then
     return 0
   fi
-  # Removing the invoking worktree would delete the caller's own checkout,
-  # and Git refuses to remove the main worktree only after cache pruning has
-  # already touched it. Neither is eligible, even with --remove-worktrees. The
-  # branch-name check covers checkouts listed under their Git directory.
-  if [[ "$path" -ef "$_current_worktree" ]] ||
-    [[ "$_switched_to_base" != 1 && -n "$_current_branch" &&
-      "$branch" == "$_current_branch" ]]; then
+  # Never delete the invoking checkout's branch, and never remove that
+  # checkout. The branch-name check runs first because the inventory can miss
+  # it entirely: a bare repository used through GIT_DIR and GIT_WORK_TREE has
+  # no branch line, and other main worktrees are listed by their Git
+  # directory. The path check covers a branch the current worktree reserves
+  # without having it checked out, such as during a detached bisect.
+  if [[ "$_switched_to_base" != 1 && -n "$_current_branch" &&
+    "$branch" == "$_current_branch" ]] ||
+    [[ -n "$path" && "$path" -ef "$_current_worktree" ]]; then
     _say "keeping $branch; checked out in the current worktree"
     return 1
   fi
+  [[ -n "$path" ]] || return 0
   if [[ "$_remove_worktrees" != 1 ]]; then
     _say "skipping $branch; checked out in worktree $path"
     return 1
   fi
+  # Git refuses to remove the main worktree only after cache pruning has
+  # already touched it, so it is never eligible, even with --remove-worktrees.
   # Both paths come from the same inventory, so they agree even when the main
   # worktree is listed by its Git directory.
   if ! gt_find_main_worktree; then

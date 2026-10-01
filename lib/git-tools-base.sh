@@ -798,6 +798,154 @@ gt_find_main_worktree() {
   return 1
 }
 
+# @brief Decide how the invoking checkout may advance a local base branch.
+# @param $1 Base branch name.
+# @param $2 Optional: 1 to inspect rebase and bisect reservations even when the
+#   main worktree could simply switch. `git switch` refuses a reserved branch
+#   on its own, so only callers that must refuse before an irreversible step
+#   need to pay for scanning every worktree.
+#
+# Only the checkout that has the base checked out may merge into it, and only
+# the main worktree may take the base over: a linked worktree that switched to
+# the base would release its own branch and lock the main worktree out of the
+# base. A main worktree whose files live outside its Git directory (a
+# `core.worktree` or separate-Git-directory checkout, or a bare repository used
+# through an external work tree) is left to the tooling that manages it, which
+# may validate, back up, or normalize what it checks out.
+#
+# Facts about the invoking checkout come from HEAD and the Git directories, not
+# from `git worktree list` paths, which name such main worktrees by their Git
+# directory and list a bare repository's external work tree not at all.
+#
+# Sets GT_BASE_SYNC_IN_MAIN to 1 when the invoking checkout is the main
+# worktree, and GT_BASE_SYNC_ACTION to one of:
+#   current   the invoking checkout has the base checked out
+#   switch    the invoking main worktree may check the base out
+#   worktree  ordinary worktree GT_BASE_SYNC_PATH has the base checked out
+#   external  main worktree GT_BASE_SYNC_PATH, whose files live outside its Git
+#             directory, has the base checked out; GT_BASE_SYNC_REASON is
+#             index when that is inferred from a bare repository's index
+#   reserved  a rebase or bisect in GT_BASE_SYNC_PATH reserves the base
+#   ref       nothing has the base checked out; only the ref may move
+#   unknown   GT_BASE_SYNC_REASON (inventory or reservations) is uninspectable
+# Returns nonzero only when the invoking checkout itself cannot be inspected.
+# shellcheck disable=SC2034 # results are consumed by base-updating commands
+gt_plan_base_sync() {
+  local base="$1" scan_main="${2:-0}" common_dir field git_dir head index=0
+  local head_status=0 main_bare=0 main_path="" path="" target="" top
+
+  GT_BASE_SYNC_ACTION=""
+  GT_BASE_SYNC_PATH=""
+  GT_BASE_SYNC_REASON=""
+  GT_BASE_SYNC_IN_MAIN=0
+  head=$(git symbolic-ref -q HEAD) || head_status=$?
+  case "$head_status" in
+    0) ;;
+    1) head="" ;;
+    *) return 1 ;;
+  esac
+  git_dir=$(git rev-parse --git-dir) || return 1
+  common_dir=$(git rev-parse --git-common-dir) || return 1
+  [[ ! "$git_dir" -ef "$common_dir" ]] || GT_BASE_SYNC_IN_MAIN=1
+  if [[ "$head" == "refs/heads/$base" ]]; then
+    GT_BASE_SYNC_ACTION=current
+    return 0
+  fi
+
+  if ! _gt_materialize_worktree_list 2>/dev/null; then
+    GT_BASE_SYNC_ACTION=unknown
+    GT_BASE_SYNC_REASON=inventory
+    return 0
+  fi
+  # Git always lists the main worktree first.
+  for field in ${_GT_WORKTREE_FIELDS[@]+"${_GT_WORKTREE_FIELDS[@]}"}; do
+    case "$field" in
+      "worktree "*)
+        path=${field#worktree }
+        index=$((index + 1))
+        [[ "$index" != 1 ]] || main_path=$path
+        ;;
+      bare) [[ "$index" != 1 ]] || main_bare=1 ;;
+      "branch refs/heads/$base") [[ -n "$target" ]] || target=$path ;;
+    esac
+  done
+
+  if [[ -n "$target" ]]; then
+    GT_BASE_SYNC_PATH=$target
+    GT_BASE_SYNC_ACTION=worktree
+    [[ "$target" == "$main_path" ]] || return 0
+    # Git lists an ordinary main worktree as the parent of its `.git`
+    # directory and any other main worktree as the Git directory itself. A Git
+    # directory named `.git` can still carry `core.worktree`, so the checkout
+    # must also resolve to that parent. When it resolves elsewhere, name the
+    # real work tree in messages.
+    # The sentinel keeps command substitution from stripping a path's own
+    # trailing newlines; only Git's record delimiter is removed.
+    if top=$(gt_git_without_local_env -C "$target" rev-parse --show-toplevel \
+      2>/dev/null && printf x); then
+      top=${top%x}
+      top=${top%$'\n'}
+    else
+      top=""
+    fi
+    if [[ "$target/.git" -ef "$common_dir" ]] &&
+      [[ -z "$top" || "$top" -ef "$target" ]]; then
+      return 0
+    fi
+    GT_BASE_SYNC_ACTION=external
+    [[ -z "$top" ]] || GT_BASE_SYNC_PATH=$top
+    return 0
+  fi
+  if [[ "$GT_BASE_SYNC_IN_MAIN" == 1 && "$scan_main" != 1 ]]; then
+    GT_BASE_SYNC_ACTION=switch
+    return 0
+  fi
+
+  # A rebase or bisect can reserve the base while its HEAD is detached, and
+  # moving the ref underneath it would corrupt that operation. A worktree whose
+  # directory is gone makes this uninspectable.
+  if ! gt_find_worktree_reserving_branch "$base"; then
+    GT_BASE_SYNC_ACTION=unknown
+    GT_BASE_SYNC_REASON=reservations
+    return 0
+  fi
+  if [[ -n "$GT_WORKTREE_PATH" ]]; then
+    GT_BASE_SYNC_ACTION=reserved
+    GT_BASE_SYNC_PATH=$GT_WORKTREE_PATH
+    return 0
+  fi
+  if [[ "$GT_BASE_SYNC_IN_MAIN" == 1 ]]; then
+    GT_BASE_SYNC_ACTION=switch
+    return 0
+  fi
+
+  # A bare repository has no worktree of its own, but one used through
+  # GIT_DIR and GIT_WORK_TREE keeps an index, and its HEAD names the branch
+  # that external work tree has checked out. A bare clone that only hosts
+  # linked worktrees has no index.
+  if [[ "$main_bare" == 1 && -e "$common_dir/index" ]]; then
+    head_status=0
+    head=$(gt_git_without_local_env --git-dir="$common_dir" \
+      symbolic-ref -q HEAD) || head_status=$?
+    case "$head_status" in
+      0) ;;
+      1) head="" ;;
+      *)
+        GT_BASE_SYNC_ACTION=unknown
+        GT_BASE_SYNC_REASON=inventory
+        return 0
+        ;;
+    esac
+    if [[ "$head" == "refs/heads/$base" ]]; then
+      GT_BASE_SYNC_ACTION=external
+      GT_BASE_SYNC_PATH=$main_path
+      GT_BASE_SYNC_REASON=index
+      return 0
+    fi
+  fi
+  GT_BASE_SYNC_ACTION=ref
+}
+
 # @brief Set GT_WORKTREE_PATH to the worktree that has a branch checked out.
 # The global result avoids command substitution, which cannot preserve trailing
 # newlines. An empty result means the branch is not checked out.

@@ -383,20 +383,34 @@ without tags or remote-tracking ref updates, validates its native SHA-1 or
 SHA-256 object ID, and checks the local fast-forward relationship before
 changing anything. It then creates or fast-forwards the base using that same
 OID. A divergent base fails before the current branch or local base is changed.
-Where the update happens depends on which worktree owns the base:
+Where the update happens depends on which checkout owns the base, and cleanup
+says so whenever it updates a checkout other than the one it runs in:
 
-- If a worktree has the base checked out, the base is fast-forwarded there
-  with `git merge --ff-only`. Another worktree that has local changes or an
-  active operation, or cannot be inspected, is left alone, and cleanup proves
-  merges against the unchanged local base.
-- Otherwise, when run from the main worktree, it switches to the base.
+- If the current checkout has the base checked out, or no checkout has it and
+  cleanup runs from the main worktree, cleanup switches to the base there and
+  fast-forwards it with `git merge --ff-only`.
+- If another worktree has the base checked out, the base is fast-forwarded
+  there with `git merge --ff-only`. A worktree that has local changes or an
+  active operation, cannot be inspected, or refuses the fast-forward (for
+  example over an untracked file `status.showUntrackedFiles` hides) is left
+  alone, and cleanup proves merges against the unchanged local base.
+- A main worktree whose files live outside its Git directory, such as a
+  dotfiles checkout with `core.worktree` set or a bare repository used through
+  `GIT_DIR` and `GIT_WORK_TREE`, is never updated from another checkout. Its
+  own tooling may validate, back up, or normalize what it checks out, so
+  cleanup reports `not updating <base> in <path>` and leaves it alone. A bare
+  repository counts as having its HEAD branch checked out when it has an
+  index; remove a leftover index (for example from converting a clone to a
+  bare repository) if no work tree uses it.
 - Otherwise a linked worktree advances only the base ref with a guarded
   `git update-ref`, and only by fast-forward. It never switches to the base, so
   it never releases its own branch for deletion or locks the main worktree out
-  of the base. If a rebase or bisect reserves the base, or worktrees cannot be
-  inspected (for example a deleted worktree that was never pruned, or Git
-  older than 2.36), the base is left alone; without a local base, cleanup
-  stops instead.
+  of the base.
+- If a rebase or bisect reserves the base, a linked worktree leaves the base
+  alone, and from the main worktree `git switch` refuses it. A linked worktree
+  also leaves the base alone when worktrees cannot be inspected, for example a
+  deleted worktree that was never pruned (or is locked), or Git older than
+  2.36. Without a local base, cleanup stops instead.
 
 Dry-run uses isolated temporary object storage, so it leaves no permanent
 objects or refs behind. The command retains the single raw configured fetch URL
@@ -414,10 +428,11 @@ git cleanup-repo --all
 Branches checked out or reserved by another worktree are skipped by default.
 Use `--remove-worktrees` to remove a linked worktree before deleting its branch.
 It never removes the current worktree or the main worktree, so a branch still
-checked out in either after the base update is kept. Only worktrees with no tracked changes, index-hidden
-local content, or active rebase/merge/cherry-pick/revert/bisect operation are
-eligible. Unknown untracked or ignored content still blocks removal, and removal
-never uses `--force`:
+checked out in either after the base update is kept. The branch checked out in
+the checkout cleanup runs from is never deleted. Only worktrees with no tracked
+changes, index-hidden local content, or active
+rebase/merge/cherry-pick/revert/bisect operation are eligible. Unknown untracked
+or ignored content still blocks removal, and removal never uses `--force`:
 
 ```sh
 git cleanup-repo --all --remove-worktrees

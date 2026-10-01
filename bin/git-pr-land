@@ -176,8 +176,9 @@ _preflight_local_plan() {
   # Refuse before the irreversible merge when the base cannot be synchronized
   # afterwards. Reservations are scanned even from the main worktree so a
   # reserved base refuses here rather than in `git switch` after the merge. A
-  # base left to an external checkout's own tooling is never touched, so
-  # neither it nor that checkout is inspected.
+  # base left to another external checkout's own tooling is never touched, so
+  # neither it nor that checkout is inspected. (The current checkout is never
+  # external here; gt_refuse_external_checkout stopped that earlier.)
   gt_plan_base_sync "$base" 1 || gt_die "could not inspect current worktree"
   if [[ "$GT_BASE_SYNC_ACTION" != external ]]; then
     ref_status=0
@@ -344,6 +345,7 @@ _require_expected_topology() {
 }
 
 gt_require_repo
+gt_refuse_external_checkout "$_dry_run"
 gt_require_gh
 if [[ "$_dry_run" != 1 ]]; then
   gt_require_clean_worktree

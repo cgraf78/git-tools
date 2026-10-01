@@ -733,6 +733,37 @@ gt_find_current_worktree() {
   GT_WORKTREE_PATH=${output%$'\n'}
 }
 
+# @brief Succeed when Git in a work tree, on its own, reaches the Git directory.
+# A checkout whose `.git` directory or gitfile leads back (an ordinary clone, a
+# separate Git directory, a submodule) passes. One that Git reaches only
+# through GIT_DIR/GIT_WORK_TREE or another directory's `core.worktree`, as a
+# dotfiles checkout of $HOME is, does not.
+_gt_work_tree_reaches_git_dir() {
+  local top="$1" git_dir="$2" found
+
+  found=$(gt_git_without_local_env -C "$top" rev-parse --git-dir \
+    2>/dev/null) || return 1
+  [[ "$found" == /* ]] || found=$top/$found
+  [[ "$found" -ef "$git_dir" ]]
+}
+
+# @brief Succeed when the invoking checkout is a main worktree that Git reaches
+# only through GIT_DIR/GIT_WORK_TREE or `core.worktree`.
+# Such a checkout belongs to whatever tooling sets that up (a dotfiles manager
+# for $HOME, say), and a Git launcher may route unrelated directories into it,
+# so being run there is not a deliberate choice of that checkout. Sets
+# GT_WORKTREE_PATH to its work tree. Returns 1 for any other checkout and 2
+# when the checkout cannot be inspected.
+gt_current_checkout_is_external() {
+  local common_dir git_dir
+
+  gt_find_current_worktree || return 2
+  git_dir=$(git rev-parse --git-dir) || return 2
+  common_dir=$(git rev-parse --git-common-dir) || return 2
+  [[ "$git_dir" -ef "$common_dir" ]] || return 1
+  ! _gt_work_tree_reaches_git_dir "$GT_WORKTREE_PATH" "$git_dir"
+}
+
 # @brief Materialize Git's NUL-delimited worktree inventory and check its
 # producer status. Reading process substitution directly hides producer
 # failures from the consuming loop.
@@ -817,14 +848,20 @@ gt_find_main_worktree() {
 # from `git worktree list` paths, which name such main worktrees by their Git
 # directory and list a bare repository's external work tree not at all.
 #
-# Sets GT_BASE_SYNC_IN_MAIN to 1 when the invoking checkout is the main
-# worktree, and GT_BASE_SYNC_ACTION to one of:
+# The invoking checkout is held to the same rule: when it is a main worktree
+# that Git reaches only through GIT_DIR/GIT_WORK_TREE or `core.worktree` (see
+# gt_current_checkout_is_external), it is never switched or merged into, and
+# is planned like a linked worktree.
+#
+# Sets GT_BASE_SYNC_MAY_SWITCH to 1 when the invoking checkout is a main
+# worktree that may take the base over, and GT_BASE_SYNC_ACTION to one of:
 #   current   the invoking checkout has the base checked out
 #   switch    the invoking main worktree may check the base out
 #   worktree  ordinary worktree GT_BASE_SYNC_PATH has the base checked out
 #   external  main worktree GT_BASE_SYNC_PATH, whose files live outside its Git
 #             directory, has the base checked out; GT_BASE_SYNC_REASON is
-#             index when that is inferred from a bare repository's index
+#             index when that is inferred from a bare repository's index, and
+#             current when it is the invoking checkout
 #   reserved  a rebase or bisect in GT_BASE_SYNC_PATH reserves the base
 #   ref       nothing has the base checked out; only the ref may move
 #   unknown   GT_BASE_SYNC_REASON (inventory or reservations) is uninspectable
@@ -837,7 +874,7 @@ gt_plan_base_sync() {
   GT_BASE_SYNC_ACTION=""
   GT_BASE_SYNC_PATH=""
   GT_BASE_SYNC_REASON=""
-  GT_BASE_SYNC_IN_MAIN=0
+  GT_BASE_SYNC_MAY_SWITCH=0
   head=$(git symbolic-ref -q HEAD) || head_status=$?
   case "$head_status" in
     0) ;;
@@ -846,7 +883,17 @@ gt_plan_base_sync() {
   esac
   git_dir=$(git rev-parse --git-dir) || return 1
   common_dir=$(git rev-parse --git-common-dir) || return 1
-  [[ ! "$git_dir" -ef "$common_dir" ]] || GT_BASE_SYNC_IN_MAIN=1
+  if [[ "$git_dir" -ef "$common_dir" ]]; then
+    gt_find_current_worktree || return 1
+    if _gt_work_tree_reaches_git_dir "$GT_WORKTREE_PATH" "$git_dir"; then
+      GT_BASE_SYNC_MAY_SWITCH=1
+    elif [[ "$head" == "refs/heads/$base" ]]; then
+      GT_BASE_SYNC_ACTION=external
+      GT_BASE_SYNC_PATH=$GT_WORKTREE_PATH
+      GT_BASE_SYNC_REASON=current
+      return 0
+    fi
+  fi
   if [[ "$head" == "refs/heads/$base" ]]; then
     GT_BASE_SYNC_ACTION=current
     return 0
@@ -896,7 +943,7 @@ gt_plan_base_sync() {
     [[ -z "$top" ]] || GT_BASE_SYNC_PATH=$top
     return 0
   fi
-  if [[ "$GT_BASE_SYNC_IN_MAIN" == 1 && "$scan_main" != 1 ]]; then
+  if [[ "$GT_BASE_SYNC_MAY_SWITCH" == 1 && "$scan_main" != 1 ]]; then
     GT_BASE_SYNC_ACTION=switch
     return 0
   fi
@@ -914,7 +961,7 @@ gt_plan_base_sync() {
     GT_BASE_SYNC_PATH=$GT_WORKTREE_PATH
     return 0
   fi
-  if [[ "$GT_BASE_SYNC_IN_MAIN" == 1 ]]; then
+  if [[ "$GT_BASE_SYNC_MAY_SWITCH" == 1 ]]; then
     GT_BASE_SYNC_ACTION=switch
     return 0
   fi

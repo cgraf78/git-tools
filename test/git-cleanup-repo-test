@@ -2982,10 +2982,10 @@ _assert_contains "separate Git directory main worktree deletes its old branch" \
   "deleting feat (merged)" "$result"
 
 # Run from a bare repository's explicit work tree, as dotfiles setups do, the
-# checked-out base is still updated in place rather than by ref alone.
+# checked-out base belongs to the tooling that manages that work tree, so it is
+# left alone even though cleanup runs there.
 lw_bare_repo=$(_merged_feature_repo)
 lw_bare_old=$(git -C "$lw_bare_repo" rev-parse refs/heads/main)
-lw_bare_remote=$(git -C "$lw_bare_repo" rev-parse refs/remotes/origin/main)
 lw_bare_gitdir="$(_tmpdir)/cfg.git"
 lw_bare_work=$(_tmpdir)
 git clone --quiet --bare "$lw_bare_repo" "$lw_bare_gitdir"
@@ -2994,16 +2994,74 @@ git --git-dir="$lw_bare_gitdir" config remote.origin.url \
 git --git-dir="$lw_bare_gitdir" update-ref refs/heads/main "$lw_bare_old"
 git --git-dir="$lw_bare_gitdir" --work-tree="$lw_bare_work" \
   checkout --quiet -f main
+lw_bare_before=$(_worktree_snapshot "$lw_bare_work")
 lw_bare_rc=0
-(cd "$lw_bare_work" &&
+result=$(cd "$lw_bare_work" &&
   GIT_DIR="$lw_bare_gitdir" GIT_WORK_TREE="$lw_bare_work" \
-    git cleanup-repo >/dev/null 2>&1) || lw_bare_rc=$?
+    git cleanup-repo 2>&1) || lw_bare_rc=$?
 _assert_eq "explicit work tree cleanup succeeds" 0 "$lw_bare_rc"
-_assert_eq "explicit work tree base is fast-forwarded" \
-  "$lw_bare_remote" "$(git --git-dir="$lw_bare_gitdir" rev-parse refs/heads/main)"
-_assert_eq "explicit work tree follows the base fast-forward" "" \
+_assert_contains "explicit work tree base is left to its own tooling" \
+  "not updating main in $lw_bare_work; update that checkout with its own tooling" \
+  "$result"
+_assert_eq "explicit work tree base is not moved" \
+  "$lw_bare_old" "$(git --git-dir="$lw_bare_gitdir" rev-parse refs/heads/main)"
+_assert_eq "explicit work tree files are untouched" \
+  "$lw_bare_before" "$(_worktree_snapshot "$lw_bare_work")"
+_assert_eq "explicit work tree stays clean" "" \
   "$(git --git-dir="$lw_bare_gitdir" --work-tree="$lw_bare_work" \
     status --porcelain)"
+
+# The owner's dotfiles layout, run from the $HOME-style checkout itself (a Git
+# launcher routes any directory there): the base it has checked out is never
+# merged into, but branches already merged into that local base are still
+# deleted.
+hx_repo=$(_merged_feature_repo)
+hx_old=$(git -C "$hx_repo" rev-parse refs/heads/main)
+git -C "$hx_repo" branch done-already "$hx_old"
+hx_gitdir="$(_tmpdir)/dotfiles"
+hx_home=$(_tmpdir)
+git clone --quiet --bare "$hx_repo" "$hx_gitdir"
+git --git-dir="$hx_gitdir" config remote.origin.url \
+  "$(git -C "$hx_repo" config remote.origin.url)"
+git --git-dir="$hx_gitdir" update-ref refs/heads/main "$hx_old"
+git --git-dir="$hx_gitdir" config core.bare false
+git --git-dir="$hx_gitdir" config core.worktree "$hx_home"
+git --git-dir="$hx_gitdir" checkout --quiet -f main
+hx_before=$(_worktree_snapshot "$hx_home")
+hx_rc=0
+result=$(cd "$hx_home" && GIT_DIR="$hx_gitdir" git cleanup-repo 2>&1) ||
+  hx_rc=$?
+_assert_eq "external main checkout cleanup on the base succeeds" 0 "$hx_rc"
+_assert_contains "external main checkout on the base is not merged into" \
+  "not updating main in $hx_home; update that checkout with its own tooling" \
+  "$result"
+_assert_eq "external main checkout on the base keeps its ref" \
+  "$hx_old" "$(git --git-dir="$hx_gitdir" rev-parse refs/heads/main)"
+_assert_eq "external main checkout on the base keeps its files" \
+  "$hx_before" "$(_worktree_snapshot "$hx_home")"
+_assert_contains "external main checkout still deletes locally merged branches" \
+  "deleting done-already (merged)" "$result"
+
+# On another branch, with the base checked out nowhere, it is planned like a
+# linked worktree: only the base ref moves, and its own branch is kept.
+git --git-dir="$hx_gitdir" checkout --quiet feat
+hx_feat=$(git --git-dir="$hx_gitdir" rev-parse refs/heads/feat)
+hx_remote=$(git -C "$hx_repo" rev-parse refs/remotes/origin/main)
+hx_before=$(_worktree_snapshot "$hx_home")
+hx_rc=0
+result=$(cd "$hx_home" && GIT_DIR="$hx_gitdir" git cleanup-repo 2>&1) ||
+  hx_rc=$?
+_assert_eq "external main checkout cleanup off the base succeeds" 0 "$hx_rc"
+_assert_eq "external main checkout is not switched to the base" \
+  refs/heads/feat "$(git --git-dir="$hx_gitdir" symbolic-ref HEAD)"
+_assert_eq "external main checkout off the base keeps its files" \
+  "$hx_before" "$(_worktree_snapshot "$hx_home")"
+_assert_eq "external main checkout off the base advances only the ref" \
+  "$hx_remote" "$(git --git-dir="$hx_gitdir" rev-parse refs/heads/main)"
+_assert_contains "external main checkout keeps its own merged branch" \
+  "keeping feat; checked out in the current worktree" "$result"
+_assert_eq "external main checkout's own branch still exists" \
+  "$hx_feat" "$(git --git-dir="$hx_gitdir" rev-parse refs/heads/feat)"
 
 # Git before 2.36 cannot list worktrees with -z. The main worktree keeps its
 # historical update, and a linked worktree leaves the base alone.

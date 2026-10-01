@@ -1531,7 +1531,7 @@ _dotfiles_fixture() {
   git --git-dir="$df_gitdir" switch --quiet main
   git --git-dir="$df_gitdir" worktree add --quiet "$df_linked" feature
   df_old=$(git --git-dir="$df_gitdir" rev-parse refs/heads/main)
-  df_new=$(_advance_remote_main "$remote")
+  _advance_remote_main "$remote" >/dev/null
 }
 
 # From a linked worktree the external main checkout is never merged into.
@@ -1556,21 +1556,68 @@ _assert_eq "external main checkout stays clean" "" \
 _assert_eq "external main checkout leaves the linked worktree on its branch" \
   feature "$(git -C "$df_linked" branch --show-current)"
 
-# From the external main checkout itself, the base merges in place.
-_dotfiles_fixture
-df_log=$(_tmpdir)/gh.log
-df_rc=0
-result=$(cd "$df_home" && GIT_DIR="$df_gitdir" GH_LOG="$df_log" \
-  GH_TEST_REPO="$df_home" GH_PR_HEAD_OID="$(git --git-dir="$df_gitdir" \
-    rev-parse refs/remotes/origin/feature)" PATH="$bin_dir:$PATH" \
-  "$ROOT/bin/git-pr-land" 4 2>&1) || df_rc=$?
-_assert_eq "external main checkout landing on the base succeeds" 0 "$df_rc"
-_assert_eq "external main checkout base is fast-forwarded in place" \
-  "$df_new" "$(git --git-dir="$df_gitdir" rev-parse HEAD)"
-_assert_eq "external main checkout files follow the base" "" \
-  "$(git --git-dir="$df_gitdir" status --porcelain)"
-_assert_not_contains "external main checkout is not treated as another" \
-  "not updating main" "$result"
+# Print every file under a directory with its checksum.
+_tree_fingerprint() {
+  find "$1" -type f -exec cksum {} + | LC_ALL=C sort
+}
+
+# Landing from the external main checkout itself refuses before merging: it
+# would merge into or switch a checkout its own tooling owns, and a Git
+# launcher can route any directory into it. This holds on the base, on another
+# branch, and in a dry run.
+_external_land() {
+  local log="$1"
+  shift
+  (cd "$df_home" && GIT_DIR="$df_gitdir" GH_LOG="$log" \
+    GH_TEST_REPO="$df_home" GH_PR_HEAD_OID="$(git --git-dir="$df_gitdir" \
+      rev-parse refs/remotes/origin/feature)" PATH="$bin_dir:$PATH" \
+    "$ROOT/bin/git-pr-land" 4 "$@")
+}
+
+for df_case in base branch dry-run; do
+  _dotfiles_fixture
+  df_args=()
+  case "$df_case" in
+    branch)
+      git --git-dir="$df_gitdir" worktree remove --force "$df_linked"
+      git --git-dir="$df_gitdir" switch --quiet feature
+      ;;
+    dry-run) df_args=(--dry-run) ;;
+  esac
+  df_log=$(_tmpdir)/gh.log
+  df_head=$(git --git-dir="$df_gitdir" symbolic-ref HEAD)
+  df_tip=$(git --git-dir="$df_gitdir" rev-parse HEAD)
+  df_files=$(_tree_fingerprint "$df_home")
+  df_rc=0
+  result=$(_external_land "$df_log" ${df_args[@]+"${df_args[@]}"} 2>&1) ||
+    df_rc=$?
+  _assert_eq "external main checkout ($df_case) refuses to land" 1 "$df_rc"
+  if [[ "$df_case" == dry-run ]]; then
+    _assert_contains "external main checkout ($df_case) reports the refusal" \
+      "would refuse to land from $df_home" "$result"
+  else
+    _assert_contains "external main checkout ($df_case) explains the refusal" \
+      "refusing to land from $df_home: Git reaches this checkout only" \
+      "$result"
+  fi
+  _assert_contains "external main checkout ($df_case) names the alternative" \
+    "land from a linked worktree" "$result"
+  if [[ -s "$df_log" ]]; then
+    _fail "external main checkout ($df_case) refuses before merging"
+  else
+    _pass "external main checkout ($df_case) refuses before merging"
+  fi
+  _assert_eq "external main checkout ($df_case) keeps its base ref" "$df_old" \
+    "$(git --git-dir="$df_gitdir" rev-parse refs/heads/main)"
+  _assert_eq "external main checkout ($df_case) keeps its HEAD" \
+    "$df_head $df_tip" "$(git --git-dir="$df_gitdir" symbolic-ref HEAD) $(
+      git --git-dir="$df_gitdir" rev-parse HEAD
+    )"
+  _assert_eq "external main checkout ($df_case) keeps its files" "$df_files" \
+    "$(_tree_fingerprint "$df_home")"
+  _assert_eq "external main checkout ($df_case) stays clean" "" \
+    "$(git --git-dir="$df_gitdir" status --porcelain)"
+done
 
 # An external main checkout is never touched, so a local base that cannot
 # fast-forward there does not block landing from a linked worktree.
@@ -1589,10 +1636,9 @@ _assert_eq "external main checkout with a divergent base still lands" \
 _assert_eq "external main checkout keeps its divergent base" "$df_local" \
   "$(git --git-dir="$df_gitdir" rev-parse refs/heads/main)"
 
-# A bare repository driven by GIT_DIR and GIT_WORK_TREE inherits those
-# variables into pr-land. The base worktree's status and fast-forward must
-# still run in that worktree, not in the invoking work tree.
-# Sets bw_gitdir, bw_work, bw_base, and bw_new.
+# A bare repository driven by GIT_DIR and GIT_WORK_TREE, the classic dotfiles
+# setup, is the same kind of checkout: landing from its work tree refuses
+# before merging even though the base lives in a linked worktree.
 _bare_work_tree_fixture() {
   local remote
 
@@ -1604,46 +1650,29 @@ _bare_work_tree_fixture() {
   mv "$bw_work/.git" "$bw_gitdir"
   git --git-dir="$bw_gitdir" config core.bare true
   git --git-dir="$bw_gitdir" worktree add --quiet "$bw_base" main
-  bw_new=$(_advance_remote_main "$remote")
-}
-
-_bare_work_tree_land() {
-  (cd "$bw_work" && GIT_DIR="$bw_gitdir" GIT_WORK_TREE="$bw_work" \
-    GH_LOG="$1" GH_PR_HEAD_OID="$(git --git-dir="$bw_gitdir" \
-      rev-parse refs/remotes/origin/feature)" PATH="$bin_dir:$PATH" \
-    "$ROOT/bin/git-pr-land" 4)
+  bw_old=$(git -C "$bw_base" rev-parse HEAD)
+  _advance_remote_main "$remote" >/dev/null
 }
 
 _bare_work_tree_fixture
 bw_log=$(_tmpdir)/gh.log
 bw_rc=0
-result=$(_bare_work_tree_land "$bw_log" 2>&1) || bw_rc=$?
-_assert_eq "explicit work tree landing beside a base worktree succeeds" \
-  0 "$bw_rc"
-_assert_eq "explicit work tree landing fast-forwards the base worktree" \
-  "$bw_new" "$(git -C "$bw_base" rev-parse HEAD)"
-_assert_eq "explicit work tree landing keeps the base worktree clean" "" \
-  "$(git -C "$bw_base" status --porcelain)"
+result=$(cd "$bw_work" && GIT_DIR="$bw_gitdir" GIT_WORK_TREE="$bw_work" \
+  GH_LOG="$bw_log" GH_PR_HEAD_OID="$(git --git-dir="$bw_gitdir" \
+    rev-parse refs/remotes/origin/feature)" PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-land" 4 2>&1) || bw_rc=$?
+_assert_eq "explicit work tree landing refuses" 1 "$bw_rc"
+_assert_contains "explicit work tree landing explains the refusal" \
+  "refusing to land from $bw_work" "$result"
+if [[ -s "$bw_log" ]]; then
+  _fail "explicit work tree landing refuses before merging"
+else
+  _pass "explicit work tree landing refuses before merging"
+fi
+_assert_eq "explicit work tree landing leaves the base worktree alone" \
+  "$bw_old" "$(git -C "$bw_base" rev-parse HEAD)"
 _assert_eq "explicit work tree landing keeps its own branch" \
   refs/heads/feature "$(git --git-dir="$bw_gitdir" symbolic-ref HEAD)"
-_assert_eq "explicit work tree landing leaves its own branch in place" \
-  "$(git --git-dir="$bw_gitdir" rev-parse refs/remotes/origin/feature)" \
-  "$(git --git-dir="$bw_gitdir" rev-parse refs/heads/feature)"
-
-_bare_work_tree_fixture
-bw_log=$(_tmpdir)/gh.log
-printf '%s\n' "local edit" >"$bw_base/README.md"
-bw_rc=0
-result=$(_bare_work_tree_land "$bw_log" 2>&1) || bw_rc=$?
-_assert_eq "explicit work tree landing beside a dirty base worktree refuses" \
-  1 "$bw_rc"
-_assert_contains "explicit work tree landing inspects the base worktree" \
-  "base worktree must be clean: $bw_base" "$result"
-if [[ -s "$bw_log" ]]; then
-  _fail "explicit work tree landing does not merge beside a dirty base"
-else
-  _pass "explicit work tree landing does not merge beside a dirty base"
-fi
 
 # A dry run reports the refusal a real run makes in preflight when the local
 # base cannot fast-forward, instead of claiming the PR merged.

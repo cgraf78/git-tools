@@ -287,7 +287,9 @@ _skip_base_update() {
 
 # A main worktree whose files live outside its Git directory belongs to the
 # tooling that manages it, which may validate, back up, or normalize what it
-# checks out, so cleanup never merges into it from another checkout.
+# checks out, so cleanup never merges into it, even when cleanup runs there
+# (a Git launcher can route any directory into a dotfiles checkout of $HOME).
+# Branch deletion still proceeds, proven against the unchanged local base.
 _leave_external_base() {
   local path=$GT_BASE_SYNC_PATH
 
@@ -404,7 +406,7 @@ _update_base() {
       # keeps its historical switch, which Git itself refuses when another
       # worktree has the base checked out or reserved.
       if [[ "$GT_BASE_SYNC_REASON" == inventory &&
-        "$GT_BASE_SYNC_IN_MAIN" == 1 ]]; then
+        "$GT_BASE_SYNC_MAY_SWITCH" == 1 ]]; then
         _switch_to_base
       elif [[ "$_planned_base_oid" == "$_local_base_oid" ]]; then
         :

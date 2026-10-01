@@ -310,6 +310,10 @@ _require_positive_integer "--check-timeout" "$_check_timeout"
 _require_positive_integer "--check-interval" "$_check_interval"
 
 gt_require_repo
+# Every land syncs the base and every restack checks out a child in the
+# current checkout, so refuse before discovery as `git pr-land` would before
+# the first merge.
+gt_refuse_external_checkout "$_dry_run"
 gt_require_gh
 if [[ "$_dry_run" != 1 ]]; then
   gt_require_clean_worktree

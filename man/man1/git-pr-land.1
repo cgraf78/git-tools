@@ -42,6 +42,16 @@ Git directory (such as a
 .B core.worktree
 checkout) is never touched or inspected and is reported instead.
 .PP
+The command refuses to run, before merging, in a main checkout that Git
+reaches only through
+.BR GIT_DIR / GIT_WORK_TREE
+or
+.BR core.worktree ,
+such as a dotfiles checkout of the home directory; land from a linked worktree
+of that repository instead. Separate Git directories and submodules, whose
+.B .git
+file leads back to their Git directory, are not affected.
+.PP
 Local deletion is manual because Git has no portable primitive that serializes
 deletion with a checkout that already resolved the ref but has not updated its
 worktree HEAD. Remote deletion is also manual: a repository-scoped PR inventory

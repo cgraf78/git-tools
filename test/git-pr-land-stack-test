@@ -1039,9 +1039,9 @@ outside=$(_tmpdir)
 result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" _pr_land_stack "$outside" 1 2>&1 || true)
 _assert_contains "requires git repo" "not inside a git repository" "$result"
 
-# A dotfiles-style checkout is driven by GIT_DIR with `core.worktree`, and Git
-# lists it by its Git directory. Its own operation state and the stack branch
-# it has checked out must still be recognized as the current checkout's.
+# A dotfiles-style checkout is driven by GIT_DIR with `core.worktree`. Landing
+# would sync the base into it and restacking would check out each child there,
+# behind its own tooling's back, so the stack refuses before discovery.
 dotfiles_home=$(_tmpdir)
 dotfiles_gitdir="$(_tmpdir)/dotfiles"
 dotfiles_log=$(_tmpdir)/stack.log
@@ -1052,13 +1052,21 @@ git -C "$dotfiles_home" branch feature/c
 mv "$dotfiles_home/.git" "$dotfiles_gitdir"
 git --git-dir="$dotfiles_gitdir" config core.worktree "$dotfiles_home"
 git --git-dir="$dotfiles_gitdir" switch --quiet feature/b
-rc=0
-result=$(cd "$dotfiles_home" && GIT_DIR="$dotfiles_gitdir" \
-  PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
-  STACK_LOG="$dotfiles_log" "$ROOT/bin/git-pr-land-stack" 1 2>&1) || rc=$?
-_assert_eq "dotfiles-style stack landing succeeds" "0" "$rc"
-_assert_contains "dotfiles-style stack lands the root PR" \
-  "land https://github.test/example/repo/pull/1" "$(cat "$dotfiles_log" 2>/dev/null)"
+for dotfiles_args in "" --dry-run; do
+  rc=0
+  result=$(cd "$dotfiles_home" && GIT_DIR="$dotfiles_gitdir" \
+    PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+    STACK_LOG="$dotfiles_log" "$ROOT/bin/git-pr-land-stack" 1 \
+    $dotfiles_args 2>&1) || rc=$?
+  _assert_eq "dotfiles-style stack landing refuses ${dotfiles_args:-real run}" \
+    "1" "$rc"
+  _assert_contains "dotfiles-style stack landing explains ${dotfiles_args:-real run}" \
+    "to land from $dotfiles_home" "$result"
+done
+_assert_eq "dotfiles-style stack landing runs no stack tool" "" \
+  "$(cat "$dotfiles_log" 2>/dev/null)"
+_assert_eq "dotfiles-style stack landing leaves the checkout on its branch" \
+  refs/heads/feature/b "$(git --git-dir="$dotfiles_gitdir" symbolic-ref HEAD)"
 
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2

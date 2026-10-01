@@ -42,7 +42,13 @@ outside its Git directory, such as a
 .B core.worktree
 checkout or a bare repository with an index used through an external work
 tree, is never updated from another checkout; cleanup reports that it is not
-updating the base there and leaves that checkout to its own tooling. Otherwise
+updating the base there and leaves that checkout to its own tooling. The same
+holds when cleanup runs in a main checkout that Git reaches only through
+.BR GIT_DIR / GIT_WORK_TREE
+or
+.BR core.worktree :
+it is never switched or merged into, and is planned like a linked worktree;
+branches already merged into its local base are still deleted. Otherwise
 the main worktree switches to the base. A linked worktree never switches to
 the base; it advances only the base ref with an expected-old-value
 .BR "git update\-ref" ,

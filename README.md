@@ -278,6 +278,12 @@ base has local changes or an active operation, or when a rebase or bisect
 reserves the base. A base checked out in a main worktree whose files live
 outside its Git directory (such as a `core.worktree` dotfiles checkout) is
 never touched or inspected; it is reported with a `not updating` message.
+The command refuses to run, before merging, in a main checkout that Git
+reaches only through `GIT_DIR`/`GIT_WORK_TREE` or `core.worktree` (a dotfiles
+checkout of `$HOME`, which a Git launcher may route any directory into): land
+from a linked worktree of that repository instead. Checkouts whose `.git`
+directory or file leads back to their Git directory, including separate Git
+directories and submodules, are not affected.
 If GitHub reports an error after completing the server-side merge,
 the command rechecks structured PR state and identifies any remaining work as
 incomplete cleanup instead of incorrectly reporting that the merge failed.
@@ -299,7 +305,8 @@ git pr-land-stack 123 --dry-run
 ```
 
 The command composes `git pr-stack`, `git pr-land`, and `git pr-restack`. It
-refuses the whole stack before merging anything if any PR is not ready. URL
+refuses the whole stack before merging anything if any PR is not ready, or when
+run in a checkout that `git pr-land` refuses to land from. URL
 targets and every discovered PR must belong to the current GitHub repository.
 Qualified URLs are retained across stack, land, restack, and readiness polling
 handoffs.
@@ -396,7 +403,11 @@ says so whenever it updates a checkout other than the one it runs in:
 
 - If the current checkout has the base checked out, or no checkout has it and
   cleanup runs from the main worktree, cleanup switches to the base there and
-  fast-forwards it with `git merge --ff-only`.
+  fast-forwards it with `git merge --ff-only`. The exception is a main checkout
+  that Git reaches only through `GIT_DIR`/`GIT_WORK_TREE` or `core.worktree`,
+  such as a dotfiles checkout of `$HOME`: cleanup never switches or merges
+  there, even when it runs there, and plans the base like a linked worktree
+  would. Branches already merged into its local base are still deleted.
 - If another worktree has the base checked out, the base is fast-forwarded
   there with `git merge --ff-only`. A worktree that has local changes or an
   active operation, cannot be inspected, or refuses the fast-forward (for

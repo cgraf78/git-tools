@@ -49,6 +49,20 @@ _assert_contains() {
   fi
 }
 
+_assert_not_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" != *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output NOT to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
 _git_init() {
   local repo="$1"
   git init -q --initial-branch=main "$repo"
@@ -872,6 +886,14 @@ _assert_eq "three-PR dry run preserves plan order" \
   "$(awk '{ print $1, $2 }' "$dry_plan_log")"
 _assert_contains "three-PR dry run plans the final land" \
   "land https://github.test/example/repo/pull/3 --method squash --dry-run" \
+  "$(cat "$dry_plan_log")"
+# Without a restack, children still target their parents, so each child's dry
+# run is told the base the real run lands it into.
+_assert_contains "three-PR dry run plans a child into the root base" \
+  "land https://github.test/example/repo/pull/2 --method squash --keep-branch --dry-run --expect-base main" \
+  "$(cat "$dry_plan_log")"
+_assert_not_contains "three-PR dry run plans the root into its own base" \
+  "pull/1 --method squash --keep-branch --dry-run --expect-base" \
   "$(cat "$dry_plan_log")"
 if compgen -G "$dry_plan_topology.*" >/dev/null; then
   _fail "three-PR dry run leaves discovered topology unchanged"

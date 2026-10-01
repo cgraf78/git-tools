@@ -406,6 +406,9 @@ for _i in "${!_numbers[@]}"; do
   fi
   if [[ "$_dry_run" == 1 ]]; then
     _land_args+=(--dry-run)
+    # A dry run does not restack, so each child still targets its parent. Tell
+    # git pr-land the base the real run would land it into.
+    ((_i == 0)) || _land_args+=(--expect-base "$_land_base")
   fi
   _land_args+=(--expect-topology "$_expected_topology")
 

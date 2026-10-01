@@ -283,7 +283,9 @@ reaches only through `GIT_DIR`/`GIT_WORK_TREE` or `core.worktree` (a dotfiles
 checkout of `$HOME`, which a Git launcher may route any directory into): land
 from a linked worktree of that repository instead. Checkouts whose `.git`
 directory or file leads back to their Git directory, including separate Git
-directories and submodules, are not affected.
+directories and submodules, are not affected. A dry run makes the same local
+checks and, where the real run would refuse, reports `would refuse: <reason>`
+and exits 1 instead of describing a landing.
 If GitHub reports an error after completing the server-side merge,
 the command rechecks structured PR state and identifies any remaining work as
 incomplete cleanup instead of incorrectly reporting that the merge failed.

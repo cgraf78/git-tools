@@ -76,7 +76,10 @@ Defaults to
 Accepted for compatibility. Local and remote branches are always retained.
 .TP
 .BR \-n ", " \-\-dry\-run
-Print actions without changing anything.
+Print actions without changing anything. A dry run makes the same local checks
+as a real run and, where the real run would refuse before merging, reports
+.B would refuse:
+and the reason, and exits 1.
 .TP
 .BR \-h ", " \-\-help
 Show help.

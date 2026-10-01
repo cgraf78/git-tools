@@ -86,6 +86,17 @@ _assert_not_contains() {
   fi
 }
 
+_assert_occurrences() {
+  local name="$1" expected="$2" needle="$3" haystack="$4"
+  local count=0 remainder="$haystack"
+
+  while [[ "$remainder" == *"$needle"* ]]; do
+    remainder=${remainder#*"$needle"}
+    count=$((count + 1))
+  done
+  _assert_eq "$name" "$expected" "$count"
+}
+
 _commit_file() {
   local repo="$1"
   local path="$2"
@@ -909,6 +920,11 @@ result=$(GH_LOG="$log_dry" PATH="$bin_dir:$PATH" _pr_land "$repo_dry" 4 --dry-ru
 rc=$?
 _assert_contains "dry run prints merge command" "would run: gh pr merge 4 --squash" "$result"
 _assert_eq "dry run succeeds" "0" "$rc"
+_assert_contains "dry run reports what it would land" \
+  "would land PR #4 (feature -> main)" "$result"
+_assert_not_contains "dry run does not claim the PR landed" "landed PR" "$result"
+_assert_occurrences "dry run fetches the base once" 1 \
+  "would fetch refs/heads/main" "$result"
 _assert_eq "dry run keeps branch checked out" "feature" "$(git -C "$repo_dry" branch --show-current)"
 
 repo_dry_linked=$(_tmpdir)
@@ -930,8 +946,10 @@ result=$(GH_LOG="$log_dry_linked" PATH="$bin_dir:$PATH" \
   _pr_land "$repo_dry_linked" 4 --dry-run --keep-branch 2>&1)
 rc=$?
 _assert_eq "linked base dry run: succeeds" "0" "$rc"
-_assert_contains "linked base dry run: prints external fast-forward" \
-  "would run: gt_git_without_local_env -C" "$result"
+_assert_contains "linked base dry run: prints the Git command it would run" \
+  "would run: git -C $main_dry_linked merge --quiet --ff-only" "$result"
+_assert_not_contains "linked base dry run: hides the environment wrapper" \
+  "gt_git_without_local_env" "$result"
 _assert_eq "linked base dry run: does not advance base" \
   "$dry_linked_base_before" "$(git -C "$main_dry_linked" rev-parse HEAD)"
 _assert_eq "linked base dry run: leaves base worktree on main" \
@@ -1447,10 +1465,12 @@ git -C "$rd_base" bisect start HEAD HEAD~2 >/dev/null
 rd_rc=0
 result=$(GH_LOG="$rd_log" PATH="$bin_dir:$PATH" \
   _pr_land "$rd_repo" 4 --dry-run 2>&1) || rd_rc=$?
-_assert_eq "reserved base dry run succeeds" 0 "$rd_rc"
-_assert_contains "reserved base dry run reports the reservation" \
-  "not updating main; reserved by worktree $(_canonical_path "$rd_base")" \
+_assert_eq "reserved base dry run refuses like the real run" 1 "$rd_rc"
+_assert_contains "reserved base dry run reports the refusal" \
+  "would refuse: base worktree has bisect in progress: $(_canonical_path "$rd_base")" \
   "$result"
+_assert_not_contains "reserved base dry run plans no merge" \
+  "would run: gh pr merge" "$result"
 if [[ "$result" == *"merge --quiet --ff-only"* ]]; then
   _fail "reserved base dry run plans no merge into the reservation"
 else
@@ -1561,6 +1581,12 @@ _tree_fingerprint() {
   find "$1" -type f -exec cksum {} + | LC_ALL=C sort
 }
 
+# Print the branch and commit a Git directory's HEAD names.
+_head_state() {
+  printf '%s %s\n' "$(git --git-dir="$1" symbolic-ref HEAD)" \
+    "$(git --git-dir="$1" rev-parse HEAD)"
+}
+
 # Landing from the external main checkout itself refuses before merging: it
 # would merge into or switch a checkout its own tooling owns, and a Git
 # launcher can route any directory into it. This holds on the base, on another
@@ -1585,8 +1611,7 @@ for df_case in base branch dry-run; do
     dry-run) df_args=(--dry-run) ;;
   esac
   df_log=$(_tmpdir)/gh.log
-  df_head=$(git --git-dir="$df_gitdir" symbolic-ref HEAD)
-  df_tip=$(git --git-dir="$df_gitdir" rev-parse HEAD)
+  df_head=$(_head_state "$df_gitdir")
   df_files=$(_tree_fingerprint "$df_home")
   df_rc=0
   result=$(_external_land "$df_log" ${df_args[@]+"${df_args[@]}"} 2>&1) ||
@@ -1610,9 +1635,7 @@ for df_case in base branch dry-run; do
   _assert_eq "external main checkout ($df_case) keeps its base ref" "$df_old" \
     "$(git --git-dir="$df_gitdir" rev-parse refs/heads/main)"
   _assert_eq "external main checkout ($df_case) keeps its HEAD" \
-    "$df_head $df_tip" "$(git --git-dir="$df_gitdir" symbolic-ref HEAD) $(
-      git --git-dir="$df_gitdir" rev-parse HEAD
-    )"
+    "$df_head" "$(_head_state "$df_gitdir")"
   _assert_eq "external main checkout ($df_case) keeps its files" "$df_files" \
     "$(_tree_fingerprint "$df_home")"
   _assert_eq "external main checkout ($df_case) stays clean" "" \
@@ -1691,13 +1714,118 @@ dv_local=$(git -C "$dv_repo" rev-parse refs/heads/main)
 dv_rc=0
 result=$(GH_LOG="$dv_log" PATH="$bin_dir:$PATH" \
   _pr_land "$dv_linked" 4 --dry-run 2>&1) || dv_rc=$?
-_assert_eq "divergent base dry run succeeds" 0 "$dv_rc"
+_assert_eq "divergent base dry run refuses like the real run" 1 "$dv_rc"
 _assert_contains "divergent base dry run reports the refusal" \
   "would refuse: local main cannot fast-forward to origin/main" "$result"
-_assert_not_contains "divergent base dry run does not claim a merge" \
-  "merged; cleanup incomplete" "$result"
+_assert_not_contains "divergent base dry run plans no merge" \
+  "would run: gh pr merge" "$result"
 _assert_eq "divergent base dry run leaves the base alone" "$dv_local" \
   "$(git -C "$dv_repo" rev-parse refs/heads/main)"
+
+# A local base ahead of the remote cannot take the landed commit by
+# fast-forward. The real run refuses that in preflight, and so does a dry run,
+# even when the base is checked out nowhere and only its ref would move.
+ah_repo=$(_tmpdir)
+ah_remote=$(_tmpdir)
+ah_linked="$(_tmpdir)/linked"
+ah_log=$(_tmpdir)/gh.log
+_init_repo "$ah_repo" "$ah_remote"
+git -C "$ah_repo" switch --quiet main
+_commit_file "$ah_repo" local.txt local "unpushed base work"
+git -C "$ah_repo" switch --quiet --detach
+git -C "$ah_repo" worktree add --quiet "$ah_linked" feature
+ah_local=$(git -C "$ah_repo" rev-parse refs/heads/main)
+for ah_mode in real dry; do
+  ah_args=()
+  ah_prefix=""
+  if [[ "$ah_mode" == dry ]]; then
+    ah_args=(--dry-run)
+    ah_prefix="would refuse: "
+  fi
+  ah_rc=0
+  result=$(GH_LOG="$ah_log" PATH="$bin_dir:$PATH" \
+    _pr_land "$ah_linked" 4 ${ah_args[@]+"${ah_args[@]}"} 2>&1) || ah_rc=$?
+  _assert_eq "ahead base: $ah_mode run refuses" 1 "$ah_rc"
+  _assert_contains "ahead base: $ah_mode run reports why" \
+    "${ah_prefix}local main cannot fast-forward to origin/main" "$result"
+  _assert_not_contains "ahead base: $ah_mode run does not claim a landing" \
+    "PR #4 (feature ->" "$result"
+done
+if [[ -s "$ah_log" ]]; then
+  _fail "ahead base: nothing is merged"
+else
+  _pass "ahead base: nothing is merged"
+fi
+_assert_eq "ahead base: the local base is left alone" "$ah_local" \
+  "$(git -C "$ah_repo" rev-parse refs/heads/main)"
+
+# Dry runs refuse for local changes, in the base worktree or the current one,
+# exactly where the real run refuses.
+for dl_case in base current; do
+  dl_repo=$(_tmpdir)
+  dl_remote=$(_tmpdir)
+  dl_base="$(_tmpdir)/base"
+  dl_log=$(_tmpdir)/gh.log
+  _init_repo "$dl_repo" "$dl_remote"
+  git -C "$dl_repo" worktree add --quiet "$dl_base" main
+  case "$dl_case" in
+    base)
+      printf '%s\n' "local edit" >"$dl_base/README.md"
+      dl_expected="base worktree must be clean: $(_canonical_path "$dl_base")"
+      ;;
+    current)
+      printf '%s\n' "local edit" >"$dl_repo/README.md"
+      dl_expected="worktree must be clean"
+      ;;
+  esac
+  for dl_mode in real dry; do
+    dl_args=()
+    dl_prefix=""
+    if [[ "$dl_mode" == dry ]]; then
+      dl_args=(--dry-run)
+      dl_prefix="would refuse: "
+    fi
+    dl_rc=0
+    result=$(GH_LOG="$dl_log" PATH="$bin_dir:$PATH" \
+      _pr_land "$dl_repo" 4 ${dl_args[@]+"${dl_args[@]}"} 2>&1) || dl_rc=$?
+    _assert_eq "$dl_case worktree changes: $dl_mode run refuses" 1 "$dl_rc"
+    _assert_contains "$dl_case worktree changes: $dl_mode run reports why" \
+      "$dl_prefix$dl_expected" "$result"
+  done
+  if [[ -s "$dl_log" ]]; then
+    _fail "$dl_case worktree changes: nothing is merged"
+  else
+    _pass "$dl_case worktree changes: nothing is merged"
+  fi
+done
+
+# The base handed over by git pr-land-stack must match in a real run, and in a
+# dry run replaces the PR's current base, which the real run would have
+# retargeted by then.
+eb_repo=$(_tmpdir)
+eb_remote=$(_tmpdir)
+eb_log=$(_tmpdir)/gh.log
+_init_repo "$eb_repo" "$eb_remote"
+git -C "$eb_repo" push --quiet origin main:release
+eb_rc=0
+result=$(GH_LOG="$eb_log" PATH="$bin_dir:$PATH" \
+  _pr_land "$eb_repo" 4 --expect-base release 2>&1) || eb_rc=$?
+_assert_eq "mismatched expected base refuses" 1 "$eb_rc"
+_assert_contains "mismatched expected base is reported" \
+  "PR #4 base changed since stack discovery" "$result"
+if [[ -s "$eb_log" ]]; then
+  _fail "mismatched expected base merges nothing"
+else
+  _pass "mismatched expected base merges nothing"
+fi
+eb_rc=0
+result=$(GH_LOG="$eb_log" PATH="$bin_dir:$PATH" \
+  _pr_land "$eb_repo" 4 --dry-run --expect-base release 2>&1) || eb_rc=$?
+_assert_eq "dry run with an expected base succeeds" 0 "$eb_rc"
+_assert_contains "dry run syncs the expected base" \
+  "syncing release from origin" "$result"
+_assert_contains "dry run lands into the expected base" \
+  "would land PR #4 (feature -> release)" "$result"
 
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2

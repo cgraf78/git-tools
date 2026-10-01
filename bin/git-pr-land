@@ -50,14 +50,23 @@ _target=""
 _method="squash"
 _dry_run=0
 _expected_topology=""
+_expected_base=""
 
 _run() {
   if [[ "$_dry_run" == 1 ]]; then
     printf 'git pr-land: would run:' >&2
-    if [[ "${1:-}" == gt_gh_pr ]]; then
-      shift
-      printf ' gh pr' >&2
-    fi
+    case "${1:-}" in
+      gt_gh_pr)
+        shift
+        printf ' gh pr' >&2
+        ;;
+      # Show the Git command the user would type; clearing the inherited
+      # repository environment is an implementation detail.
+      gt_git_without_local_env)
+        shift
+        printf ' git' >&2
+        ;;
+    esac
     printf ' %q' "$@" >&2
     printf '\n' >&2
     return 0
@@ -94,6 +103,21 @@ while (($#)); do
       _expected_topology="${1#--expect-topology=}"
       [[ -n "$_expected_topology" ]] ||
         gt_usage_error "--expect-topology requires a value"
+      shift
+      ;;
+    # Private handoff: the base `git pr-land-stack` retargets this PR to before
+    # landing it. A stack dry run cannot retarget, so it plans the base sync
+    # and its preflight against this base instead of the PR's current one.
+    --expect-base)
+      shift
+      (($#)) || gt_usage_error "--expect-base requires a value"
+      _expected_base="$1"
+      shift
+      ;;
+    --expect-base=*)
+      _expected_base="${1#--expect-base=}"
+      [[ -n "$_expected_base" ]] ||
+        gt_usage_error "--expect-base requires a value"
       shift
       ;;
     -n | --dry-run)
@@ -136,6 +160,15 @@ _worktree_status() {
   gt_git_without_local_env -C "$1" status --porcelain
 }
 
+# Stop before the merge. A dry run makes the same checks as the real run, so it
+# reports the refusal the real run would make instead of a successful landing.
+_refuse() {
+  if [[ "$_dry_run" == 1 ]]; then
+    gt_die "would refuse: $*"
+  fi
+  gt_die "$*"
+}
+
 _load_exact_base_oid() {
   local remote="$1" url="$2" base="$3" status=0
 
@@ -162,7 +195,7 @@ _preflight_local_plan() {
   _load_exact_base_oid "$remote" "$url" "$base" || ref_status=$?
   case "$ref_status" in
     0) ;;
-    1) gt_die "base branch does not exist on $remote: $base" ;;
+    1) _refuse "base branch does not exist on $remote: $base" ;;
     *) gt_die "could not fetch exact base branch from $remote: $base" ;;
   esac
   _preflight_base_oid=$_exact_base_oid
@@ -172,7 +205,7 @@ _preflight_local_plan() {
   operation=$(gt_worktree_operation "") ||
     gt_die "could not inspect current worktree operation"
   [[ -z "$operation" ]] ||
-    gt_die "current worktree has $operation in progress: $current_worktree"
+    _refuse "current worktree has $operation in progress: $current_worktree"
   # Refuse before the irreversible merge when the base cannot be synchronized
   # afterwards. Reservations are scanned even from the main worktree so a
   # reserved base refuses here rather than in `git switch` after the merge. A
@@ -183,9 +216,12 @@ _preflight_local_plan() {
   if [[ "$GT_BASE_SYNC_ACTION" != external ]]; then
     ref_status=0
     _local_branch_exists "$base" || ref_status=$?
-    if [[ "$ref_status" == 0 ]]; then
+    # A dry run only queried the remote OID, so ancestry can be checked only
+    # when that commit already exists locally.
+    if [[ "$ref_status" == 0 ]] && { [[ "$_dry_run" != 1 ]] ||
+      git cat-file -e "$_preflight_base_oid^{commit}" 2>/dev/null; }; then
       git merge-base --is-ancestor "$GT_REF_OID" "$_preflight_base_oid" 2>/dev/null ||
-        gt_die "local $base cannot fast-forward to $remote/$base"
+        _refuse "local $base cannot fast-forward to $remote/$base"
     elif [[ "$ref_status" != 1 ]]; then
       gt_die "could not inspect local base branch: $base"
     fi
@@ -196,10 +232,10 @@ _preflight_local_plan() {
       operation=$(gt_worktree_operation "$base_worktree") ||
         gt_die "could not inspect base worktree operation: $base_worktree"
       [[ -z "$operation" ]] ||
-        gt_die "base worktree has $operation in progress: $base_worktree"
+        _refuse "base worktree has $operation in progress: $base_worktree"
       status=$(_worktree_status "$base_worktree") ||
         gt_die "could not inspect base worktree: $base_worktree"
-      [[ -z "$status" ]] || gt_die "base worktree must be clean: $base_worktree"
+      [[ -z "$status" ]] || _refuse "base worktree must be clean: $base_worktree"
       ;;
     unknown) gt_die "could not inspect worktrees" ;;
   esac
@@ -216,8 +252,14 @@ _sync_base() {
   local base="$3"
   local base_oid path
 
-  _load_exact_base_oid "$remote" "$url" "$base" || return 1
-  base_oid=$_exact_base_oid
+  # A dry run merges nothing, so the OID preflight saw is still the one to plan
+  # with; a real run fetches the base again to pick up the merge.
+  if [[ "$_dry_run" == 1 ]]; then
+    base_oid=$_preflight_base_oid
+  else
+    _load_exact_base_oid "$remote" "$url" "$base" || return 1
+    base_oid=$_exact_base_oid
+  fi
   gt_plan_base_sync "$base" 1 || return 1
   path=$GT_BASE_SYNC_PATH
 
@@ -297,19 +339,15 @@ _fast_forward_base_ref() {
   esac
   [[ "$local_oid" != "$base_oid" ]] || return 0
   # A dry run only queried the remote OID, so its ancestry can be checked only
-  # when that commit already exists locally.
+  # when that commit already exists locally. Preflight refuses a divergent base
+  # before merging, so divergence here means the base moved since then.
   if [[ "$_dry_run" != 1 ]] ||
     git cat-file -e "$base_oid^{commit}" 2>/dev/null; then
     if git merge-base --is-ancestor "$base_oid" "$local_oid" 2>/dev/null; then
       return 0
     fi
-    if ! git merge-base --is-ancestor "$local_oid" "$base_oid" 2>/dev/null; then
-      # A real run refuses this in preflight, before merging; a dry run skips
-      # preflight, so report the refusal instead of claiming a merged PR.
-      [[ "$_dry_run" == 1 ]] || return 1
-      gt_say "would refuse: local $base cannot fast-forward to $remote/$base"
-      return 0
-    fi
+    git merge-base --is-ancestor "$local_oid" "$base_oid" 2>/dev/null ||
+      return 1
   fi
   _run git update-ref -m "$message" "refs/heads/$base" "$base_oid" "$local_oid" ||
     return 1
@@ -347,9 +385,8 @@ _require_expected_topology() {
 gt_require_repo
 gt_refuse_external_checkout "$_dry_run"
 gt_require_gh
-if [[ "$_dry_run" != 1 ]]; then
-  gt_require_clean_worktree
-fi
+_status=$(git status --porcelain) || gt_die "could not inspect worktree status"
+[[ -z "$_status" ]] || _refuse "worktree must be clean"
 
 _target_repo_status=0
 gt_validate_pr_target_repository "$_target" || _target_repo_status=$?
@@ -406,8 +443,18 @@ case "$_base_remote_status" in
   1) gt_die "could not resolve one exact fetch remote for the base repository" ;;
   *) gt_die "could not inspect configured fetch remotes for the base repository" ;;
 esac
+# The base this landing syncs: the PR's own, or in a stack dry run the base the
+# real run would have retargeted it to by now.
+_sync_base_branch=$_base
+if [[ -n "$_expected_base" ]]; then
+  if [[ "$_dry_run" == 1 ]]; then
+    _sync_base_branch=$_expected_base
+  elif [[ "$_expected_base" != "$_base" ]]; then
+    gt_die "PR #$_number base changed since stack discovery"
+  fi
+fi
+_preflight_local_plan "$_remote" "$_base_remote_url" "$_sync_base_branch"
 if [[ "$_dry_run" != 1 ]]; then
-  _preflight_local_plan "$_remote" "$_base_remote_url" "$_base"
   _head_remote=""
   _head_remote_url=""
   _head_remote_map_status=0
@@ -466,9 +513,9 @@ if [[ "$_dry_run" != 1 ]]; then
   fi
 fi
 
-gt_say "syncing $_base from $_remote"
-_sync_base "$_remote" "$_base_remote_url" "$_base" ||
-  _cleanup_incomplete "could not fast-forward $_base from $_remote"
+gt_say "syncing $_sync_base_branch from $_remote"
+_sync_base "$_remote" "$_base_remote_url" "$_sync_base_branch" ||
+  _cleanup_incomplete "could not fast-forward $_sync_base_branch from $_remote"
 if [[ "$_dry_run" != 1 && -n "${_head_remote_url:-}" ]]; then
   gt_say "preserving remote PR head $_head at $_remote_head_oid; delete it manually after verifying no pull request consumes it"
 elif [[ "$_dry_run" != 1 ]]; then
@@ -477,4 +524,8 @@ fi
 _report_local_head "$_head" ||
   _cleanup_incomplete "could not inspect local branch $_head for manual cleanup"
 
-gt_say "landed PR #$_number ($_head -> $_base)"
+if [[ "$_dry_run" == 1 ]]; then
+  gt_say "would land PR #$_number ($_head -> $_sync_base_branch)"
+else
+  gt_say "landed PR #$_number ($_head -> $_base)"
+fi

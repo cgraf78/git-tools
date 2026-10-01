@@ -35,9 +35,10 @@ _snapshot_tool_dir() {
     return 0
   }
 
-  # `git pr-land` switches the checkout to the landing base after each merge.
-  # Keep the helper implementations stable for the whole orchestration instead
-  # of reading whatever files happen to exist after those branch switches.
+  # `git pr-land` can switch the checkout to the landing base after each merge,
+  # and `git pr-restack` checks out each child. Keep the helper implementations
+  # stable for the whole orchestration instead of reading whatever files happen
+  # to exist after those branch switches.
   _tool_tmp=$(mktemp -d)
   mkdir -p "$_tool_tmp/bin" "$_tool_tmp/lib"
   cp "$_root/bin/git-pr-land" "$_tool_tmp/bin/git-pr-land"
@@ -97,11 +98,15 @@ _run_tool() {
 }
 
 _preflight_stack_topology() {
-  local current head_worktree index operation
+  local current current_ref head_worktree index operation
 
   gt_find_current_worktree || gt_die "could not resolve current worktree"
   current=$GT_WORKTREE_PATH
-  operation=$(gt_worktree_operation "$current") ||
+  # Recognize the current checkout by its HEAD as well as its path: Git lists
+  # a main worktree with a separate Git directory or `core.worktree` by that
+  # Git directory, so its path never matches the checkout's top level.
+  current_ref=$(git symbolic-ref -q HEAD) || current_ref=""
+  operation=$(gt_worktree_operation "") ||
     gt_die "could not inspect current worktree operation"
   [[ -z "$operation" ]] ||
     gt_die "current worktree has $operation in progress: $current"
@@ -111,7 +116,8 @@ _preflight_stack_topology() {
       gt_find_worktree_reserving_branch "${_heads[$index]}" ||
         gt_die "could not inspect worktrees"
       head_worktree=$GT_WORKTREE_PATH
-      if [[ -n "$head_worktree" && "$head_worktree" != "$current" ]]; then
+      if [[ -n "$head_worktree" && "$head_worktree" != "$current" &&
+        "$current_ref" != "refs/heads/${_heads[$index]}" ]]; then
         gt_die "stack branch ${_heads[$index]} is checked out or reserved in another worktree: $head_worktree"
       fi
     fi

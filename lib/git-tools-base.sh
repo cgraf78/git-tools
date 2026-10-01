@@ -1033,13 +1033,20 @@ gt_worktree_reserving_branch() {
 }
 
 # @brief Print the active sequencer operation in a worktree, if any.
+# @param $1 Worktree path, or empty for the invoking checkout. The invoking
+#   checkout keeps its inherited Git environment, because a checkout driven by
+#   GIT_DIR (dotfiles-style) cannot be found again from its work tree path.
 gt_worktree_operation() {
   local path="$1"
   local entry label state_path
 
   while IFS=$'\t' read -r entry label; do
-    state_path=$(gt_git_without_local_env -C "$path" rev-parse --git-path "$entry" 2>/dev/null) ||
-      return 1
+    if [[ -z "$path" ]]; then
+      state_path=$(git rev-parse --git-path "$entry" 2>/dev/null) || return 1
+    else
+      state_path=$(gt_git_without_local_env -C "$path" rev-parse --git-path "$entry" 2>/dev/null) ||
+        return 1
+    fi
     [[ -e "$state_path" ]] || continue
     printf '%s\n' "$label"
     return 0

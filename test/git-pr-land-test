@@ -15,6 +15,22 @@ _failures=0
 gt_test_temp_init || exit 1
 _tmpdir() { gt_test_temp_dir; }
 
+# Run fixtures and the tool against the real Git with private configuration.
+# A Git launcher earlier on PATH, the caller's global, system, or XDG settings,
+# and repository variables inherited from a Git hook or alias must not
+# influence fixtures or the tool.
+_hermetic_bin=$(_tmpdir) || exit 1
+ln -s "$(type -a -p git | tail -n 1)" "$_hermetic_bin/git" || exit 1
+HOME=$(_tmpdir) || exit 1
+export HOME
+export XDG_CONFIG_HOME="$HOME/.config"
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
+# shellcheck disable=SC2046 # Git prints one variable name per line.
+unset $("$_hermetic_bin/git" rev-parse --local-env-vars) \
+  GIT_NAMESPACE GIT_CEILING_DIRECTORIES GIT_DEFAULT_HASH
+PATH="$_hermetic_bin:$PATH"
+
 _canonical_path() {
   (cd -P -- "$1" && pwd)
 }
@@ -52,6 +68,20 @@ _assert_contains() {
   else
     _fail "$name"
     printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_assert_not_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" != *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output NOT to contain: %s\n' "$needle" >&2
     printf '  actual output:\n%s\n' "$haystack" >&2
   fi
 }
@@ -1340,6 +1370,266 @@ _assert_contains "refuses dirty merge state" "merge state is DIRTY" "$result"
 
 result=$(GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 --method bad 2>&1 || true)
 _assert_contains "validates merge method" "merge method must be squash, merge, or rebase" "$result"
+
+# Base synchronization follows the `git cleanup-repo` rules: a linked worktree
+# never takes the base over, a reservation is never merged into, and an
+# external main checkout is left to its own tooling.
+
+# Advance the remote base by one commit and print the new OID.
+_advance_remote_main() {
+  local remote="$1" updater
+
+  updater=$(_tmpdir) || return 1
+  git clone --quiet "$remote" "$updater"
+  git -C "$updater" config user.email test@test.com
+  git -C "$updater" config user.name Test
+  git -C "$updater" config core.hooksPath /dev/null
+  _commit_file "$updater" base-2.txt base-2 base-2
+  git -C "$updater" push --quiet origin main
+  git -C "$updater" rev-parse HEAD
+}
+
+# With the base checked out nowhere, a linked worktree advances only the ref.
+lr_repo=$(_tmpdir)
+lr_remote=$(_tmpdir)
+lr_linked="$(_tmpdir)/linked"
+lr_log=$(_tmpdir)/gh.log
+_init_repo "$lr_repo" "$lr_remote"
+git -C "$lr_repo" switch --quiet --detach
+git -C "$lr_repo" worktree add --quiet "$lr_linked" feature
+lr_new=$(_advance_remote_main "$lr_remote")
+lr_rc=0
+result=$(GH_LOG="$lr_log" PATH="$bin_dir:$PATH" _pr_land "$lr_linked" 4 2>&1) ||
+  lr_rc=$?
+_assert_eq "linked landing with an unchecked-out base succeeds" 0 "$lr_rc"
+_assert_eq "linked landing keeps the linked worktree on its branch" feature \
+  "$(git -C "$lr_linked" branch --show-current)"
+_assert_eq "linked landing fast-forwards the base ref" "$lr_new" \
+  "$(git -C "$lr_repo" rev-parse refs/heads/main)"
+_assert_eq "linked landing leaves the main worktree detached" "" \
+  "$(git -C "$lr_repo" branch --show-current)"
+_assert_contains "linked landing reports the ref-only update" \
+  "fast-forwarded main to origin/main; no worktree has it checked out" "$result"
+_assert_eq "linked landing records the ref update in the reflog" \
+  "pr-land: fast-forward main to origin/main" \
+  "$(git -C "$lr_repo" reflog -1 --format=%gs refs/heads/main)"
+
+# A base worktree is fast-forwarded in place, and the update is reported.
+lw_repo=$(_tmpdir)
+lw_remote=$(_tmpdir)
+lw_base="$(_tmpdir)/base"
+lw_log=$(_tmpdir)/gh.log
+_init_repo "$lw_repo" "$lw_remote"
+git -C "$lw_repo" worktree add --quiet "$lw_base" main
+lw_new=$(_advance_remote_main "$lw_remote")
+lw_rc=0
+result=$(GH_LOG="$lw_log" PATH="$bin_dir:$PATH" _pr_land "$lw_repo" 4 2>&1) ||
+  lw_rc=$?
+_assert_eq "landing beside a base worktree succeeds" 0 "$lw_rc"
+_assert_eq "landing fast-forwards the base worktree" "$lw_new" \
+  "$(git -C "$lw_base" rev-parse HEAD)"
+_assert_eq "landing keeps the main worktree on its branch" feature \
+  "$(git -C "$lw_repo" branch --show-current)"
+_assert_contains "landing reports updating the base worktree" \
+  "fast-forwarded main in worktree $lw_base" "$result"
+
+# A detached bisect that reserves the base is never merged into.
+rd_repo=$(_tmpdir)
+rd_remote=$(_tmpdir)
+rd_base=$(_tmpdir)
+rd_log=$(_tmpdir)/gh.log
+_init_repo "$rd_repo" "$rd_remote"
+git -C "$rd_repo" worktree add --quiet "$rd_base" main
+_commit_file "$rd_base" base-2.txt base-2 base-2
+_commit_file "$rd_base" base-3.txt base-3 base-3
+git -C "$rd_base" push --quiet origin main
+git -C "$rd_base" bisect start HEAD HEAD~2 >/dev/null
+rd_rc=0
+result=$(GH_LOG="$rd_log" PATH="$bin_dir:$PATH" \
+  _pr_land "$rd_repo" 4 --dry-run 2>&1) || rd_rc=$?
+_assert_eq "reserved base dry run succeeds" 0 "$rd_rc"
+_assert_contains "reserved base dry run reports the reservation" \
+  "not updating main; reserved by worktree $(_canonical_path "$rd_base")" \
+  "$result"
+if [[ "$result" == *"merge --quiet --ff-only"* ]]; then
+  _fail "reserved base dry run plans no merge into the reservation"
+else
+  _pass "reserved base dry run plans no merge into the reservation"
+fi
+
+# A main checkout with a separate Git directory that has the base checked out
+# merges in place; Git lists it by its Git directory, not its work tree.
+sg_repo=$(_tmpdir)
+sg_remote=$(_tmpdir)
+sg_gitdir="$(_tmpdir)/repo.git"
+sg_log=$(_tmpdir)/gh.log
+_init_repo "$sg_repo" "$sg_remote"
+git -C "$sg_repo" init --quiet --separate-git-dir "$sg_gitdir"
+git -C "$sg_repo" switch --quiet main
+sg_new=$(_advance_remote_main "$sg_remote")
+sg_rc=0
+result=$(GH_LOG="$sg_log" PATH="$bin_dir:$PATH" _pr_land "$sg_repo" 4 2>&1) ||
+  sg_rc=$?
+_assert_eq "separate Git directory landing on the base succeeds" 0 "$sg_rc"
+_assert_eq "separate Git directory base is fast-forwarded in place" \
+  "$sg_new" "$(git -C "$sg_repo" rev-parse HEAD)"
+_assert_eq "separate Git directory work tree follows the base" "" \
+  "$(git -C "$sg_repo" status --porcelain)"
+
+# The owner's dotfiles layout: a non-bare Git directory whose `core.worktree`
+# is another directory, with linked worktrees elsewhere.
+# Sets df_gitdir, df_home, df_linked, and df_old.
+_dotfiles_fixture() {
+  local remote
+
+  df_home=$(_tmpdir)
+  remote=$(_tmpdir)
+  df_gitdir="$(_tmpdir)/dotfiles"
+  df_linked="$(_tmpdir)/linked"
+  _init_repo "$df_home" "$remote"
+  mv "$df_home/.git" "$df_gitdir"
+  git --git-dir="$df_gitdir" config core.worktree "$df_home"
+  git --git-dir="$df_gitdir" switch --quiet main
+  git --git-dir="$df_gitdir" worktree add --quiet "$df_linked" feature
+  df_old=$(git --git-dir="$df_gitdir" rev-parse refs/heads/main)
+  df_new=$(_advance_remote_main "$remote")
+}
+
+# From a linked worktree the external main checkout is never merged into.
+_dotfiles_fixture
+df_log=$(_tmpdir)/gh.log
+df_home_head=$(git --git-dir="$df_gitdir" rev-parse HEAD)
+df_rc=0
+result=$(GH_LOG="$df_log" GH_PR_HEAD_OID="$(git --git-dir="$df_gitdir" \
+  rev-parse refs/remotes/origin/feature)" PATH="$bin_dir:$PATH" \
+  _pr_land "$df_linked" 4 2>&1) || df_rc=$?
+_assert_eq "linked landing beside an external main checkout succeeds" \
+  0 "$df_rc"
+_assert_contains "external main checkout is left to its own tooling" \
+  "not updating main in $df_home; update that checkout with its own tooling" \
+  "$result"
+_assert_eq "external main checkout base ref is not moved" "$df_old" \
+  "$(git --git-dir="$df_gitdir" rev-parse refs/heads/main)"
+_assert_eq "external main checkout HEAD is not moved" "$df_home_head" \
+  "$(git --git-dir="$df_gitdir" rev-parse HEAD)"
+_assert_eq "external main checkout stays clean" "" \
+  "$(git --git-dir="$df_gitdir" status --porcelain)"
+_assert_eq "external main checkout leaves the linked worktree on its branch" \
+  feature "$(git -C "$df_linked" branch --show-current)"
+
+# From the external main checkout itself, the base merges in place.
+_dotfiles_fixture
+df_log=$(_tmpdir)/gh.log
+df_rc=0
+result=$(cd "$df_home" && GIT_DIR="$df_gitdir" GH_LOG="$df_log" \
+  GH_TEST_REPO="$df_home" GH_PR_HEAD_OID="$(git --git-dir="$df_gitdir" \
+    rev-parse refs/remotes/origin/feature)" PATH="$bin_dir:$PATH" \
+  "$ROOT/bin/git-pr-land" 4 2>&1) || df_rc=$?
+_assert_eq "external main checkout landing on the base succeeds" 0 "$df_rc"
+_assert_eq "external main checkout base is fast-forwarded in place" \
+  "$df_new" "$(git --git-dir="$df_gitdir" rev-parse HEAD)"
+_assert_eq "external main checkout files follow the base" "" \
+  "$(git --git-dir="$df_gitdir" status --porcelain)"
+_assert_not_contains "external main checkout is not treated as another" \
+  "not updating main" "$result"
+
+# An external main checkout is never touched, so a local base that cannot
+# fast-forward there does not block landing from a linked worktree.
+_dotfiles_fixture
+df_log=$(_tmpdir)/gh.log
+printf '%s\n' local >"$df_home/local.txt"
+git --git-dir="$df_gitdir" -C "$df_home" add local.txt
+git --git-dir="$df_gitdir" -C "$df_home" commit --quiet -m "local-only base work"
+df_local=$(git --git-dir="$df_gitdir" rev-parse refs/heads/main)
+df_rc=0
+result=$(GH_LOG="$df_log" GH_PR_HEAD_OID="$(git --git-dir="$df_gitdir" \
+  rev-parse refs/remotes/origin/feature)" PATH="$bin_dir:$PATH" \
+  _pr_land "$df_linked" 4 2>&1) || df_rc=$?
+_assert_eq "external main checkout with a divergent base still lands" \
+  0 "$df_rc"
+_assert_eq "external main checkout keeps its divergent base" "$df_local" \
+  "$(git --git-dir="$df_gitdir" rev-parse refs/heads/main)"
+
+# A bare repository driven by GIT_DIR and GIT_WORK_TREE inherits those
+# variables into pr-land. The base worktree's status and fast-forward must
+# still run in that worktree, not in the invoking work tree.
+# Sets bw_gitdir, bw_work, bw_base, and bw_new.
+_bare_work_tree_fixture() {
+  local remote
+
+  bw_work=$(_tmpdir)
+  remote=$(_tmpdir)
+  bw_gitdir="$(_tmpdir)/cfg.git"
+  bw_base="$(_tmpdir)/base"
+  _init_repo "$bw_work" "$remote"
+  mv "$bw_work/.git" "$bw_gitdir"
+  git --git-dir="$bw_gitdir" config core.bare true
+  git --git-dir="$bw_gitdir" worktree add --quiet "$bw_base" main
+  bw_new=$(_advance_remote_main "$remote")
+}
+
+_bare_work_tree_land() {
+  (cd "$bw_work" && GIT_DIR="$bw_gitdir" GIT_WORK_TREE="$bw_work" \
+    GH_LOG="$1" GH_PR_HEAD_OID="$(git --git-dir="$bw_gitdir" \
+      rev-parse refs/remotes/origin/feature)" PATH="$bin_dir:$PATH" \
+    "$ROOT/bin/git-pr-land" 4)
+}
+
+_bare_work_tree_fixture
+bw_log=$(_tmpdir)/gh.log
+bw_rc=0
+result=$(_bare_work_tree_land "$bw_log" 2>&1) || bw_rc=$?
+_assert_eq "explicit work tree landing beside a base worktree succeeds" \
+  0 "$bw_rc"
+_assert_eq "explicit work tree landing fast-forwards the base worktree" \
+  "$bw_new" "$(git -C "$bw_base" rev-parse HEAD)"
+_assert_eq "explicit work tree landing keeps the base worktree clean" "" \
+  "$(git -C "$bw_base" status --porcelain)"
+_assert_eq "explicit work tree landing keeps its own branch" \
+  refs/heads/feature "$(git --git-dir="$bw_gitdir" symbolic-ref HEAD)"
+_assert_eq "explicit work tree landing leaves its own branch in place" \
+  "$(git --git-dir="$bw_gitdir" rev-parse refs/remotes/origin/feature)" \
+  "$(git --git-dir="$bw_gitdir" rev-parse refs/heads/feature)"
+
+_bare_work_tree_fixture
+bw_log=$(_tmpdir)/gh.log
+printf '%s\n' "local edit" >"$bw_base/README.md"
+bw_rc=0
+result=$(_bare_work_tree_land "$bw_log" 2>&1) || bw_rc=$?
+_assert_eq "explicit work tree landing beside a dirty base worktree refuses" \
+  1 "$bw_rc"
+_assert_contains "explicit work tree landing inspects the base worktree" \
+  "base worktree must be clean: $bw_base" "$result"
+if [[ -s "$bw_log" ]]; then
+  _fail "explicit work tree landing does not merge beside a dirty base"
+else
+  _pass "explicit work tree landing does not merge beside a dirty base"
+fi
+
+# A dry run reports the refusal a real run makes in preflight when the local
+# base cannot fast-forward, instead of claiming the PR merged.
+dv_repo=$(_tmpdir)
+dv_remote=$(_tmpdir)
+dv_linked="$(_tmpdir)/linked"
+dv_log=$(_tmpdir)/gh.log
+_init_repo "$dv_repo" "$dv_remote"
+git -C "$dv_repo" switch --quiet main
+_commit_file "$dv_repo" local.txt local "local-only base work"
+git -C "$dv_repo" switch --quiet --detach
+git -C "$dv_repo" worktree add --quiet "$dv_linked" feature
+_advance_remote_main "$dv_remote" >/dev/null
+git -C "$dv_repo" fetch --quiet origin
+dv_local=$(git -C "$dv_repo" rev-parse refs/heads/main)
+dv_rc=0
+result=$(GH_LOG="$dv_log" PATH="$bin_dir:$PATH" \
+  _pr_land "$dv_linked" 4 --dry-run 2>&1) || dv_rc=$?
+_assert_eq "divergent base dry run succeeds" 0 "$dv_rc"
+_assert_contains "divergent base dry run reports the refusal" \
+  "would refuse: local main cannot fast-forward to origin/main" "$result"
+_assert_not_contains "divergent base dry run does not claim a merge" \
+  "merged; cleanup incomplete" "$result"
+_assert_eq "divergent base dry run leaves the base alone" "$dv_local" \
+  "$(git -C "$dv_repo" rev-parse refs/heads/main)"
 
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2

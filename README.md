@@ -269,8 +269,16 @@ immediately before merging, and post-merge verification remains bound to that
 same PR number and topology. The merge request is pinned with GitHub's
 `--match-head-commit`, and an exactly mapped live remote head must equal the
 structured PR head OID.
-An already-checked-out base is synchronized in its owning worktree. If GitHub
-reports an error after completing the server-side merge,
+The local base is synchronized under the same rules as `git cleanup-repo`: it
+is fast-forwarded in the worktree that has it checked out, the main worktree
+may switch to it, and a linked worktree never does, advancing only the base ref
+when nothing has it checked out. Any update to another checkout is reported.
+The command refuses before merging when the worktree that would receive the
+base has local changes or an active operation, or when a rebase or bisect
+reserves the base. A base checked out in a main worktree whose files live
+outside its Git directory (such as a `core.worktree` dotfiles checkout) is
+never touched or inspected; it is reported with a `not updating` message.
+If GitHub reports an error after completing the server-side merge,
 the command rechecks structured PR state and identifies any remaining work as
 incomplete cleanup instead of incorrectly reporting that the merge failed.
 Local deletion is intentionally manual because Git has no portable primitive

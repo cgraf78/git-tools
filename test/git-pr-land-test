@@ -771,6 +771,7 @@ git -C "$chain_repo" remote set-url origin "$chain_url"
 git -C "$chain_repo" config "url.$chain_effective.pushInsteadOf" "$chain_url"
 _write_gh_stub "$chain_bin"
 rm -f "$chain_bin/git"
+# GIT_SSH_COMMAND is run through the shell, so uses below quote this path.
 _write_git_remote_ssh "$chain_ssh"
 chain_parameters="'url.file://$chain_unrelated.insteadOf'='$chain_effective' "
 chain_parameters+="'url.file://$chain_unrelated.pushInsteadOf'='$chain_effective'"
@@ -794,7 +795,7 @@ pin_oid=$(git -C "$pin_expected" rev-parse refs/heads/feature)
 pin_parameters="'url.file://$pin_unrelated.insteadOf'='$chain_effective' "
 pin_parameters+="'url.file://$pin_unrelated.pushInsteadOf'='$chain_effective'"
 (cd "$pin_repo" && GIT_CONFIG_PARAMETERS="$pin_parameters" \
-  GIT_SSH_COMMAND="$chain_ssh" GIT_TEST_SSH_REPO="$pin_expected" \
+  GIT_SSH_COMMAND="$(printf %q "$chain_ssh")" GIT_TEST_SSH_REPO="$pin_expected" \
   ROOT="$ROOT" PIN_URL="$chain_effective" PIN_OID="$pin_oid" \
   /bin/bash -c '. "$ROOT/lib/git-tools-base.sh"; gt_push_exact_url "$PIN_URL" "--force-with-lease=refs/heads/feature:$PIN_OID" ":refs/heads/feature"') \
   >/dev/null 2>&1 || true
@@ -809,7 +810,7 @@ fi
 chain_rc=0
 chain_output=$(cd "$chain_repo" &&
   GH_LOG="$chain_log" PATH="$chain_bin:$ROOT/bin:$PATH" \
-    GIT_SSH_COMMAND="$chain_ssh" \
+    GIT_SSH_COMMAND="$(printf %q "$chain_ssh")" \
     GIT_TEST_SSH_REPO="$chain_expected" \
     /usr/bin/git \
     -c "url.file://$chain_unrelated.insteadOf=$chain_effective" \
@@ -879,7 +880,10 @@ cat "$buffer"
 rm -f -- "$buffer"
 EOF
 chmod +x "$checkout_state/smudge"
-git -C "$checkout_repo" config filter.stall.smudge "$checkout_state/smudge"
+# Git runs filter commands through the shell, so quote the path (TMPDIR may
+# contain spaces).
+git -C "$checkout_repo" config filter.stall.smudge \
+  "$(printf %q "$checkout_state/smudge")"
 git -C "$checkout_repo" config filter.stall.clean cat
 git -C "$checkout_repo" config filter.stall.required true
 (

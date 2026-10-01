@@ -846,7 +846,8 @@ chain_stack_rc=0
 chain_stack_output=$(cd "$chain_stack_repo" &&
   PATH="$chain_stack_path:$ROOT/bin:/usr/bin:/bin" GIT_TOOLS_TOOL_DIR="$bin_dir" \
     STACK_LOG="$chain_stack_log" \
-    GIT_SSH_COMMAND="$chain_stack_ssh" GIT_TEST_SSH_REPO="$chain_stack_expected" \
+    GIT_SSH_COMMAND="$(printf %q "$chain_stack_ssh")" \
+    GIT_TEST_SSH_REPO="$chain_stack_expected" \
     /usr/bin/git \
     -c "url.file://$chain_stack_unrelated.insteadOf=$chain_stack_effective" \
     -c "url.file://$chain_stack_unrelated.pushInsteadOf=$chain_stack_effective" \

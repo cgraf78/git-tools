@@ -1457,6 +1457,45 @@ else
   _pass "reserved base dry run plans no merge into the reservation"
 fi
 
+# A rebase or bisect of the base in the main worktree refuses landing from a
+# linked worktree before the merge. Git reports the main worktree's state
+# files relative to it, so they must not be looked up under the caller.
+_main_reservation_land() {
+  local kind="$1" repo remote linked log rc=0 old out
+
+  repo=$(_tmpdir)
+  remote=$(_tmpdir)
+  linked="$(_tmpdir)/linked"
+  log=$(_tmpdir)/gh.log
+  _init_repo "$repo" "$remote"
+  git -C "$repo" switch --quiet main
+  git -C "$repo" worktree add --quiet "$linked" feature
+  _advance_remote_main "$remote" >/dev/null
+  case "$kind" in
+    rebase)
+      git -C "$repo" rebase --quiet --exec false --root >/dev/null 2>&1
+      ;;
+    bisect)
+      git -C "$repo" bisect start >/dev/null
+      git -C "$repo" switch --quiet --detach 2>/dev/null
+      ;;
+  esac
+  old=$(git -C "$repo" rev-parse refs/heads/main)
+  out=$(GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$linked" 4 2>&1) || rc=$?
+  _assert_eq "main worktree $kind of the base refuses landing" 1 "$rc"
+  _assert_contains "main worktree $kind of the base is reported" \
+    "base worktree has $kind in progress: $repo" "$out"
+  if [[ -s "$log" ]] && grep -q 'pr merge' "$log"; then
+    _fail "main worktree $kind of the base refuses before merging"
+  else
+    _pass "main worktree $kind of the base refuses before merging"
+  fi
+  _assert_eq "main worktree $kind keeps the base ref in place" "$old" \
+    "$(git -C "$repo" rev-parse refs/heads/main)"
+}
+_main_reservation_land rebase
+_main_reservation_land bisect
+
 # A main checkout with a separate Git directory that has the base checked out
 # merges in place; Git lists it by its Git directory, not its work tree.
 sg_repo=$(_tmpdir)

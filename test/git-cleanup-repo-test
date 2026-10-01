@@ -2848,6 +2848,60 @@ _assert_contains "uninspectable base reservation is reported" \
 _assert_eq "uninspectable base reservation leaves the ref in place" \
   "$lw_stale_old" "$(git -C "$lw_stale_repo" rev-parse refs/heads/main)"
 
+# A rebase or bisect in the main worktree reserves the base too. Git reports
+# the main worktree's state files relative to that worktree, so a check run
+# from a linked worktree must not look for them under its own directory.
+mm_rebase_repo=$(_merged_feature_repo)
+mm_rebase_old=$(git -C "$mm_rebase_repo" rev-parse refs/heads/main)
+mm_rebase_linked="$(_tmpdir)/linked"
+git -C "$mm_rebase_repo" worktree add --quiet "$mm_rebase_linked" feat
+git -C "$mm_rebase_repo" rebase --quiet --exec false --root >/dev/null 2>&1
+mm_rebase_rc=0
+result=$(git -C "$mm_rebase_linked" cleanup-repo 2>&1) || mm_rebase_rc=$?
+_assert_eq "linked cleanup beside a rebasing main worktree succeeds" \
+  0 "$mm_rebase_rc"
+_assert_contains "main worktree rebase of the base is a reservation" \
+  "not updating main; reserved by worktree $mm_rebase_repo" "$result"
+_assert_eq "main worktree rebase keeps the base ref in place" \
+  "$mm_rebase_old" "$(git -C "$mm_rebase_repo" rev-parse refs/heads/main)"
+mm_rebase_rc=0
+git -C "$mm_rebase_repo" rebase --continue >/dev/null 2>&1 || mm_rebase_rc=$?
+_assert_eq "main worktree rebase still continues" 0 "$mm_rebase_rc"
+_assert_eq "main worktree rebase finishes on the base" \
+  refs/heads/main "$(_head_ref "$mm_rebase_repo")"
+
+mm_bisect_repo=$(_merged_feature_repo)
+mm_bisect_old=$(git -C "$mm_bisect_repo" rev-parse refs/heads/main)
+mm_bisect_linked="$(_tmpdir)/linked"
+git -C "$mm_bisect_repo" worktree add --quiet "$mm_bisect_linked" feat
+git -C "$mm_bisect_repo" bisect start >/dev/null
+git -C "$mm_bisect_repo" switch --quiet --detach 2>/dev/null
+mm_bisect_rc=0
+result=$(git -C "$mm_bisect_linked" cleanup-repo 2>&1) || mm_bisect_rc=$?
+_assert_eq "linked cleanup beside a bisecting main worktree succeeds" \
+  0 "$mm_bisect_rc"
+_assert_contains "main worktree bisect from the base is a reservation" \
+  "not updating main; reserved by worktree $mm_bisect_repo" "$result"
+_assert_eq "main worktree bisect keeps the base ref in place" \
+  "$mm_bisect_old" "$(git -C "$mm_bisect_repo" rev-parse refs/heads/main)"
+
+# A merged branch the main worktree is rebasing is reserved, not deleted.
+mm_topic_repo=$(_merged_feature_repo)
+mm_topic_linked="$(_tmpdir)/linked"
+git -C "$mm_topic_repo" branch other
+git -C "$mm_topic_repo" worktree add --quiet "$mm_topic_linked" other
+git -C "$mm_topic_repo" switch --quiet feat
+mm_topic_feat=$(git -C "$mm_topic_repo" rev-parse refs/heads/feat)
+git -C "$mm_topic_repo" rebase --quiet --exec false HEAD~1 >/dev/null 2>&1
+mm_topic_rc=0
+result=$(git -C "$mm_topic_linked" cleanup-repo 2>&1) || mm_topic_rc=$?
+_assert_eq "linked cleanup beside a main worktree rebasing a branch succeeds" \
+  0 "$mm_topic_rc"
+_assert_contains "branch rebasing in the main worktree is skipped" \
+  "skipping feat; checked out in worktree $mm_topic_repo" "$result"
+_assert_eq "branch rebasing in the main worktree is kept" \
+  "$mm_topic_feat" "$(git -C "$mm_topic_repo" rev-parse refs/heads/feat)"
+
 # The main worktree hands the base to its owner instead of failing to switch.
 lw_owner_repo=$(_merged_feature_repo)
 lw_owner_remote=$(git -C "$lw_owner_repo" rev-parse refs/remotes/origin/main)

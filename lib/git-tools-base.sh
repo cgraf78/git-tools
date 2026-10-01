@@ -975,6 +975,23 @@ gt_worktree_for_branch() {
   [[ -z "$GT_WORKTREE_PATH" ]] || printf '%s\n' "$GT_WORKTREE_PATH"
 }
 
+# @brief Set GT_GIT_PATH to a Git metadata path of another worktree.
+# Git prints `--git-path` relative to the directory it ran in when the Git
+# directory is below it (`.git/<name>` for an ordinary main worktree, `<name>`
+# for a Git directory listed as itself), and absolute for linked worktrees. The
+# caller tests the result from its own directory, so a relative path is
+# anchored at the worktree; otherwise the main worktree's rebase, bisect, or
+# merge state would be looked up under the caller's directory and missed.
+_gt_find_worktree_git_path() {
+  local worktree="$1" name="$2" result
+
+  GT_GIT_PATH=""
+  result=$(gt_git_without_local_env -C "$worktree" rev-parse --git-path \
+    "$name" 2>/dev/null) || return 1
+  [[ "$result" == /* ]] || result=$worktree/$result
+  GT_GIT_PATH=$result
+}
+
 # @brief Print the worktree path that owns or reserves the given branch.
 #
 # A rebase temporarily detaches HEAD while retaining the original branch in
@@ -1003,8 +1020,8 @@ gt_find_worktree_reserving_branch() {
 
   for path in "${paths[@]}"; do
     for state_file in rebase-merge/head-name rebase-apply/head-name; do
-      state_file=$(gt_git_without_local_env -C "$path" rev-parse --git-path "$state_file" 2>/dev/null) ||
-        return 1
+      _gt_find_worktree_git_path "$path" "$state_file" || return 1
+      state_file=$GT_GIT_PATH
       [[ -f "$state_file" ]] || continue
       IFS= read -r state_head <"$state_file" || return 1
       if [[ "$state_head" == "refs/heads/$branch" ]]; then
@@ -1013,8 +1030,8 @@ gt_find_worktree_reserving_branch() {
       fi
     done
 
-    state_file=$(gt_git_without_local_env -C "$path" rev-parse --git-path BISECT_START 2>/dev/null) ||
-      return 1
+    _gt_find_worktree_git_path "$path" BISECT_START || return 1
+    state_file=$GT_GIT_PATH
     if [[ -f "$state_file" ]]; then
       IFS= read -r state_head <"$state_file" || return 1
       if [[ "$state_head" == "$branch" || "$state_head" == "refs/heads/$branch" ]]; then
@@ -1044,8 +1061,8 @@ gt_worktree_operation() {
     if [[ -z "$path" ]]; then
       state_path=$(git rev-parse --git-path "$entry" 2>/dev/null) || return 1
     else
-      state_path=$(gt_git_without_local_env -C "$path" rev-parse --git-path "$entry" 2>/dev/null) ||
-        return 1
+      _gt_find_worktree_git_path "$path" "$entry" || return 1
+      state_path=$GT_GIT_PATH
     fi
     [[ -e "$state_path" ]] || continue
     printf '%s\n' "$label"

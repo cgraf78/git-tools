@@ -21,14 +21,22 @@ _tmpdir() { gt_test_temp_dir; }
 # influence fixtures or the tool.
 _hermetic_bin=$(_tmpdir) || exit 1
 ln -s "$(type -a -p git | tail -n 1)" "$_hermetic_bin/git" || exit 1
+# Inherited Git variables (repository-local ones from a hook or alias,
+# command-scope configuration, templates, ref namespaces) and a BASH_ENV that
+# every child bash sources would retarget or reconfigure fixtures and tools.
+# GIT_TOOLS_TEST_* are the suites' own settings.
+while IFS= read -r _name; do
+  case "$_name" in
+    GIT_TOOLS_TEST_*) ;;
+    GIT_*) unset "$_name" ;;
+  esac
+done < <(compgen -e)
+unset BASH_ENV _name
 HOME=$(_tmpdir) || exit 1
 export HOME
 export XDG_CONFIG_HOME="$HOME/.config"
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
-# shellcheck disable=SC2046 # Git prints one variable name per line.
-unset $("$_hermetic_bin/git" rev-parse --local-env-vars) \
-  GIT_NAMESPACE GIT_CEILING_DIRECTORIES GIT_DEFAULT_HASH
 PATH="$_hermetic_bin:$PATH"
 
 _canonical_path() {
@@ -947,7 +955,7 @@ result=$(GH_LOG="$log_dry_linked" PATH="$bin_dir:$PATH" \
 rc=$?
 _assert_eq "linked base dry run: succeeds" "0" "$rc"
 _assert_contains "linked base dry run: prints the Git command it would run" \
-  "would run: git -C $main_dry_linked merge --quiet --ff-only" "$result"
+  "would run: git -C $(printf %q "$main_dry_linked") merge --quiet --ff-only" "$result"
 _assert_not_contains "linked base dry run: hides the environment wrapper" \
   "gt_git_without_local_env" "$result"
 _assert_eq "linked base dry run: does not advance base" \

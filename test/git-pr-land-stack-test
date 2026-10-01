@@ -12,6 +12,29 @@ _failures=0
 gt_test_temp_init || exit 1
 _tmpdir() { gt_test_temp_dir; }
 
+# Run fixtures and the tools against the real Git with private configuration.
+# A Git launcher earlier on PATH and the caller's global, system, or XDG
+# settings must not influence fixtures or the tools.
+_hermetic_bin=$(_tmpdir) || exit 1
+ln -s "$(type -a -p git | tail -n 1)" "$_hermetic_bin/git" || exit 1
+# Inherited Git variables (repository-local ones from a hook or alias,
+# command-scope configuration, templates, ref namespaces) and a BASH_ENV that
+# every child bash sources would retarget or reconfigure fixtures and tools.
+# GIT_TOOLS_TEST_* are the suites' own settings.
+while IFS= read -r _name; do
+  case "$_name" in
+    GIT_TOOLS_TEST_*) ;;
+    GIT_*) unset "$_name" ;;
+  esac
+done < <(compgen -e)
+unset BASH_ENV _name
+HOME=$(_tmpdir) || exit 1
+export HOME
+export XDG_CONFIG_HOME="$HOME/.config"
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
+PATH="$_hermetic_bin:$PATH"
+
 _pass() {
   printf 'ok - %s\n' "$1"
 }

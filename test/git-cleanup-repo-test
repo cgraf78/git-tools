@@ -2,6 +2,20 @@
 
 set -uo pipefail
 
+# Bash can neither trap nor reset a signal that was ignored when it started,
+# and the signal-interruption cases need TERM to reach their handlers (a
+# parent process can start the suite with TERM ignored). Re-exec once with the default action where env supports that (GNU
+# coreutils 8.31 or newer); elsewhere those cases are skipped below.
+if [[ -n "$(trap -p TERM)" && -z "${GIT_TOOLS_TEST_SIGNAL_RESET:-}" ]] &&
+  env --default-signal=TERM true 2>/dev/null; then
+  export GIT_TOOLS_TEST_SIGNAL_RESET=1
+  # The new shell would source the startup file again.
+  unset BASH_ENV ENV
+  exec env --default-signal=TERM "$BASH" "${BASH_SOURCE[0]}" "$@"
+fi
+_term_ignored=0
+[[ -z "$(trap -p TERM)" ]] || _term_ignored=1
+
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
@@ -37,15 +51,21 @@ trap 'exit 143' TERM
 _hermetic_bin="$_suite_tmp_root/bin"
 mkdir "$_hermetic_bin" "$_suite_tmp_root/home" || exit 1
 ln -s "$GIT_TOOLS_TEST_REAL_GIT" "$_hermetic_bin/git" || exit 1
+# Inherited Git variables (repository-local ones from a hook or alias,
+# command-scope configuration, templates, ref namespaces) and a BASH_ENV that
+# every child bash sources would retarget or reconfigure fixtures and tools.
+# GIT_TOOLS_TEST_* are the suites' own settings.
+while IFS= read -r _name; do
+  case "$_name" in
+    GIT_TOOLS_TEST_*) ;;
+    GIT_*) unset "$_name" ;;
+  esac
+done < <(compgen -e)
+unset BASH_ENV _name
 export HOME="$_suite_tmp_root/home"
 export XDG_CONFIG_HOME="$HOME/.config"
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
-# Repository-local variables inherited from a Git hook or alias, command-scope
-# configuration, and ref namespaces would retarget or reconfigure every fixture.
-# shellcheck disable=SC2046 # Git prints one variable name per line.
-unset $("$GIT_TOOLS_TEST_REAL_GIT" rev-parse --local-env-vars) \
-  GIT_NAMESPACE GIT_CEILING_DIRECTORIES GIT_DEFAULT_HASH
 PATH="$_hermetic_bin:$ROOT/bin:$PATH"
 
 _pass() {
@@ -1715,8 +1735,12 @@ signal_setup_output=$(cd "$readonly_repo" &&
     [[ -e "$GIT_PATCH_SIGNAL_MARKER" ]] || exit 2
     printf interrupted
   ' _ "$ROOT" 2>&1)
-_assert_eq "setup-time TERM fails squash proof conservatively" interrupted \
-  "$signal_setup_output"
+if [[ "$_term_ignored" == 1 ]]; then
+  _pass "setup-time TERM fails squash proof conservatively (skipped: SIGTERM ignored at start)"
+else
+  _assert_eq "setup-time TERM fails squash proof conservatively" interrupted \
+    "$signal_setup_output"
+fi
 _assert_eq "setup-time TERM removes squash workspace" "" \
   "$(_tool_artifacts "$signal_setup_tmp")"
 
@@ -2573,7 +2597,7 @@ git -C "$lw_other_repo" worktree add --quiet "$lw_other_linked" feat
 lw_other_old=$(git -C "$lw_other_repo" rev-parse refs/heads/main)
 result=$(git -C "$lw_other_linked" cleanup-repo --dry-run 2>&1)
 _assert_contains "linked dry run reports the base worktree fast-forward" \
-  "would run: git -C $lw_other_base merge --quiet --ff-only $lw_other_remote" \
+  "would run: git -C $(printf %q "$lw_other_base") merge --quiet --ff-only $lw_other_remote" \
   "$result"
 _assert_eq "linked dry run leaves the base worktree unchanged" \
   "$lw_other_old" "$(git -C "$lw_other_base" rev-parse HEAD)"

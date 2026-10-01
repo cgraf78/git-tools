@@ -221,7 +221,7 @@ if [[ "$1 $2" == "pr view" ]]; then
         printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
       fi
       ;;
-    checkout-head-after-merge | advance-head-after-merge | advance-remote-after-merge | create-remote-after-merge)
+    checkout-head-after-merge | advance-head-after-merge | advance-remote-after-merge | create-remote-after-merge | diverge-base-after-merge)
       if [[ -f "$state_file" ]]; then
         printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
       else
@@ -324,6 +324,14 @@ if [[ "$1 $2" == "pr merge" ]]; then
     create-remote-after-merge)
       git -C "${GH_TEST_REPO:?}" push --quiet origin \
         "refs/heads/feature:refs/heads/feature"
+      : >"$state_file"
+      ;;
+    diverge-base-after-merge)
+      old=$(git -C "${GH_TEST_REPO:?}" rev-parse refs/heads/main)
+      tree=$(git -C "$GH_TEST_REPO" rev-parse "$old^{tree}")
+      new=$(printf '%s\n' concurrent-base | git -C "$GH_TEST_REPO" commit-tree "$tree" -p "$old")
+      git -C "$GH_TEST_REPO" update-ref refs/heads/main "$new" "$old"
+      printf '%s\n' "$new" >"${GH_ADVANCED_OID:?}"
       : >"$state_file"
       ;;
     queued)
@@ -1850,6 +1858,66 @@ if [[ -s "$sw_log" ]]; then
 else
   _pass "missing worktree: nothing is merged"
 fi
+
+# The guarded ref updates lose to a concurrent writer instead of overwriting
+# it: this Git wrapper moves refs/heads/main to RACE_OID just before the
+# command's own update-ref of it. The PR is merged by then, so the run reports
+# incomplete cleanup.
+race_bin=$(_tmpdir)
+cat >"$race_bin/git" <<'SHIM'
+#!/usr/bin/env bash
+real=$RACE_REAL_GIT
+if [[ " $* " == *" update-ref "*" refs/heads/main "* ]]; then
+  "$real" update-ref refs/heads/main "$RACE_OID"
+fi
+exec "$real" "$@"
+SHIM
+chmod +x "$race_bin/git"
+for race_case in fast-forward create; do
+  race_repo=$(_tmpdir)
+  race_remote=$(_tmpdir)
+  race_linked="$(_tmpdir)/linked"
+  race_log=$(_tmpdir)/gh.log
+  _init_repo "$race_repo" "$race_remote"
+  git -C "$race_repo" switch --quiet --detach
+  race_oid=$(git -C "$race_repo" commit-tree \
+    "$(git -C "$race_repo" rev-parse 'main^{tree}')" -p main -m race </dev/null)
+  [[ "$race_case" != create ]] || git -C "$race_repo" branch --quiet -D main
+  git -C "$race_repo" worktree add --quiet "$race_linked" feature
+  _advance_remote_main "$race_remote" >/dev/null
+  race_rc=0
+  result=$(RACE_REAL_GIT="$bin_dir/git" RACE_OID="$race_oid" \
+    GH_LOG="$race_log" PATH="$race_bin:$bin_dir:$PATH" \
+    _pr_land "$race_linked" 4 2>&1) || race_rc=$?
+  _assert_eq "racing base $race_case: run fails" 1 "$race_rc"
+  _assert_contains "racing base $race_case: reports incomplete cleanup" \
+    "PR #4 merged; cleanup incomplete: could not fast-forward main from origin" \
+    "$result"
+  _assert_eq "racing base $race_case: keeps the concurrent value" \
+    "$race_oid" "$(git -C "$race_repo" rev-parse refs/heads/main)"
+done
+
+# A base that diverges between preflight and the post-merge sync is never moved
+# non-fast-forward.
+dm_repo=$(_tmpdir)
+dm_remote=$(_tmpdir)
+dm_linked="$(_tmpdir)/linked"
+dm_log=$(_tmpdir)/gh.log
+dm_advanced=$(_tmpdir)/advanced
+_init_repo "$dm_repo" "$dm_remote"
+git -C "$dm_repo" switch --quiet --detach
+git -C "$dm_repo" worktree add --quiet "$dm_linked" feature
+_advance_remote_main "$dm_remote" >/dev/null
+dm_rc=0
+result=$(GH_PR_CASE=diverge-base-after-merge GH_ADVANCED_OID="$dm_advanced" \
+  GH_LOG="$dm_log" PATH="$bin_dir:$PATH" _pr_land "$dm_linked" 4 2>&1) ||
+  dm_rc=$?
+_assert_eq "base diverging after the merge fails the run" 1 "$dm_rc"
+_assert_contains "base diverging after the merge reports incomplete cleanup" \
+  "PR #4 merged; cleanup incomplete: could not fast-forward main from origin" \
+  "$result"
+_assert_eq "base diverging after the merge keeps the concurrent commit" \
+  "$(cat "$dm_advanced")" "$(git -C "$dm_repo" rev-parse refs/heads/main)"
 
 # Dry runs refuse for local changes, in the base worktree or the current one,
 # exactly where the real run refuses.

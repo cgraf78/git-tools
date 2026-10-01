@@ -3261,6 +3261,73 @@ _assert_eq "core.worktree under a .git directory keeps its base" \
 _assert_eq "core.worktree under a .git directory keeps its files" \
   "$dg_home_before" "$(_worktree_snapshot "$dg_home")"
 
+# The guarded base updates must lose to a concurrent writer instead of
+# overwriting it. This Git wrapper moves refs/heads/main to RACE_OID just
+# before cleanup's own update-ref of it, or, for a fast-forward in the base
+# worktree, moves it and then fails the merge.
+race_bin=$(_tmpdir)
+cat >"$race_bin/git" <<'SHIM'
+#!/usr/bin/env bash
+real=$GIT_TOOLS_TEST_REAL_GIT
+case " $* " in
+  *" update-ref "*" refs/heads/main "*)
+    [[ " $* " == *" -d "* ]] || "$real" update-ref refs/heads/main "$RACE_OID"
+    ;;
+  *" merge --quiet --ff-only "*)
+    if [[ -n "${RACE_MERGE:-}" ]]; then
+      "$real" update-ref refs/heads/main "$RACE_OID"
+      exit 1
+    fi
+    ;;
+esac
+exec "$real" "$@"
+SHIM
+chmod +x "$race_bin/git"
+
+# Prints the commit a concurrent writer moves main to: a child of local main.
+_race_commit() {
+  git -C "$1" commit-tree "$(git -C "$1" rev-parse 'refs/heads/main^{tree}')" \
+    -p "$(git -C "$1" rev-parse refs/heads/main)" -m race </dev/null
+}
+
+for race_case in fast-forward create; do
+  race_repo=$(_merged_feature_repo)
+  git -C "$race_repo" switch --quiet -c other
+  race_oid=$(_race_commit "$race_repo")
+  if [[ "$race_case" == create ]]; then
+    git -C "$race_repo" branch --quiet -D main
+  fi
+  race_linked="$(_tmpdir)/linked"
+  git -C "$race_repo" worktree add --quiet "$race_linked" feat
+  race_rc=0
+  result=$(cd "$race_linked" && RACE_OID="$race_oid" \
+    PATH="$race_bin:$PATH" "$ROOT/bin/git-cleanup-repo" 2>&1) || race_rc=$?
+  _assert_eq "racing base $race_case stops cleanup" 2 "$race_rc"
+  if [[ "$race_case" == create ]]; then
+    _assert_contains "racing base create is reported" \
+      "could not create local base branch: main" "$result"
+  else
+    _assert_contains "racing base fast-forward is reported" \
+      "could not fast-forward local base branch: main" "$result"
+  fi
+  _assert_eq "racing base $race_case keeps the concurrent value" \
+    "$race_oid" "$(git -C "$race_repo" rev-parse refs/heads/main)"
+done
+
+# A fast-forward refused in the base worktree is only a skip while the base
+# ref is unchanged; if the ref moved meanwhile, cleanup stops.
+race_repo=$(_merged_feature_repo)
+race_oid=$(_race_commit "$race_repo")
+race_linked="$(_tmpdir)/linked"
+git -C "$race_repo" worktree add --quiet "$race_linked" feat
+race_rc=0
+result=$(cd "$race_linked" && RACE_OID="$race_oid" RACE_MERGE=1 \
+  PATH="$race_bin:$PATH" "$ROOT/bin/git-cleanup-repo" 2>&1) || race_rc=$?
+_assert_eq "base moved during a refused worktree fast-forward stops cleanup" \
+  2 "$race_rc"
+_assert_contains "base moved during a refused worktree fast-forward is reported" \
+  "could not fast-forward main in worktree $race_repo" "$result"
+
 # A main checkout with a separate Git directory records nowhere where its work
 # tree is, so from a linked worktree it can only be named by its Git directory.
 sx_remote=$(_tmpdir)

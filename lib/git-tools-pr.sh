@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Shared helpers for GitHub pull-request workflow commands.
 
+# Every `git` this library runs is Git's own binary, not a PATH wrapper.
+_gt_lib_dir=${BASH_SOURCE[0]%/*}
+[[ "$_gt_lib_dir" != "${BASH_SOURCE[0]}" ]] || _gt_lib_dir=.
+# shellcheck source=lib/git-tools-git.sh
+. "$_gt_lib_dir/git-tools-git.sh" || return 1
+unset _gt_lib_dir
+
 gt_command=${gt_command:-git-tools}
 
 # Never trust inherited values for destructive-operation safety checks.
@@ -37,6 +44,32 @@ gt_require_clean_worktree() {
   if [[ -n "$status" ]]; then
     gt_die "worktree must be clean"
   fi
+}
+
+# @brief Refuse to land from a checkout that Git reaches only through
+# GIT_DIR/GIT_WORK_TREE or `core.worktree`, such as a dotfiles checkout of
+# $HOME.
+# Landing syncs the base into the current checkout and a stack restack checks
+# out every child there, behind the back of the tooling that owns it; a Git
+# launcher can also route any directory into such a checkout, so landing there
+# is rarely deliberate. Refusing before the irreversible merge is safer than
+# merging and then skipping the sync. Requires lib/git-tools-base.sh.
+# @param $1 1 for a dry run, which reports the refusal it would make.
+gt_refuse_external_checkout() {
+  local lead=refusing status=0
+
+  [[ "${1:-0}" != 1 ]] || lead="would refuse"
+  gt_current_checkout_is_external || status=$?
+  case "$status" in
+    0)
+      gt_die "$lead to land from $GT_WORKTREE_PATH: Git reaches this" \
+        "checkout only through GIT_DIR, GIT_WORK_TREE, or core.worktree," \
+        "so its own tooling updates it; land from a linked worktree" \
+        "(git worktree add) instead"
+      ;;
+    1) ;;
+    *) gt_die "could not inspect current checkout" ;;
+  esac
 }
 
 gt_require_gh() {

@@ -30,10 +30,42 @@ Base selection does not depend on configured fetch refspecs or short ref names.
 The command fetches exactly
 .BR refs/heads/ base
 without tags, validates and pins its native SHA-1 or SHA-256 object ID, and
-checks the local fast-forward relationship before switching branches. It then
+checks the local fast-forward relationship before changing anything. It then
 creates or fast-forwards the base using that same object ID. A divergent base
-fails before the current branch or local base is changed. Dry-run uses isolated
-temporary object storage.
+fails before the current branch or local base is changed. A worktree that has
+the base checked out is fast-forwarded in place with
+.BR "git merge \-\-ff\-only" ;
+another worktree that has local changes or an active operation, cannot be
+inspected, or refuses the fast-forward is left alone, and merges are then
+proven against the unchanged local base. A main worktree whose files live
+outside its Git directory, such as a
+.B core.worktree
+checkout or a bare repository with an index used through an external work
+tree, is never updated from another checkout; cleanup reports that it is not
+updating the base there and leaves that checkout to its own tooling. The same
+holds when cleanup runs in a main checkout that Git reaches only through
+.BR GIT_DIR / GIT_WORK_TREE
+or
+.BR core.worktree :
+it is never switched or merged into, and is planned like a linked worktree;
+branches already merged into its local base are still deleted. Otherwise
+the main worktree switches to the base. A linked worktree never switches to
+the base; it advances only the base ref with an expected-old-value
+.BR "git update\-ref" ,
+by fast-forward only, and leaves the base alone when a rebase or bisect
+reserves it or worktrees cannot be inspected; without a local base, it stops
+instead. From the main worktree,
+.B git switch
+itself refuses a base that a rebase or bisect reserves. Updates to a checkout other than the current one are always reported.
+The branch checked out in the current checkout is never deleted. When the base
+update is skipped, the command still exits 0, but its final summary line ends
+with
+.RI "" base " not updated (" reason )
+so the base is not mistaken for current. A dry run stops with exit status 2
+and
+.B would refuse:
+and the reason wherever the real run refuses before changing anything. Dry-run
+uses isolated temporary object storage.
 .PP
 The command retains the single raw configured fetch URL for both remote
 inspection and fetch, allowing Git to apply any
@@ -57,7 +89,9 @@ Delete all local branches except the base branch.
 .TP
 .B \-\-remove\-worktrees
 Remove eligible, operation-free linked worktrees for branches selected for
-deletion. Removal never uses
+deletion. The current worktree and the main worktree are never removed, so a
+branch still checked out in either after the base update is kept. Removal never
+uses
 .BR \-\-force .
 .TP
 .BR \-n ", " \-\-dry\-run

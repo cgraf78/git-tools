@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Private, invocation-owned temporary roots for shell test harnesses.
 
+# The commands run Git's own binary rather than `git` on PATH; suites that put
+# fake `git` programs on PATH need them honored (see lib/git-tools-git.sh).
+export GIT_TOOLS_TEST_PATH_GIT=1
+
 GT_TEST_TEMP_ROOT=${GT_TEST_TEMP_ROOT:-}
 _GT_TEST_TEMP_PARENT=${_GT_TEST_TEMP_PARENT:-}
 

@@ -8,11 +8,22 @@
 # (repo-state). Keeping them side-effect free lets both lib-sourcing commands
 # and standalone scripts compose them.
 
+# Every `git` this library runs is Git's own binary, not a PATH wrapper.
+_gt_lib_dir=${BASH_SOURCE[0]%/*}
+[[ "$_gt_lib_dir" != "${BASH_SOURCE[0]}" ]] || _gt_lib_dir=.
+# shellcheck source=lib/git-tools-git.sh
+. "$_gt_lib_dir/git-tools-git.sh" || return 1
+unset _gt_lib_dir
+
 # Cache Git's documented repository-local environment inventory within this
 # library load. Reset on source so inherited/exported private state cannot skip
 # the safety probe or retain GIT_DIR/GIT_WORK_TREE across repositories.
 _GT_GIT_LOCAL_ENV_VARS_READY=0
 _GT_GIT_LOCAL_ENV_VARS=""
+# Set by gt_record_uninspectable_worktree for gt_uninspectable_worktree_hint;
+# an inherited value must not name a worktree this run never inspected.
+GT_WORKTREE_FAILED_PATH=""
+GT_WORKTREE_FAILED_LOCKED=0
 
 # @brief Print the repository's default branch short name.
 # @param remote Remote to consult for the default head (defaults to origin).
@@ -716,7 +727,7 @@ gt_git_without_local_env() {
     env_args+=("-u" "$name")
   done <<<"$local_vars"
 
-  env "${env_args[@]}" git "$@"
+  env "${env_args[@]}" "$GT_GIT" "$@"
 }
 
 # @brief Set GT_WORKTREE_PATH to the current worktree without losing newlines.
@@ -731,6 +742,41 @@ gt_find_current_worktree() {
   output=${output%"$sentinel"}
   [[ "$output" == *$'\n' ]] || return 1
   GT_WORKTREE_PATH=${output%$'\n'}
+}
+
+# @brief Succeed when Git in a work tree, on its own, reaches the Git directory.
+# A checkout whose `.git` directory or gitfile leads back (an ordinary clone, a
+# separate Git directory, a submodule) passes. One that Git reaches only
+# through GIT_DIR/GIT_WORK_TREE or another directory's `core.worktree`, as a
+# dotfiles checkout of $HOME is, does not.
+_gt_work_tree_reaches_git_dir() {
+  local top="$1" git_dir="$2" found
+
+  # The `.git` entry is checked on disk first: when a command is run by name,
+  # `git` on PATH can be a launcher that routes `git -C $HOME` back into the
+  # dotfiles repository, so asking Git alone would report that it leads back.
+  [[ -e "$top/.git" || -L "$top/.git" ]] || return 1
+  found=$(gt_git_without_local_env -C "$top" rev-parse --git-dir \
+    2>/dev/null) || return 1
+  [[ "$found" == /* ]] || found=$top/$found
+  [[ "$found" -ef "$git_dir" ]]
+}
+
+# @brief Succeed when the invoking checkout is a main worktree that Git reaches
+# only through GIT_DIR/GIT_WORK_TREE or `core.worktree`.
+# Such a checkout belongs to whatever tooling sets that up (a dotfiles manager
+# for $HOME, say), and a Git launcher may route unrelated directories into it,
+# so being run there is not a deliberate choice of that checkout. Sets
+# GT_WORKTREE_PATH to its work tree. Returns 1 for any other checkout and 2
+# when the checkout cannot be inspected.
+gt_current_checkout_is_external() {
+  local common_dir git_dir
+
+  gt_find_current_worktree || return 2
+  git_dir=$(git rev-parse --git-dir) || return 2
+  common_dir=$(git rev-parse --git-common-dir) || return 2
+  [[ "$git_dir" -ef "$common_dir" ]] || return 1
+  ! _gt_work_tree_reaches_git_dir "$GT_WORKTREE_PATH" "$git_dir"
 }
 
 # @brief Materialize Git's NUL-delimited worktree inventory and check its
@@ -779,6 +825,218 @@ _gt_materialize_worktree_list() {
   eval "exec $list_fd<&-"
 }
 
+# @brief Set GT_WORKTREE_PATH to the repository's main worktree.
+# Git always lists the main worktree first, including when invoked from a
+# linked worktree. For a bare repository this is the bare directory itself.
+gt_find_main_worktree() {
+  local field
+
+  GT_WORKTREE_PATH=""
+  _gt_materialize_worktree_list || return 1
+  for field in ${_GT_WORKTREE_FIELDS[@]+"${_GT_WORKTREE_FIELDS[@]}"}; do
+    case "$field" in
+      "worktree "*)
+        GT_WORKTREE_PATH=${field#worktree }
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+# @brief Decide how the invoking checkout may advance a local base branch.
+# @param $1 Base branch name.
+# @param $2 Optional: 1 to inspect rebase and bisect reservations even when the
+#   main worktree could simply switch. `git switch` refuses a reserved branch
+#   on its own, so only callers that must refuse before an irreversible step
+#   need to pay for scanning every worktree.
+#
+# Only the checkout that has the base checked out may merge into it, and only
+# the main worktree may take the base over: a linked worktree that switched to
+# the base would release its own branch and lock the main worktree out of the
+# base. A main worktree whose files live outside its Git directory (a
+# `core.worktree` or separate-Git-directory checkout, or a bare repository used
+# through an external work tree) is left to the tooling that manages it, which
+# may validate, back up, or normalize what it checks out.
+#
+# Facts about the invoking checkout come from HEAD and the Git directories, not
+# from `git worktree list` paths, which name such main worktrees by their Git
+# directory and list a bare repository's external work tree not at all.
+#
+# The invoking checkout is held to the same rule: when it is a main worktree
+# that Git reaches only through GIT_DIR/GIT_WORK_TREE or `core.worktree` (see
+# gt_current_checkout_is_external), it is never switched or merged into, and
+# is planned like a linked worktree.
+#
+# Sets GT_BASE_SYNC_MAY_SWITCH to 1 when the invoking checkout is a main
+# worktree that may take the base over, and GT_BASE_SYNC_ACTION to one of:
+#   current   the invoking checkout has the base checked out
+#   switch    the invoking main worktree may check the base out
+#   worktree  ordinary worktree GT_BASE_SYNC_PATH has the base checked out
+#   external  main worktree GT_BASE_SYNC_PATH, whose files live outside its Git
+#             directory, has the base checked out; GT_BASE_SYNC_REASON is
+#             index when that is inferred from a bare repository's index,
+#             current when it is the invoking checkout, and unlocated when
+#             GT_BASE_SYNC_PATH is its Git directory because its work tree
+#             cannot be found (see gt_base_sync_external_message)
+#   reserved  a rebase or bisect in GT_BASE_SYNC_PATH reserves the base
+#   ref       nothing has the base checked out; only the ref may move
+#   unknown   GT_BASE_SYNC_REASON (inventory or reservations) is uninspectable
+# Returns nonzero only when the invoking checkout itself cannot be inspected.
+# shellcheck disable=SC2034 # results are consumed by base-updating commands
+gt_plan_base_sync() {
+  local base="$1" scan_main="${2:-0}" common_dir field git_dir head index=0
+  local head_status=0 main_bare=0 main_path="" path="" target="" top
+
+  GT_BASE_SYNC_ACTION=""
+  GT_BASE_SYNC_PATH=""
+  GT_BASE_SYNC_REASON=""
+  GT_BASE_SYNC_MAY_SWITCH=0
+  head=$(git symbolic-ref -q HEAD) || head_status=$?
+  case "$head_status" in
+    0) ;;
+    1) head="" ;;
+    *) return 1 ;;
+  esac
+  git_dir=$(git rev-parse --git-dir) || return 1
+  common_dir=$(git rev-parse --git-common-dir) || return 1
+  if [[ "$git_dir" -ef "$common_dir" ]]; then
+    gt_find_current_worktree || return 1
+    if _gt_work_tree_reaches_git_dir "$GT_WORKTREE_PATH" "$git_dir"; then
+      GT_BASE_SYNC_MAY_SWITCH=1
+    elif [[ "$head" == "refs/heads/$base" ]]; then
+      GT_BASE_SYNC_ACTION=external
+      GT_BASE_SYNC_PATH=$GT_WORKTREE_PATH
+      GT_BASE_SYNC_REASON=current
+      return 0
+    fi
+  fi
+  if [[ "$head" == "refs/heads/$base" ]]; then
+    GT_BASE_SYNC_ACTION=current
+    return 0
+  fi
+
+  if ! _gt_materialize_worktree_list 2>/dev/null; then
+    GT_BASE_SYNC_ACTION=unknown
+    GT_BASE_SYNC_REASON=inventory
+    return 0
+  fi
+  # Git always lists the main worktree first.
+  for field in ${_GT_WORKTREE_FIELDS[@]+"${_GT_WORKTREE_FIELDS[@]}"}; do
+    case "$field" in
+      "worktree "*)
+        path=${field#worktree }
+        index=$((index + 1))
+        [[ "$index" != 1 ]] || main_path=$path
+        ;;
+      bare) [[ "$index" != 1 ]] || main_bare=1 ;;
+      "branch refs/heads/$base") [[ -n "$target" ]] || target=$path ;;
+    esac
+  done
+
+  if [[ -n "$target" ]]; then
+    GT_BASE_SYNC_PATH=$target
+    GT_BASE_SYNC_ACTION=worktree
+    [[ "$target" == "$main_path" ]] || return 0
+    # Git lists an ordinary main worktree as the parent of its `.git`
+    # directory and any other main worktree as the Git directory itself. A Git
+    # directory named `.git` can still carry `core.worktree`, so the checkout
+    # must also resolve to that parent. When it resolves elsewhere, name the
+    # real work tree in messages.
+    # The sentinel keeps command substitution from stripping a path's own
+    # trailing newlines; only Git's record delimiter is removed.
+    if top=$(gt_git_without_local_env -C "$target" rev-parse --show-toplevel \
+      2>/dev/null && printf x); then
+      top=${top%x}
+      top=${top%$'\n'}
+    else
+      top=""
+    fi
+    if [[ "$target/.git" -ef "$common_dir" ]] &&
+      [[ -z "$top" || "$top" -ef "$target" ]]; then
+      return 0
+    fi
+    GT_BASE_SYNC_ACTION=external
+    if [[ -n "$top" ]]; then
+      GT_BASE_SYNC_PATH=$top
+    else
+      # A separate Git directory or a symlinked `.git` records nothing about
+      # where its work tree is, so only the Git directory can be named.
+      GT_BASE_SYNC_REASON=unlocated
+    fi
+    return 0
+  fi
+  if [[ "$GT_BASE_SYNC_MAY_SWITCH" == 1 && "$scan_main" != 1 ]]; then
+    GT_BASE_SYNC_ACTION=switch
+    return 0
+  fi
+
+  # A rebase or bisect can reserve the base while its HEAD is detached, and
+  # moving the ref underneath it would corrupt that operation. A worktree whose
+  # directory is gone makes this uninspectable.
+  if ! gt_find_worktree_reserving_branch "$base"; then
+    GT_BASE_SYNC_ACTION=unknown
+    GT_BASE_SYNC_REASON=reservations
+    return 0
+  fi
+  if [[ -n "$GT_WORKTREE_PATH" ]]; then
+    GT_BASE_SYNC_ACTION=reserved
+    GT_BASE_SYNC_PATH=$GT_WORKTREE_PATH
+    return 0
+  fi
+  if [[ "$GT_BASE_SYNC_MAY_SWITCH" == 1 ]]; then
+    GT_BASE_SYNC_ACTION=switch
+    return 0
+  fi
+
+  # A bare repository has no worktree of its own, but one used through
+  # GIT_DIR and GIT_WORK_TREE keeps an index, and its HEAD names the branch
+  # that external work tree has checked out. A bare clone that only hosts
+  # linked worktrees has no index.
+  if [[ "$main_bare" == 1 && -e "$common_dir/index" ]]; then
+    head_status=0
+    head=$(gt_git_without_local_env --git-dir="$common_dir" \
+      symbolic-ref -q HEAD) || head_status=$?
+    case "$head_status" in
+      0) ;;
+      1) head="" ;;
+      *)
+        GT_BASE_SYNC_ACTION=unknown
+        GT_BASE_SYNC_REASON=inventory
+        return 0
+        ;;
+    esac
+    if [[ "$head" == "refs/heads/$base" ]]; then
+      GT_BASE_SYNC_ACTION=external
+      GT_BASE_SYNC_PATH=$main_path
+      GT_BASE_SYNC_REASON=index
+      return 0
+    fi
+  fi
+  GT_BASE_SYNC_ACTION=ref
+}
+
+# @brief Print why an `external` base sync leaves the base alone, for the
+# "not updating <base> ..." diagnostics of every base-updating command.
+gt_base_sync_external_message() {
+  local base="$1" path=$GT_BASE_SYNC_PATH
+
+  case "$GT_BASE_SYNC_REASON" in
+    index)
+      printf 'not updating %s in %s; update that checkout with its own tooling (a bare repository with an index counts as checked out; remove %s/index if no work tree uses it)\n' \
+        "$base" "$path" "$path"
+      ;;
+    unlocated)
+      printf 'not updating %s; it is checked out in the main worktree, whose work tree location is unknown (Git directory %s); update that checkout with its own tooling\n' \
+        "$base" "$path"
+      ;;
+    *)
+      printf 'not updating %s in %s; update that checkout with its own tooling\n' \
+        "$base" "$path"
+      ;;
+  esac
+}
+
 # @brief Set GT_WORKTREE_PATH to the worktree that has a branch checked out.
 # The global result avoids command substitution, which cannot preserve trailing
 # newlines. An empty result means the branch is not checked out.
@@ -808,6 +1066,23 @@ gt_worktree_for_branch() {
   [[ -z "$GT_WORKTREE_PATH" ]] || printf '%s\n' "$GT_WORKTREE_PATH"
 }
 
+# @brief Set GT_GIT_PATH to a Git metadata path of another worktree.
+# Git prints `--git-path` relative to the directory it ran in when the Git
+# directory is below it (`.git/<name>` for an ordinary main worktree, `<name>`
+# for a Git directory listed as itself), and absolute for linked worktrees. The
+# caller tests the result from its own directory, so a relative path is
+# anchored at the worktree; otherwise the main worktree's rebase, bisect, or
+# merge state would be looked up under the caller's directory and missed.
+_gt_find_worktree_git_path() {
+  local worktree="$1" name="$2" result
+
+  GT_GIT_PATH=""
+  result=$(gt_git_without_local_env -C "$worktree" rev-parse --git-path \
+    "$name" 2>/dev/null) || return 1
+  [[ "$result" == /* ]] || result=$worktree/$result
+  GT_GIT_PATH=$result
+}
+
 # @brief Print the worktree path that owns or reserves the given branch.
 #
 # A rebase temporarily detaches HEAD while retaining the original branch in
@@ -819,6 +1094,8 @@ gt_find_worktree_reserving_branch() {
   local -a paths=()
 
   GT_WORKTREE_PATH=""
+  GT_WORKTREE_FAILED_PATH=""
+  GT_WORKTREE_FAILED_LOCKED=0
   _gt_materialize_worktree_list || return 1
 
   for field in "${_GT_WORKTREE_FIELDS[@]}"; do
@@ -836,8 +1113,9 @@ gt_find_worktree_reserving_branch() {
 
   for path in "${paths[@]}"; do
     for state_file in rebase-merge/head-name rebase-apply/head-name; do
-      state_file=$(gt_git_without_local_env -C "$path" rev-parse --git-path "$state_file" 2>/dev/null) ||
-        return 1
+      _gt_find_worktree_git_path "$path" "$state_file" ||
+        gt_record_uninspectable_worktree "$path" || return 1
+      state_file=$GT_GIT_PATH
       [[ -f "$state_file" ]] || continue
       IFS= read -r state_head <"$state_file" || return 1
       if [[ "$state_head" == "refs/heads/$branch" ]]; then
@@ -846,8 +1124,9 @@ gt_find_worktree_reserving_branch() {
       fi
     done
 
-    state_file=$(gt_git_without_local_env -C "$path" rev-parse --git-path BISECT_START 2>/dev/null) ||
-      return 1
+    _gt_find_worktree_git_path "$path" BISECT_START ||
+      gt_record_uninspectable_worktree "$path" || return 1
+    state_file=$GT_GIT_PATH
     if [[ -f "$state_file" ]]; then
       IFS= read -r state_head <"$state_file" || return 1
       if [[ "$state_head" == "$branch" || "$state_head" == "refs/heads/$branch" ]]; then
@@ -858,6 +1137,40 @@ gt_find_worktree_reserving_branch() {
   done
 }
 
+# @brief Record a worktree that could not be inspected for
+# gt_uninspectable_worktree_hint, noting whether the inventory marks it locked.
+# Always returns 1 so callers can chain it onto the failed inspection.
+gt_record_uninspectable_worktree() {
+  local field path=""
+
+  GT_WORKTREE_FAILED_PATH=$1
+  GT_WORKTREE_FAILED_LOCKED=0
+  for field in ${_GT_WORKTREE_FIELDS[@]+"${_GT_WORKTREE_FIELDS[@]}"}; do
+    case "$field" in
+      "worktree "*) path=${field#worktree } ;;
+      locked | "locked "*)
+        [[ "$path" != "$1" ]] || GT_WORKTREE_FAILED_LOCKED=1
+        ;;
+    esac
+  done
+  return 1
+}
+
+# @brief Print the advice for a worktree a reservation scan could not inspect,
+# usually one whose directory was deleted without `git worktree prune`. Every
+# command gives the same advice, whichever checkout it runs from.
+gt_uninspectable_worktree_hint() {
+  local path=$GT_WORKTREE_FAILED_PATH
+
+  [[ -n "$path" ]] || return 0
+  if [[ "$GT_WORKTREE_FAILED_LOCKED" == 1 ]]; then
+    printf 'if worktree %s was deleted, run git worktree unlock %q, then git worktree prune\n' \
+      "$path" "$path"
+  else
+    printf 'if worktree %s was deleted, run git worktree prune\n' "$path"
+  fi
+}
+
 # @brief Print the worktree path that owns or reserves the given branch.
 # Prefer gt_find_worktree_reserving_branch when the path is consumed by shell.
 gt_worktree_reserving_branch() {
@@ -866,13 +1179,20 @@ gt_worktree_reserving_branch() {
 }
 
 # @brief Print the active sequencer operation in a worktree, if any.
+# @param $1 Worktree path, or empty for the invoking checkout. The invoking
+#   checkout keeps its inherited Git environment, because a checkout driven by
+#   GIT_DIR (dotfiles-style) cannot be found again from its work tree path.
 gt_worktree_operation() {
   local path="$1"
   local entry label state_path
 
   while IFS=$'\t' read -r entry label; do
-    state_path=$(gt_git_without_local_env -C "$path" rev-parse --git-path "$entry" 2>/dev/null) ||
-      return 1
+    if [[ -z "$path" ]]; then
+      state_path=$(git rev-parse --git-path "$entry" 2>/dev/null) || return 1
+    else
+      _gt_find_worktree_git_path "$path" "$entry" || return 1
+      state_path=$GT_GIT_PATH
+    fi
     [[ -e "$state_path" ]] || continue
     printf '%s\n' "$label"
     return 0

@@ -12,6 +12,32 @@ _failures=0
 gt_test_temp_init || exit 1
 _tmpdir() { gt_test_temp_dir; }
 
+# Run fixtures and the tools against the real Git with private configuration.
+# A Git launcher earlier on PATH and the caller's global, system, or XDG
+# settings must not influence fixtures or the tools.
+_hermetic_bin=$(_tmpdir) || exit 1
+ln -s "$(type -a -p git | tail -n 1)" "$_hermetic_bin/git" || exit 1
+# Inherited Git variables (repository-local ones from a hook or alias,
+# command-scope configuration, templates, ref namespaces) and a BASH_ENV that
+# every child bash sources would retarget or reconfigure fixtures and tools.
+# GIT_TOOLS_TEST_* are the suites' own settings.
+while IFS= read -r _name; do
+  case "$_name" in
+    GIT_TOOLS_TEST_*) ;;
+    GIT_*) unset "$_name" ;;
+  esac
+done < <(compgen -e)
+unset BASH_ENV _name
+# Fake `git` programs on PATH inject failures below, so the tools must use PATH
+# Git instead of Git's own binary; the cases that test that lookup unset this.
+export GIT_TOOLS_TEST_PATH_GIT=1
+HOME=$(_tmpdir) || exit 1
+export HOME
+export XDG_CONFIG_HOME="$HOME/.config"
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
+PATH="$_hermetic_bin:$PATH"
+
 _pass() {
   printf 'ok - %s\n' "$1"
 }
@@ -45,6 +71,20 @@ _assert_contains() {
   else
     _fail "$name"
     printf '  expected output to contain: %s\n' "$needle" >&2
+    printf '  actual output:\n%s\n' "$haystack" >&2
+  fi
+}
+
+_assert_not_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+
+  if [[ "$haystack" != *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output NOT to contain: %s\n' "$needle" >&2
     printf '  actual output:\n%s\n' "$haystack" >&2
   fi
 }
@@ -806,7 +846,8 @@ chain_stack_rc=0
 chain_stack_output=$(cd "$chain_stack_repo" &&
   PATH="$chain_stack_path:$ROOT/bin:/usr/bin:/bin" GIT_TOOLS_TOOL_DIR="$bin_dir" \
     STACK_LOG="$chain_stack_log" \
-    GIT_SSH_COMMAND="$chain_stack_ssh" GIT_TEST_SSH_REPO="$chain_stack_expected" \
+    GIT_SSH_COMMAND="$(printf %q "$chain_stack_ssh")" \
+    GIT_TEST_SSH_REPO="$chain_stack_expected" \
     /usr/bin/git \
     -c "url.file://$chain_stack_unrelated.insteadOf=$chain_stack_effective" \
     -c "url.file://$chain_stack_unrelated.pushInsteadOf=$chain_stack_effective" \
@@ -872,6 +913,14 @@ _assert_eq "three-PR dry run preserves plan order" \
   "$(awk '{ print $1, $2 }' "$dry_plan_log")"
 _assert_contains "three-PR dry run plans the final land" \
   "land https://github.test/example/repo/pull/3 --method squash --dry-run" \
+  "$(cat "$dry_plan_log")"
+# Without a restack, children still target their parents, so each child's dry
+# run is told the base the real run lands it into.
+_assert_contains "three-PR dry run plans a child into the root base" \
+  "land https://github.test/example/repo/pull/2 --method squash --keep-branch --dry-run --expect-base main" \
+  "$(cat "$dry_plan_log")"
+_assert_not_contains "three-PR dry run plans the root into its own base" \
+  "pull/1 --method squash --keep-branch --dry-run --expect-base" \
   "$(cat "$dry_plan_log")"
 if compgen -G "$dry_plan_topology.*" >/dev/null; then
   _fail "three-PR dry run leaves discovered topology unchanged"
@@ -1038,6 +1087,62 @@ _assert_contains "validates check timeout" "--check-timeout must be greater than
 outside=$(_tmpdir)
 result=$(PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" STACK_LOG="$log" _pr_land_stack "$outside" 1 2>&1 || true)
 _assert_contains "requires git repo" "not inside a git repository" "$result"
+
+# A dotfiles-style checkout is driven by GIT_DIR with `core.worktree`. Landing
+# would sync the base into it and restacking would check out each child there,
+# behind its own tooling's back, so the stack refuses before discovery.
+dotfiles_home=$(_tmpdir)
+dotfiles_gitdir="$(_tmpdir)/dotfiles"
+dotfiles_log=$(_tmpdir)/stack.log
+_git_init "$dotfiles_home"
+git -C "$dotfiles_home" branch feature/a
+git -C "$dotfiles_home" branch feature/b
+git -C "$dotfiles_home" branch feature/c
+mv "$dotfiles_home/.git" "$dotfiles_gitdir"
+git --git-dir="$dotfiles_gitdir" config core.worktree "$dotfiles_home"
+git --git-dir="$dotfiles_gitdir" switch --quiet feature/b
+for dotfiles_args in "" --dry-run; do
+  rc=0
+  result=$(cd "$dotfiles_home" && GIT_DIR="$dotfiles_gitdir" \
+    PATH="$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+    STACK_LOG="$dotfiles_log" "$ROOT/bin/git-pr-land-stack" 1 \
+    $dotfiles_args 2>&1) || rc=$?
+  _assert_eq "dotfiles-style stack landing refuses ${dotfiles_args:-real run}" \
+    "1" "$rc"
+  _assert_contains "dotfiles-style stack landing explains ${dotfiles_args:-real run}" \
+    "to land from $dotfiles_home" "$result"
+done
+# The stack tool's own Git commands use Git's own binary too: a PATH launcher
+# rerouting into an ordinary decoy repository would hide the dotfiles checkout
+# and let discovery proceed.
+decoy_bin=$(_tmpdir)
+cat >"$decoy_bin/git" <<'SHIM'
+#!/usr/bin/env bash
+# A PATH launcher that reroutes every command into a decoy repository.
+printf '%s\n' "$*" >>"$DECOY_LOG"
+exec env GIT_DIR="$DECOY_GITDIR" "$DECOY_REAL_GIT" "$@"
+SHIM
+chmod +x "$decoy_bin/git"
+decoy_other=$(_tmpdir)
+_git_init "$decoy_other"
+decoy_log="$(_tmpdir)/launcher.log"
+: >"$decoy_log"
+rc=0
+result=$(cd "$dotfiles_home" && env -u GIT_TOOLS_TEST_PATH_GIT -u GIT_EXEC_PATH \
+  GIT_DIR="$dotfiles_gitdir" DECOY_LOG="$decoy_log" \
+  DECOY_GITDIR="$decoy_other/.git" DECOY_REAL_GIT="$_hermetic_bin/git" \
+  PATH="$decoy_bin:$bin_dir:$PATH" GIT_TOOLS_TOOL_DIR="$bin_dir" \
+  STACK_LOG="$dotfiles_log" "$ROOT/bin/git-pr-land-stack" 1 2>&1) || rc=$?
+_assert_eq "PATH launcher: stack still refuses the dotfiles-style checkout" \
+  "1" "$rc"
+_assert_contains "PATH launcher: stack names the real checkout" \
+  "refusing to land from $dotfiles_home" "$result"
+_assert_eq "PATH launcher: stack only asks it for the exec path" \
+  "--exec-path" "$(cat "$decoy_log")"
+_assert_eq "dotfiles-style stack landing runs no stack tool" "" \
+  "$(cat "$dotfiles_log" 2>/dev/null)"
+_assert_eq "dotfiles-style stack landing leaves the checkout on its branch" \
+  refs/heads/feature/b "$(git --git-dir="$dotfiles_gitdir" symbolic-ref HEAD)"
 
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2

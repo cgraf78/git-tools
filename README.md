@@ -269,8 +269,24 @@ immediately before merging, and post-merge verification remains bound to that
 same PR number and topology. The merge request is pinned with GitHub's
 `--match-head-commit`, and an exactly mapped live remote head must equal the
 structured PR head OID.
-An already-checked-out base is synchronized in its owning worktree. If GitHub
-reports an error after completing the server-side merge,
+The local base is synchronized under the same rules as `git cleanup-repo`: it
+is fast-forwarded in the worktree that has it checked out, the main worktree
+may switch to it, and a linked worktree never does, advancing only the base ref
+when nothing has it checked out. Any update to another checkout is reported.
+The command refuses before merging when the worktree that would receive the
+base has local changes or an active operation, or when a rebase or bisect
+reserves the base. A base checked out in a main worktree whose files live
+outside its Git directory (such as a `core.worktree` dotfiles checkout) is
+never touched or inspected; it is reported with a `not updating` message.
+The command refuses to run, before merging, in a main checkout that Git
+reaches only through `GIT_DIR`/`GIT_WORK_TREE` or `core.worktree` (a dotfiles
+checkout of `$HOME`, which a Git launcher may route any directory into): land
+from a linked worktree of that repository instead. Checkouts whose `.git`
+directory or file leads back to their Git directory, including separate Git
+directories and submodules, are not affected. A dry run makes the same local
+checks and, where the real run would refuse, reports `would refuse: <reason>`
+and exits 1 instead of describing a landing.
+If GitHub reports an error after completing the server-side merge,
 the command rechecks structured PR state and identifies any remaining work as
 incomplete cleanup instead of incorrectly reporting that the merge failed.
 Local deletion is intentionally manual because Git has no portable primitive
@@ -291,7 +307,8 @@ git pr-land-stack 123 --dry-run
 ```
 
 The command composes `git pr-stack`, `git pr-land`, and `git pr-restack`. It
-refuses the whole stack before merging anything if any PR is not ready. URL
+refuses the whole stack before merging anything if any PR is not ready, or when
+run in a checkout that `git pr-land` refuses to land from. URL
 targets and every discovered PR must belong to the current GitHub repository.
 Qualified URLs are retained across stack, land, restack, and readiness polling
 handoffs.
@@ -381,14 +398,59 @@ Base updates do not depend on configured fetch refspecs or short ref names. The
 command pins exactly `refs/heads/<base>` from the resolved endpoint, fetches it
 without tags or remote-tracking ref updates, validates its native SHA-1 or
 SHA-256 object ID, and checks the local fast-forward relationship before
-switching branches. It then creates or
-fast-forwards the base using that same OID. A divergent base fails before the
-current branch or local base is changed. Dry-run uses isolated temporary object
-storage, so it leaves no permanent objects or refs behind. The command retains
-the single raw configured fetch URL for both remote inspection and fetch, which
-lets Git apply any `insteadOf` rewrite exactly once per operation. Remotes with
-zero or multiple fetch URLs are rejected because there is no single endpoint to
-pin.
+changing anything. It then creates or fast-forwards the base using that same
+OID. A divergent base fails before the current branch or local base is changed.
+Where the update happens depends on which checkout owns the base, and cleanup
+says so whenever it updates a checkout other than the one it runs in:
+
+- If the current checkout has the base checked out, or no checkout has it and
+  cleanup runs from the main worktree, cleanup switches to the base there and
+  fast-forwards it with `git merge --ff-only`. The exception is a main checkout
+  that Git reaches only through `GIT_DIR`/`GIT_WORK_TREE` or `core.worktree`,
+  such as a dotfiles checkout of `$HOME`: cleanup never switches or merges
+  there, even when it runs there, and plans the base like a linked worktree
+  would. Branches already merged into its local base are still deleted.
+- If another worktree has the base checked out, the base is fast-forwarded
+  there with `git merge --ff-only`. A worktree that has local changes or an
+  active operation, cannot be inspected, or refuses the fast-forward (for
+  example over an untracked file `status.showUntrackedFiles` hides) is left
+  alone, and cleanup proves merges against the unchanged local base.
+- A main worktree whose files live outside its Git directory, such as a
+  dotfiles checkout with `core.worktree` set or a bare repository used through
+  `GIT_DIR` and `GIT_WORK_TREE`, is never updated from another checkout. Its
+  own tooling may validate, back up, or normalize what it checks out, so
+  cleanup reports `not updating <base> in <path>` and leaves it alone. A bare
+  repository counts as having its HEAD branch checked out when it has an
+  index; remove a leftover index (for example from converting a clone to a
+  bare repository) if no work tree uses it.
+- Otherwise a linked worktree advances only the base ref with a guarded
+  `git update-ref`, and only by fast-forward. It never switches to the base, so
+  it never releases its own branch for deletion or locks the main worktree out
+  of the base.
+- If a rebase or bisect reserves the base, a linked worktree leaves the base
+  alone, and from the main worktree `git switch` refuses it. A linked worktree
+  also leaves the base alone when worktrees cannot be inspected, for example a
+  deleted worktree that was never pruned (or is locked), or Git older than
+  2.36. Without a local base, cleanup stops instead.
+
+Whenever the base update is skipped, cleanup still exits 0, because it did
+everything it safely could, but its final `done; ...` line ends with
+`<base> not updated (<reason>)`, and branches it keeps are reported as not
+proven against that un-updated local base. Upstream state in those messages
+comes from remote-tracking refs as of the last fetch. When a worktree cannot
+be inspected, cleanup prints once how to prune it (and unlock it first if it
+is locked).
+
+A dry run stops, with exit status 2 and `would refuse: <reason>`, wherever the
+real run refuses before changing anything (a dirty worktree, an active
+operation, or a local base that cannot fast-forward), instead of describing a
+cleanup that would not happen.
+
+Dry-run uses isolated temporary object storage, so it leaves no permanent
+objects or refs behind. The command retains the single raw configured fetch URL
+for both remote inspection and fetch, which lets Git apply any `insteadOf`
+rewrite exactly once per operation. Remotes with zero or multiple fetch URLs are
+rejected because there is no single endpoint to pin.
 
 Use `--all` to delete every local branch except the base branch regardless of
 merge state:
@@ -399,10 +461,12 @@ git cleanup-repo --all
 
 Branches checked out or reserved by another worktree are skipped by default.
 Use `--remove-worktrees` to remove a linked worktree before deleting its branch.
-Only worktrees with no tracked changes, index-hidden local content, or active
-rebase/merge/cherry-pick/revert/bisect operation are eligible. Unknown
-untracked or ignored content still blocks removal, and removal never uses
-`--force`:
+It never removes the current worktree or the main worktree, so a branch still
+checked out in either after the base update is kept. The branch checked out in
+the checkout cleanup runs from is never deleted. Only worktrees with no tracked
+changes, index-hidden local content, or active
+rebase/merge/cherry-pick/revert/bisect operation are eligible. Unknown untracked
+or ignored content still blocks removal, and removal never uses `--force`:
 
 ```sh
 git cleanup-repo --all --remove-worktrees
@@ -587,7 +651,12 @@ embedding contract.
 ## Requirements
 
 - Bash
-- Git
+- Git. The commands run the `git` binary in Git's own exec path
+  (`git --exec-path`), not whichever `git` comes first on `PATH`, so a
+  launcher or wrapper there cannot redirect their repository operations.
+  Started by name, they also export `GIT_EXEC_PATH` and put that directory
+  first on `PATH`, as Git does for its subcommands. If that binary is missing
+  they print a note and use `git` from `PATH`.
 - [`gh`](https://cli.github.com/), authenticated for the repository's GitHub
   host, for the `git pr-*` commands; `git repo-state`, `git branch-audit`, and
   `git worktree-audit` also use it when available to show PR details
@@ -687,3 +756,8 @@ test/shell-integration-test
 
 If `git-absorb` is not installed, the test suite verifies the dependency error
 path and skips rewrite integration cases.
+
+Suites inject failures with fake `git` programs on `PATH`. `test/run` and the
+shared `test/lib/test-temp.sh` therefore export `GIT_TOOLS_TEST_PATH_GIT=1`, a
+test-only override that makes the commands use `git` from `PATH`; cases that
+test the exec-path lookup unset it.

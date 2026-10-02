@@ -15,7 +15,13 @@ and
 .BR git-pr-restack (1).
 .PP
 The command refuses the whole stack before merging anything if any pull request
-is not ready. As each parent lands, the next child is restacked onto the root
+is not ready, or when run in a checkout that
+.BR git-pr-land (1)
+refuses to land from (a main checkout that Git reaches only through
+.BR GIT_DIR / GIT_WORK_TREE
+or
+.BR core.worktree ).
+As each parent lands, the next child is restacked onto the root
 base branch before it is landed.
 .PP
 URL targets and every discovered pull request are required to belong to the

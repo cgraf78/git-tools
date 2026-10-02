@@ -34,6 +34,7 @@ program	completions/git-stash-audit.bash
 program	completions/git-worktree-audit.bash
 program	install.sh
 program	lib/git-tools-base.sh
+program	lib/git-tools-git.sh
 program	lib/git-tools-inventory.sh
 program	lib/git-tools-pr.sh
 program	scripts/checkout-installer.conf

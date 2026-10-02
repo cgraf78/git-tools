@@ -49,6 +49,15 @@ _say() {
   printf 'git cleanup-repo: %s\n' "$*" >&2
 }
 
+# Stop before changing anything. A dry run stops for the same reasons, with the
+# same exit status, so it never describes a cleanup the real run would refuse.
+_refuse() {
+  if [[ "$_dry_run" == 1 ]]; then
+    _die "would refuse: $*"
+  fi
+  _die "$*"
+}
+
 _run() {
   if [[ "$_dry_run" == 1 ]]; then
     printf 'git cleanup-repo: would run:' >&2
@@ -79,7 +88,7 @@ _ensure_repo_ready() {
     state_rc=0
     _git_path_exists "$state" || state_rc=$?
     case "$state_rc" in
-      0) _die "repository already has an active rebase, merge, cherry-pick, or revert" ;;
+      0) _refuse "repository already has an active rebase, merge, cherry-pick, or revert" ;;
       1) ;;
       *) _die "could not inspect repository operation state" ;;
     esac
@@ -89,13 +98,7 @@ _ensure_repo_ready() {
   # edits. Keep cleanup focused on refs, not worktree conflict resolution.
   status=$(GIT_OPTIONAL_LOCKS=0 git status --porcelain) ||
     _die "could not inspect worktree status"
-  if [[ -n "$status" ]]; then
-    if [[ "$_dry_run" == 1 ]]; then
-      _say "worktree is dirty; real cleanup would stop before changing refs"
-      return 0
-    fi
-    _die "worktree must be clean before cleanup"
-  fi
+  [[ -z "$status" ]] || _refuse "worktree must be clean before cleanup"
 }
 
 _resolve_remote() {
@@ -248,9 +251,149 @@ _preflight_base() {
     2>/dev/null || ancestor_status=$?
   case "$ancestor_status" in
     0) _planned_base_oid=$_remote_oid ;;
-    1) _die "local base cannot be fast-forwarded to $_remote/$_base" ;;
+    1) _refuse "local base cannot be fast-forwarded to $_remote/$_base" ;;
     *) _die "could not compare local and remote base branches" ;;
   esac
+}
+
+# Record the invoking checkout and its branch. The branch comes from HEAD
+# rather than from `git worktree list`, which names a main worktree by its Git
+# directory when the checkout uses a separate Git directory or `core.worktree`,
+# omits a bare repository's external work tree, and needs Git 2.36 or newer.
+_locate_worktrees() {
+  local head_status=0
+
+  gt_find_current_worktree || _die "could not resolve current worktree"
+  _current_worktree=$GT_WORKTREE_PATH
+  _current_branch=$(git symbolic-ref -q HEAD) || head_status=$?
+  case "$head_status" in
+    0) _current_branch=${_current_branch#refs/heads/} ;;
+    1) _current_branch="" ;;
+    *) _die "could not inspect current branch" ;;
+  esac
+  _switched_to_base=0
+}
+
+_record_base_config() {
+  _run git config --local --replace-all "branch.$_base.remote" "$_remote"
+  _run git config --local --replace-all \
+    "branch.$_base.merge" "refs/heads/$_base"
+}
+
+# Leave the local base where it is. Merges are then proven against that older
+# base, which can only keep more branches. Without a local base there is
+# nothing to prove against, so that case cannot be skipped.
+_skip_base_update() {
+  _keep_local_base "$*"
+  _base_skip_reason=$*
+  _say "not updating $_base; $*"
+}
+
+# Remember a worktree a reservation scan could not inspect, so the advice for
+# it is printed once, the same way from every checkout.
+_note_uninspectable_worktree() {
+  [[ -z "$GT_WORKTREE_FAILED_PATH" ]] || {
+    _uninspectable_hint=$(gt_uninspectable_worktree_hint)
+  }
+}
+
+# A main worktree whose files live outside its Git directory belongs to the
+# tooling that manages it, which may validate, back up, or normalize what it
+# checks out, so cleanup never merges into it, even when cleanup runs there
+# (a Git launcher can route any directory into a dotfiles checkout of $HOME).
+# Branch deletion still proceeds, proven against the unchanged local base.
+_leave_external_base() {
+  _keep_local_base "its checkout has other tooling"
+  _base_skip_reason="its checkout is left to its own tooling"
+  _say "$(gt_base_sync_external_message "$_base")"
+}
+
+_keep_local_base() {
+  [[ "$_base_local_exists" == 1 ]] ||
+    _refuse "could not create local base branch $_base; $*"
+  _planned_base_oid=$_local_base_oid
+}
+
+# Check out and fast-forward the base in the invoking worktree. This is the
+# historical behavior and stays reserved for the main worktree or a worktree
+# that already has the base checked out, where it cannot steal the base from
+# another worktree or orphan a linked worktree's own branch.
+_switch_to_base() {
+  if [[ "$_base_local_exists" == 1 ]]; then
+    _run git switch --quiet --no-guess "$_base"
+  else
+    _run git switch --quiet -c "$_base" "$_remote_oid"
+    _record_base_config
+  fi
+  _run git merge --quiet --ff-only "$_remote_oid"
+  _switched_to_base=1
+}
+
+# Another worktree owns the base, so only that worktree can advance it without
+# leaving its index and files behind the moved ref. Its pending edits belong to
+# the user, so skip the update rather than merge into them.
+_fast_forward_base_worktree() {
+  local path="$1" operation status
+
+  if ! operation=$(gt_worktree_operation "$path"); then
+    gt_record_uninspectable_worktree "$path" || _note_uninspectable_worktree
+    _skip_base_update "could not inspect worktree: $path"
+    return 0
+  fi
+  if [[ -n "$operation" ]]; then
+    _skip_base_update "worktree has active $operation: $path"
+    return 0
+  fi
+  if ! status=$(GIT_OPTIONAL_LOCKS=0 gt_git_without_local_env -C "$path" \
+    status --porcelain 2>/dev/null); then
+    _skip_base_update "could not inspect worktree: $path"
+    return 0
+  fi
+  if [[ -n "$status" ]]; then
+    _skip_base_update "worktree has local changes: $path"
+    return 0
+  fi
+  # Report the user-visible command; the real run clears this worktree's
+  # inherited Git environment so the merge happens in the base worktree.
+  if [[ "$_dry_run" == 1 ]]; then
+    _run git -C "$path" merge --quiet --ff-only "$_remote_oid"
+    return 0
+  fi
+  if ! gt_git_without_local_env -C "$path" merge --quiet --ff-only \
+    "$_remote_oid"; then
+    # A fast-forward refuses before changing anything when, for example, an
+    # untracked file hidden by status.showUntrackedFiles is in the way. That
+    # is the same kind of local state as the changes skipped above.
+    if ! _local_branch_exists "$_base" ||
+      [[ "$GT_REF_OID" != "$_local_base_oid" ]]; then
+      _die "could not fast-forward $_base in worktree $path"
+    fi
+    _skip_base_update "could not fast-forward it in worktree $path"
+    return 0
+  fi
+  _say "fast-forwarded $_base in worktree $path"
+}
+
+# Nothing has the base checked out or reserved, so a linked worktree can
+# advance the ref directly instead of switching away from its own branch.
+# Preflight proved the move is a fast-forward; the old-value guard keeps a
+# concurrent ref update from being overwritten.
+_fast_forward_base_ref() {
+  local message="cleanup-repo: fast-forward $_base to $_remote/$_base"
+
+  if [[ "$_base_local_exists" == 0 ]]; then
+    _run git update-ref -m "$message" "refs/heads/$_base" "$_remote_oid" "" ||
+      _die "could not create local base branch: $_base"
+    _record_base_config
+    [[ "$_dry_run" == 1 ]] ||
+      _say "created $_base at $_remote/$_base; no worktree has it checked out"
+    return 0
+  fi
+  _run git update-ref -m "$message" "refs/heads/$_base" \
+    "$_planned_base_oid" "$_local_base_oid" ||
+    _die "could not fast-forward local base branch: $_base"
+  [[ "$_dry_run" == 1 ]] ||
+    _say "fast-forwarded $_base to $_remote/$_base; no worktree has it checked out"
 }
 
 _update_base() {
@@ -258,15 +401,43 @@ _update_base() {
   _resolve_local_base
   _preflight_base
 
-  if [[ "$_base_local_exists" == 1 ]]; then
-    _run git switch --quiet --no-guess "$_base"
-  else
-    _run git switch --quiet -c "$_base" "$_remote_oid"
-    _run git config --local --replace-all "branch.$_base.remote" "$_remote"
-    _run git config --local --replace-all \
-      "branch.$_base.merge" "refs/heads/$_base"
-  fi
-  _run git merge --quiet --ff-only "$_remote_oid"
+  # `git switch` refuses a base another worktree reserves, so the main
+  # worktree does not need the slower reservation scan.
+  gt_plan_base_sync "$_base" || _die "could not inspect current worktree"
+  case "$GT_BASE_SYNC_ACTION" in
+    current | switch) _switch_to_base ;;
+    unknown)
+      # Without an inventory (for example Git before 2.36), the main worktree
+      # keeps its historical switch, which Git itself refuses when another
+      # worktree has the base checked out or reserved.
+      if [[ "$GT_BASE_SYNC_REASON" == inventory &&
+        "$GT_BASE_SYNC_MAY_SWITCH" == 1 ]]; then
+        _switch_to_base
+      elif [[ "$_planned_base_oid" == "$_local_base_oid" ]]; then
+        :
+      elif [[ "$GT_BASE_SYNC_REASON" == inventory ]]; then
+        _skip_base_update "could not inspect worktrees"
+      else
+        _note_uninspectable_worktree
+        _skip_base_update "could not inspect worktree reservations"
+      fi
+      ;;
+    *)
+      # Everything else leaves the invoking checkout alone, so there is
+      # nothing to do unless the base ref has to move.
+      if [[ "$_planned_base_oid" != "$_local_base_oid" ]]; then
+        case "$GT_BASE_SYNC_ACTION" in
+          worktree) _fast_forward_base_worktree "$GT_BASE_SYNC_PATH" ;;
+          ref) _fast_forward_base_ref ;;
+          reserved)
+            _skip_base_update "reserved by worktree $GT_BASE_SYNC_PATH"
+            ;;
+          external) _leave_external_base ;;
+          *) _die "could not plan the base update" ;;
+        esac
+      fi
+      ;;
+  esac
 
   if [[ "$_dry_run" == 1 ]]; then
     _base_oid=$_planned_base_oid
@@ -584,14 +755,45 @@ _remove_branch_worktree_if_needed() {
   local branch="$1" branch_oid="$2" operation path state
 
   if ! gt_find_worktree_reserving_branch "$branch"; then
+    _note_uninspectable_worktree
     _say "skipping $branch; could not inspect worktree reservations"
     return 1
   fi
   path=$GT_WORKTREE_PATH
-  [[ -n "$path" ]] || return 0
 
+  # A dry run does not really switch to the base, but the real run releases
+  # the branch the current worktree leaves, so report that outcome.
+  if [[ "$_dry_run" == 1 && "$_switched_to_base" == 1 &&
+    -n "$_current_branch" && "$branch" == "$_current_branch" ]]; then
+    return 0
+  fi
+  # Never delete the invoking checkout's branch, and never remove that
+  # checkout. The branch-name check runs first because the inventory can miss
+  # it entirely: a bare repository used through GIT_DIR and GIT_WORK_TREE has
+  # no branch line, and other main worktrees are listed by their Git
+  # directory. The path check covers a branch the current worktree reserves
+  # without having it checked out, such as during a detached bisect.
+  if [[ "$_switched_to_base" != 1 && -n "$_current_branch" &&
+    "$branch" == "$_current_branch" ]] ||
+    [[ -n "$path" && "$path" -ef "$_current_worktree" ]]; then
+    _say "keeping $branch; checked out in the current worktree"
+    return 1
+  fi
+  [[ -n "$path" ]] || return 0
   if [[ "$_remove_worktrees" != 1 ]]; then
     _say "skipping $branch; checked out in worktree $path"
+    return 1
+  fi
+  # Git refuses to remove the main worktree only after cache pruning has
+  # already touched it, so it is never eligible, even with --remove-worktrees.
+  # Both paths come from the same inventory, so they agree even when the main
+  # worktree is listed by its Git directory.
+  if ! gt_find_main_worktree; then
+    _say "skipping $branch; could not inspect worktrees"
+    return 1
+  fi
+  if [[ "$path" == "$GT_WORKTREE_PATH" || "$path" -ef "$GT_WORKTREE_PATH" ]]; then
+    _say "skipping $branch; checked out in the main worktree $path"
     return 1
   fi
 
@@ -661,12 +863,14 @@ _remove_branch_worktree_if_needed() {
     _say "skipping $branch; worktree could not be removed safely: $path"
     return 1
   fi
+  [[ "$_dry_run" == 1 ]] || _say "removed worktree $path"
 }
 
 _delete_branch() {
   local branch="$1" branch_oid="$2" reason="$3"
 
   if ! gt_find_worktree_reserving_branch "$branch"; then
+    _note_uninspectable_worktree
     _say "skipping $branch; could not recheck worktree reservations"
     return 1
   fi
@@ -698,7 +902,7 @@ _inventory_branches() {
   _upstreams=()
   _upstream_tracks=()
   records=$(git for-each-ref \
-    --format='%(refname)%09%(objectname)%09%(upstream)%09%(upstream:track)' \
+    --format='%(refname)%09%(objectname)%09%(upstream:short)%09%(upstream:track)' \
     refs/heads) ||
     _die "could not enumerate branches"
 
@@ -723,9 +927,14 @@ _inventory_branches() {
 }
 
 _cleanup_branches() {
-  local branch branch_oid upstream upstream_track reason index
-  local candidates=0 skipped=0
+  local branch branch_oid upstream upstream_track reason index summary
+  local candidates=0 skipped=0 unproven="merge not proven"
 
+  # Merges are proven against the local base. When its update was skipped,
+  # that base is older than the remote one, so a branch merged only remotely
+  # cannot be proven yet; say which base the proof used.
+  [[ -z "$_base_skip_reason" ]] ||
+    unproven="merge not proven against the local $_base, which was not updated"
   _inventory_branches
   for index in "${!_branches[@]}"; do
     branch=${_branches[$index]}
@@ -734,13 +943,16 @@ _cleanup_branches() {
     upstream_track=${_upstream_tracks[$index]}
 
     reason=$(_delete_reason "$branch_oid" "$upstream_track") || {
+      # Upstream state comes from remote-tracking refs as of the last fetch;
+      # cleanup fetches only the base, so say so rather than claim it is live.
       if [[ "$upstream_track" == "[gone]" ]]; then
-        _say "keeping $branch; merge not proven; upstream is gone;" \
+        _say "keeping $branch; $unproven; upstream is gone;" \
           "--gone selects it for cleanup"
       elif [[ -n "$upstream" ]]; then
-        _say "keeping $branch; merge not proven; upstream still exists"
+        _say "keeping $branch; $unproven; upstream $upstream still" \
+          "exists as of the last fetch"
       else
-        _say "keeping $branch; merge not proven; no upstream is configured"
+        _say "keeping $branch; $unproven; no upstream is configured"
       fi
       skipped=$((skipped + 1))
       continue
@@ -757,11 +969,17 @@ _cleanup_branches() {
     candidates=$((candidates + 1))
   done
 
+  [[ -z "$_uninspectable_hint" ]] || _say "$_uninspectable_hint"
   if [[ "$_dry_run" == 1 ]]; then
-    _say "done; would delete $candidates local branch(es), skipped $skipped"
+    summary="done; would delete $candidates local branch(es), skipped $skipped"
   else
-    _say "done; deleted $candidates local branch(es), skipped $skipped"
+    summary="done; deleted $candidates local branch(es), skipped $skipped"
   fi
+  # Exit 0 still means cleanup did what it safely could; the summary says when
+  # the local base was left behind the remote, so it is not taken as current.
+  [[ -z "$_base_skip_reason" ]] ||
+    summary="$summary; $_base not updated ($_base_skip_reason)"
+  _say "$summary"
 }
 
 _parse_args() {
@@ -829,6 +1047,8 @@ _parse_args() {
   done
 }
 
+_base_skip_reason=""
+_uninspectable_hint=""
 _parse_args "$@"
 _ensure_repo_ready
 if [[ "$_remove_worktrees" == 1 ]]; then
@@ -837,6 +1057,7 @@ else
   _worktree_prune_paths=()
 fi
 _resolve_remote
+_locate_worktrees
 
 # A non-writing hash probe detects the native SHA width without requiring the
 # newer rev-parse --show-object-format option.

@@ -4,6 +4,12 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
+# The tools run Git's own binary rather than `git` on PATH (lib/git-tools-git.sh).
+# Suites put fake `git` programs on PATH to inject failures, so ask the tools to
+# honor PATH for the whole run; suites that test the real-binary lookup unset
+# this themselves.
+export GIT_TOOLS_TEST_PATH_GIT=1
+
 # shellcheck source=lib/git-tools-inventory.sh
 . "$ROOT/lib/git-tools-inventory.sh"
 

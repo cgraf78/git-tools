@@ -61,5 +61,8 @@ gt_test_git_isolate() {
   export GIT_CONFIG_NOSYSTEM=1
   export GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
   export GIT_TOOLS_TEST_REAL_GIT="$real"
+  # The tools run Git's own binary, bypassing PATH; suites that put a fake
+  # `git` on PATH opt back into PATH lookup.
+  export GIT_TOOLS_TEST_PATH_GIT=1
   PATH="$root/git-bin:$PATH"
 }

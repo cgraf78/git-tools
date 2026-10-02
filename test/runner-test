@@ -3,6 +3,10 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Signal cases below need INT and TERM deliverable; see default-signals.sh.
+# shellcheck source=test/lib/default-signals.sh
+. "$ROOT/test/lib/default-signals.sh"
+gt_test_default_signals "${BASH_SOURCE[0]}" "$@"
 failures=0
 old_umask=$(umask)
 umask 077
@@ -119,7 +123,7 @@ EOF
 chmod +x "$fixture/support/sync-launcher-bootstrap" "$fixture/test/run" \
   "$fixture/test/suite"
 for suite in runner launcher-bootstrap install extras shell-integration \
-  test-temp one two; do
+  test-temp hermetic-git one two; do
   cp "$fixture/test/suite" "$fixture/test/$suite-test"
 done
 
@@ -140,7 +144,7 @@ fi
 previous=0
 ordered=1
 for suite in runner launcher-bootstrap install extras shell-integration \
-  test-temp one two; do
+  test-temp hermetic-git one two; do
   line=$(grep -n -F -x "$suite-output" "$output" | cut -d: -f1)
   if [[ -z "$line" || "$line" -le "$previous" ]]; then
     ordered=0
@@ -217,34 +221,40 @@ for invalid_jobs in invalid 0 00 08; do
   fi
 done
 
-rm -rf "$state"
-mkdir "$state"
-TMPDIR="$runner_tmp" RUNNER_STATE="$state" HANG_SUITE=runner \
-  GIT_TOOLS_SKIP_SHELLCHECK=1 \
-  GIT_TOOLS_TEST_JOBS=2 "$fixture/test/run" >"$output" 2>&1 &
-runner_pid=$!
-background_runner_pid=$runner_pid
-count=0
-while [[ ! -e "$state/runner.ready" && "$count" -lt 500 ]]; do
-  sleep 0.02
-  count=$((count + 1))
-done
-suite_pid=$(cat "$state/runner.pid" 2>/dev/null || true)
-descendant_pid=$(cat "$state/runner.descendant-pid" 2>/dev/null || true)
-kill -TERM "$runner_pid" 2>/dev/null || true
-run_status=0
-wait "$runner_pid" || run_status=$?
-background_runner_pid=""
-if [[ "$run_status" -eq 143 && -n "$suite_pid" && -n "$descendant_pid" &&
-  -e "$state/runner.terminated" ]] &&
-  ! process_is_live "$suite_pid" &&
-  ! process_is_live "$descendant_pid" &&
-  [[ -z "$(find "$runner_tmp" -name 'git-tools-run.*' -print)" ]]; then
-  pass "runner termination drains processes and private logs"
+# The runner must stop on TERM; an inherited ignored TERM that could not be
+# reset never reaches it, so the case would wait forever.
+if gt_test_signal_ignored TERM; then
+  pass "runner termination skipped: TERM is ignored and cannot be reset"
 else
-  fail "runner termination drains processes and private logs"
-  [[ -z "$suite_pid" ]] || kill -KILL "$suite_pid" 2>/dev/null || true
-  [[ -z "$descendant_pid" ]] || kill -KILL "$descendant_pid" 2>/dev/null || true
+  rm -rf "$state"
+  mkdir "$state"
+  TMPDIR="$runner_tmp" RUNNER_STATE="$state" HANG_SUITE=runner \
+    GIT_TOOLS_SKIP_SHELLCHECK=1 \
+    GIT_TOOLS_TEST_JOBS=2 "$fixture/test/run" >"$output" 2>&1 &
+  runner_pid=$!
+  background_runner_pid=$runner_pid
+  count=0
+  while [[ ! -e "$state/runner.ready" && "$count" -lt 500 ]]; do
+    sleep 0.02
+    count=$((count + 1))
+  done
+  suite_pid=$(cat "$state/runner.pid" 2>/dev/null || true)
+  descendant_pid=$(cat "$state/runner.descendant-pid" 2>/dev/null || true)
+  kill -TERM "$runner_pid" 2>/dev/null || true
+  run_status=0
+  wait "$runner_pid" || run_status=$?
+  background_runner_pid=""
+  if [[ "$run_status" -eq 143 && -n "$suite_pid" && -n "$descendant_pid" &&
+    -e "$state/runner.terminated" ]] &&
+    ! process_is_live "$suite_pid" &&
+    ! process_is_live "$descendant_pid" &&
+    [[ -z "$(find "$runner_tmp" -name 'git-tools-run.*' -print)" ]]; then
+    pass "runner termination drains processes and private logs"
+  else
+    fail "runner termination drains processes and private logs"
+    [[ -z "$suite_pid" ]] || kill -KILL "$suite_pid" 2>/dev/null || true
+    [[ -z "$descendant_pid" ]] || kill -KILL "$descendant_pid" 2>/dev/null || true
+  fi
 fi
 
 if ((failures > 0)); then

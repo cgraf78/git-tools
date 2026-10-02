@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+helper="$ROOT/test/lib/hermetic-git.sh"
+# Probe children below compare exact output; only the hostile case sets its own.
+unset BASH_ENV
+failures=0
+sandbox=$(mktemp -d "${TMPDIR:-/tmp}/git-tools-hermetic-git-test.XXXXXX") || exit 1
+trap 'rm -rf -- "$sandbox"' EXIT
+# The helper resolves its root with `cd -P`; compare against the same
+# physical path (macOS TMPDIR is /var/..., a symlink to /private/var/...,
+# and often ends in a slash).
+sandbox=$(cd -P -- "$sandbox" && pwd) || exit 1
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  failures=$((failures + 1))
+}
+
+assert_eq() {
+  local name="$1" expected="$2" actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    pass "$name"
+  else
+    fail "$name"
+    printf '  expected: %q\n' "$expected" >&2
+    printf '  actual:   %q\n' "$actual" >&2
+  fi
+}
+
+echo '=== git test environment ==='
+real_git=${GIT_TOOLS_TEST_REAL_GIT:-$(type -a -p git | tail -n 1)}
+printf '# suites run %s (%s)\n' "$real_git" "$("$real_git" --version 2>&1)"
+
+# Build every hostile input a developer shell can feed Git: a logging launcher
+# first on PATH, a global config that signs commits with a failing program,
+# exported command-scope config that installs failing hooks, repository and
+# identity variables, an SSH override, an XDG config, a caller cache root, and
+# an exported shell function shadowing git, and a BASH_ENV startup file.
+hostile_home="$sandbox/hostile-home"
+launcher_dir="$sandbox/launcher"
+hooks="$sandbox/hooks"
+mkdir -p "$hostile_home/.config/git" "$launcher_dir" "$hooks" "$sandbox/root"
+cat >"$hostile_home/.gitconfig" <<'EOF'
+[commit]
+	gpgSign = true
+[gpg]
+	program = false
+[init]
+	defaultBranch = hostile
+EOF
+printf '[core]\n\thooksPath = %s\n' "$hooks" >"$hostile_home/.config/git/config"
+printf '#!/bin/sh\nexit 1\n' >"$hooks/pre-commit"
+cat >"$launcher_dir/git" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >>"$sandbox/launcher.log"
+exit 97
+EOF
+printf 'printf "x\\n" >>"%s"\n' "$sandbox/bash-env.log" >"$sandbox/bash-env"
+chmod +x "$hooks/pre-commit" "$launcher_dir/git"
+
+report="$sandbox/report"
+child_rc=0
+HOME="$hostile_home" XDG_CONFIG_HOME="$hostile_home/.config" \
+  PATH="$launcher_dir:$PATH" \
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath \
+  GIT_CONFIG_VALUE_0="$hooks" \
+  GIT_CONFIG_PARAMETERS="'commit.gpgsign'='true'" \
+  GIT_DIR="$sandbox/missing.git" GIT_INDEX_FILE="$sandbox/missing.index" \
+  GIT_AUTHOR_NAME=Hostile GIT_COMMITTER_EMAIL=hostile@example.invalid \
+  GIT_SSH_COMMAND=false GIT_TOOLS_WORKTREE_PARENT="$sandbox/elsewhere" \
+  GIT_TOOLS_TEST_KEEP=kept XDG_CACHE_HOME="$sandbox/caller-cache" \
+  BASH_ENV="$sandbox/bash-env" TEST_BASH_ENV_LOG="$sandbox/bash-env.log" \
+  TEST_HELPER="$helper" TEST_ROOT="$sandbox/root" TEST_REPORT="$report" \
+  /bin/bash -c '
+    git() { printf "function\n"; }
+    export -f git
+    . "$TEST_HELPER"
+    gt_test_git_isolate "$TEST_ROOT" || exit 1
+    # Outside any repository, so only global and system scopes could appear.
+    cd "$TEST_ROOT" || exit 1
+    repo="$TEST_ROOT/repo"
+    {
+      printf "git=%s\n" "$(command -v git)"
+      [[ -f "$TEST_ROOT/git-bin/git" && ! -L "$TEST_ROOT/git-bin/git" ]] &&
+        printf "wrapper=regular\n"
+      printf "cache=%s\n" "${XDG_CACHE_HOME-unset}"
+      before=$(wc -l <"$TEST_BASH_ENV_LOG")
+      bash -c :
+      printf "bash_env_runs=%s\n" "$(($(wc -l <"$TEST_BASH_ENV_LOG") - before))"
+      printf "home=%s\n" "$HOME"
+      printf "global=%s\n" "$GIT_CONFIG_GLOBAL"
+      printf "inherited=%s\n" "$(compgen -e | grep "^GIT_" | grep -v "^GIT_TOOLS_TEST_" |
+        grep -Ev "^GIT_CONFIG_(NOSYSTEM|GLOBAL)$" | sort | tr "\n" " ")"
+      printf "keep=%s\n" "${GIT_TOOLS_TEST_KEEP:-}"
+      git init -q "$repo" && printf "init=ok\n"
+      git -C "$repo" config user.name Test
+      git -C "$repo" config user.email test@example.invalid
+      git -C "$repo" commit -q --allow-empty -m fixture && printf "commit=ok\n"
+      printf "branch=%s\n" "$(git -C "$repo" symbolic-ref --short HEAD)"
+      printf "author=%s\n" "$(git -C "$repo" log -1 --format=%an/%ce)"
+      printf "signature=%s\n" "$(git -C "$repo" log -1 --format=%G?)"
+      printf "config=%s\n" "$(git config --show-scope --list | tr "\n" " ")"
+      "$GIT_TOOLS_TEST_REAL_GIT" --version >/dev/null && printf "real=ok\n"
+    } >"$TEST_REPORT" 2>&1
+  ' || child_rc=$?
+
+field() {
+  sed -n "s/^$1=//p" "$report"
+}
+
+assert_eq "isolation succeeds in a hostile environment" 0 "$child_rc"
+assert_eq "real Git precedes a launcher on PATH" \
+  "$sandbox/root/git-bin/git" "$(field git)"
+assert_eq "the exported real Git runs" ok "$(field real)"
+assert_eq "real Git is reached through a regular file install.sh accepts" \
+  regular "$(field wrapper)"
+assert_eq "the caller cache root is dropped" unset "$(field cache)"
+assert_eq "child bash processes skip the caller's BASH_ENV" 0 \
+  "$(field bash_env_runs)"
+assert_eq "the launcher is never invoked" absent \
+  "$([[ -e "$sandbox/launcher.log" ]] && cat "$sandbox/launcher.log" || printf absent)"
+assert_eq "HOME is private" "$sandbox/root/git-home" "$(field home)"
+assert_eq "global config is private" "$sandbox/root/git-home/.gitconfig" \
+  "$(field global)"
+assert_eq "inherited GIT_* variables are dropped" "" "$(field inherited)"
+assert_eq "GIT_TOOLS_TEST_* harness variables are kept" kept "$(field keep)"
+assert_eq "fixture repository initializes" ok "$(field init)"
+assert_eq "fixture commit ignores signing config and hooks" ok "$(field commit)"
+assert_eq "caller defaultBranch does not apply" 0 \
+  "$([[ "$(field branch)" == hostile ]] && printf 1 || printf 0)"
+assert_eq "repository identity wins over inherited identity" \
+  "Test/test@example.invalid" "$(field author)"
+assert_eq "commits are unsigned" N "$(field signature)"
+assert_eq "no global, system, or command config is visible" "" \
+  "$(field config)"
+
+# A caller can pin the Git build under test.
+custom_git="$sandbox/custom git's/git"
+mkdir -p "${custom_git%/*}"
+printf '#!/bin/sh\nprintf "custom %%s\\n" "$*"\n' >"$custom_git"
+chmod +x "$custom_git"
+custom_out=$(GIT_TOOLS_TEST_REAL_GIT="$custom_git" TEST_HELPER="$helper" \
+  /bin/bash -c '
+    . "$TEST_HELPER"
+    gt_test_git_isolate "$1" || exit 1
+    git --version
+    printf "%s\n" "$GIT_TOOLS_TEST_REAL_GIT"
+  ' _ "$(mkdir "$sandbox/custom-root" && printf '%s' "$sandbox/custom-root")" 2>&1)
+assert_eq "a preset GIT_TOOLS_TEST_REAL_GIT is honored, even with quotes" \
+  "$(printf 'custom --version\n%s' "$custom_git")" "$custom_out"
+
+missing_rc=0
+TEST_HELPER="$helper" /bin/bash -c '
+  . "$TEST_HELPER"
+  gt_test_git_isolate "$1"
+' _ "$sandbox/does-not-exist" >/dev/null 2>&1 || missing_rc=$?
+assert_eq "a missing root fails instead of isolating elsewhere" 1 "$missing_rc"
+
+# A root spelled with a trailing slash still yields a canonical HOME.
+mkdir "$sandbox/slash-root"
+slash_home=$(TEST_HELPER="$helper" /bin/bash -c '
+  . "$TEST_HELPER"
+  gt_test_git_isolate "$1" || exit 1
+  printf "%s\n" "$HOME"
+' _ "$sandbox/slash-root/" 2>&1)
+assert_eq "a non-canonical root yields a canonical HOME" \
+  "$(cd -P -- "$sandbox/slash-root" && pwd)/git-home" "$slash_home"
+
+# Every suite must opt in before its first command, so a new suite cannot
+# silently run against the caller's configuration. Exempt suites run no Git;
+# the unmigrated ones are owned by separate work and should adopt the helper.
+exempt=" hermetic-git-test runner-test test-temp-test "
+unmigrated=" git-cleanup-repo-test git-pr-land-stack-test git-pr-land-test "
+for suite in "$ROOT"/test/*-test; do
+  name=${suite##*/}
+  [[ "$exempt$unmigrated" != *" $name "* ]] || continue
+  if grep -Eq '^[[:space:]]*gt_test_git_isolate ' "$suite"; then
+    pass "$name isolates Git"
+  else
+    fail "$name isolates Git"
+  fi
+done
+
+if ((failures > 0)); then
+  printf '%s failure(s)\n' "$failures" >&2
+  exit 1
+fi
+
+printf 'all tests passed\n'

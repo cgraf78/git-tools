@@ -10,6 +10,9 @@ ROOT=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 . "$ROOT/lib/git-tools-inventory.sh"
 
 gt_test_temp_init || exit 1
+# shellcheck source=lib/hermetic-git.sh
+. "$ROOT/test/lib/hermetic-git.sh"
+gt_test_git_isolate "$GT_TEST_TEMP_ROOT" || exit 1
 failures=0
 
 pass() {

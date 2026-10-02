@@ -24,6 +24,12 @@ _cleanup() {
 }
 trap _cleanup EXIT
 
+# shellcheck source=test/lib/hermetic-git.sh
+. "$ROOT/test/lib/hermetic-git.sh"
+_git_env_root=$(mktemp -d) || exit 1
+_temps+=("$_git_env_root")
+gt_test_git_isolate "$_git_env_root" || exit 1
+
 _pass() {
   printf 'ok - %s\n' "$1"
 }

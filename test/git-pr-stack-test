@@ -10,6 +10,9 @@ _failures=0
 # shellcheck source=test/lib/test-temp.sh
 . "$ROOT/test/lib/test-temp.sh"
 gt_test_temp_init || exit 1
+# shellcheck source=test/lib/hermetic-git.sh
+. "$ROOT/test/lib/hermetic-git.sh"
+gt_test_git_isolate "$GT_TEST_TEMP_ROOT" || exit 1
 _tmpdir() { gt_test_temp_dir; }
 
 _pass() {

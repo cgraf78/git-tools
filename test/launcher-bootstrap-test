@@ -5,6 +5,9 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMPDIR_ROOT=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_ROOT"' EXIT
+# shellcheck source=test/lib/hermetic-git.sh
+. "$ROOT/test/lib/hermetic-git.sh"
+gt_test_git_isolate "$TMPDIR_ROOT" || exit 1
 
 failures=0
 

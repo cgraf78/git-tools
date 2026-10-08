@@ -394,6 +394,52 @@ _assert_contains "gone deletes removed-upstream branches" \
 _assert_eq "gone mode deletes gone branch" \
   "$(printf 'keep\nlocal-only\nmain')" "$(_branches "$repo")"
 
+# A gone upstream selects a branch only when it was the branch's own remote
+# branch. Each case below has unpushed work that only its local ref holds.
+other_gone_repo=$(_clone_remote)
+git -C "$other_gone_repo" switch --quiet -c base-of-feature
+_commit_file "$other_gone_repo" base.txt base "add base of feature"
+git -C "$other_gone_repo" push -u origin base-of-feature >/dev/null 2>&1
+git -C "$other_gone_repo" switch --quiet -c tracks-other
+_commit_file "$other_gone_repo" other.txt unpushed "add unpushed work"
+git -C "$other_gone_repo" branch --quiet --set-upstream-to=origin/base-of-feature
+git -C "$other_gone_repo" switch --quiet main
+git -C "$other_gone_repo" push origin --delete base-of-feature >/dev/null 2>&1
+git -C "$other_gone_repo" branch --quiet -D base-of-feature
+result=$(git -C "$other_gone_repo" cleanup-repo --gone 2>&1)
+_assert_contains "gone keeps a branch whose differently named upstream is gone" \
+  "keeping tracks-other; merge not proven; upstream origin/base-of-feature is gone, but it is not this branch's own remote branch" \
+  "$result"
+_assert_eq "gone preserves a branch tracking another gone branch" \
+  "$(printf 'main\ntracks-other')" "$(_branches "$other_gone_repo")"
+
+renamed_gone_repo=$(_clone_remote)
+git -C "$renamed_gone_repo" switch --quiet -c local-name
+_commit_file "$renamed_gone_repo" renamed.txt pushed "add renamed work"
+git -C "$renamed_gone_repo" push --quiet -u origin local-name:remote-name >/dev/null 2>&1
+git -C "$renamed_gone_repo" switch --quiet main
+git -C "$renamed_gone_repo" push origin --delete remote-name >/dev/null 2>&1
+result=$(git -C "$renamed_gone_repo" cleanup-repo --gone 2>&1)
+_assert_contains "gone keeps a branch whose renamed upstream is gone" \
+  "keeping local-name; merge not proven; upstream origin/remote-name is gone" \
+  "$result"
+_assert_eq "gone preserves a branch with a renamed gone upstream" \
+  "$(printf 'local-name\nmain')" "$(_branches "$renamed_gone_repo")"
+
+local_gone_repo=$(_clone_remote)
+git -C "$local_gone_repo" branch local-base
+git -C "$local_gone_repo" switch --quiet -c tracks-local
+_commit_file "$local_gone_repo" local.txt unpushed "add local-only work"
+git -C "$local_gone_repo" branch --quiet --set-upstream-to=local-base
+git -C "$local_gone_repo" switch --quiet main
+git -C "$local_gone_repo" branch --quiet -D local-base
+result=$(git -C "$local_gone_repo" cleanup-repo --gone 2>&1)
+_assert_contains "gone keeps a branch whose local upstream is gone" \
+  "keeping tracks-local; merge not proven; upstream local-base is gone" \
+  "$result"
+_assert_eq "gone preserves a branch tracking a deleted local branch" \
+  "$(printf 'main\ntracks-local')" "$(_branches "$local_gone_repo")"
+
 squash_repo=$(_clone_remote)
 git -C "$squash_repo" switch --quiet -c squashed
 _commit_file "$squash_repo" squashed.txt one "add squashed step 1"

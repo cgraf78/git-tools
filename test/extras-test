@@ -298,7 +298,7 @@ _assert_contains "fish branch-audit describes candidate reporting" \
   'drop-merged -d "Report branches already merged into the default branch"' \
   "$ROOT/completions/git-branch-audit.fish"
 _assert_contains "zsh cleanup describes gone selection" \
-  "--gone[Select gone-upstream branches for cleanup]" \
+  "--gone[Select branches whose own-name upstream is gone]" \
   "$ROOT/completions/git-cleanup-repo.zsh"
 _assert_contains "fish cleanup describes worktree removal" \
   'remove-worktrees -d "Remove eligible linked worktrees for deleted branches"' \

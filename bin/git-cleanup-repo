@@ -32,7 +32,7 @@ deletion.
 Options:
   -b, --base <branch>       Base branch to keep and update.
   -r, --remote <name>       Remote endpoint to fetch from (default: origin).
-      --gone                Select gone-upstream branches for cleanup.
+      --gone                Select branches whose own-name upstream is gone.
   -a, --all                 Delete all local branches except the base branch.
       --remove-worktrees    Remove eligible linked worktrees for deleted branches.
   -n, --dry-run             Print actions without changing anything.
@@ -457,8 +457,21 @@ _branch_merged_into_base() {
   git merge-base --is-ancestor "$1" "$_base_oid" 2>/dev/null
 }
 
+# Only a gone upstream that carried this branch's own name suggests the
+# branch was published and then retired, normally by a landed PR. A branch
+# that tracks another branch (the base it was cut from, a teammate's branch,
+# or a local one) may hold commits no remote ever saw, so that branch's
+# deleted upstream proves nothing about it.
+_own_upstream_gone() {
+  local branch="$1" upstream_track="$2" remote_name="$3" remote_ref="$4"
+
+  [[ "$upstream_track" == "[gone]" && -n "$remote_name" &&
+    "$remote_name" != . && "$remote_ref" == "refs/heads/$branch" ]]
+}
+
 _delete_reason() {
-  local branch_oid="$1" upstream_track="$2" ancestor_status=0
+  local branch="$1" branch_oid="$2" upstream_track="$3" remote_name="$4"
+  local remote_ref="$5" ancestor_status=0
 
   if [[ "$_all" == 1 ]]; then
     printf 'all\n'
@@ -477,7 +490,8 @@ _delete_reason() {
     printf 'content-merged\n'
     return 0
   fi
-  if [[ "$_gone" == 1 && "$upstream_track" == "[gone]" ]]; then
+  if [[ "$_gone" == 1 ]] &&
+    _own_upstream_gone "$branch" "$upstream_track" "$remote_name" "$remote_ref"; then
     printf 'upstream gone\n'
     return 0
   fi
@@ -895,19 +909,29 @@ _delete_branch() {
 }
 
 _inventory_branches() {
-  local records branch_ref branch branch_oid upstream upstream_track status=0
+  local records branch_ref branch branch_oid upstream upstream_track
+  local remote_name remote_ref status=0
 
   _branches=()
   _branch_oids=()
   _upstreams=()
   _upstream_tracks=()
+  _upstream_remotes=()
+  _upstream_refs=()
+  # Optional fields carry a tag: TAB is IFS whitespace, so `read` would
+  # collapse an empty field and shift every later one into the wrong slot.
   records=$(git for-each-ref \
-    --format='%(refname)%09%(objectname)%09%(upstream:short)%09%(upstream:track)' \
+    --format='%(refname)%09%(objectname)%09u=%(upstream:short)%09t=%(upstream:track)%09r=%(upstream:remotename)%09f=%(upstream:remoteref)' \
     refs/heads) ||
     _die "could not enumerate branches"
 
-  while IFS=$'\t' read -r branch_ref branch_oid upstream upstream_track; do
+  while IFS=$'\t' read -r branch_ref branch_oid upstream upstream_track \
+    remote_name remote_ref; do
     [[ -n "$branch_ref" ]] || continue
+    upstream=${upstream#u=}
+    upstream_track=${upstream_track#t=}
+    remote_name=${remote_name#r=}
+    remote_ref=${remote_ref#f=}
     case "$branch_ref" in
       refs/heads/*) branch=${branch_ref#refs/heads/} ;;
       *) _die "invalid branch inventory record: $branch_ref" ;;
@@ -923,11 +947,14 @@ _inventory_branches() {
     _branch_oids+=("$branch_oid")
     _upstreams+=("$upstream")
     _upstream_tracks+=("$upstream_track")
+    _upstream_remotes+=("$remote_name")
+    _upstream_refs+=("$remote_ref")
   done <<<"$records"
 }
 
 _cleanup_branches() {
-  local branch branch_oid upstream upstream_track reason index summary
+  local branch branch_oid upstream upstream_track remote_name remote_ref
+  local reason index summary
   local candidates=0 skipped=0 unproven="merge not proven"
 
   # Merges are proven against the local base. When its update was skipped,
@@ -941,13 +968,20 @@ _cleanup_branches() {
     branch_oid=${_branch_oids[$index]}
     upstream=${_upstreams[$index]}
     upstream_track=${_upstream_tracks[$index]}
+    remote_name=${_upstream_remotes[$index]}
+    remote_ref=${_upstream_refs[$index]}
 
-    reason=$(_delete_reason "$branch_oid" "$upstream_track") || {
+    reason=$(_delete_reason "$branch" "$branch_oid" "$upstream_track" \
+      "$remote_name" "$remote_ref") || {
       # Upstream state comes from remote-tracking refs as of the last fetch;
       # cleanup fetches only the base, so say so rather than claim it is live.
-      if [[ "$upstream_track" == "[gone]" ]]; then
+      if _own_upstream_gone "$branch" "$upstream_track" "$remote_name" \
+        "$remote_ref"; then
         _say "keeping $branch; $unproven; upstream is gone;" \
           "--gone selects it for cleanup"
+      elif [[ "$upstream_track" == "[gone]" ]]; then
+        _say "keeping $branch; $unproven; upstream $upstream is gone," \
+          "but it is not this branch's own remote branch"
       elif [[ -n "$upstream" ]]; then
         _say "keeping $branch; $unproven; upstream $upstream still" \
           "exists as of the last fetch"

@@ -389,8 +389,11 @@ path, deletion, or gitlink differences still reject it. Multi-commit rebase and
 cherry-pick matches retain an exact-current-snapshot check. The complete branch
 and upstream-state inventory is validated before the first mutation. Each
 candidate is rechecked before deletion, and the ref is deleted only if it still
-has the exact proven OID. Use `--gone` to also select branches whose existing
-upstream-tracking state is gone. The command deliberately does not run
+has the exact proven OID. Use `--gone` to also select branches whose own
+remote branch (the same name on a real remote) is gone. A branch that tracks a
+different branch, such as the base it was cut from, is never selected that way,
+because its upstream's deletion says nothing about its own commits. The command
+deliberately does not run
 configured fetch or prune mappings; refresh other remote-tracking state
 separately when needed.
 

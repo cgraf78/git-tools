@@ -341,8 +341,9 @@ git branch-audit --base main
 ```
 
 Use `--porcelain` for stable tab-separated `branch` records (name, merged,
-ahead, behind, PR number, commit timestamp, and a `gone` flag for deleted
-upstreams) that other scripts can filter.
+ahead, behind, PR number, commit timestamp, a `gone` flag for deleted
+upstreams, the proof kind, and the branch's full OID) that other scripts can
+filter. New fields are only ever appended.
 
 PR lookup is best-effort: when `gh` is missing or unauthenticated, the audit
 still reports local branch state and omits PR numbers.
@@ -356,18 +357,14 @@ mainline edit therefore does not erase an exact historical squash proof.
 Multi-commit rebase and cherry-pick matches require every commit's patch ID and
 the exact net delta in the pinned default snapshot. Raw comparisons include
 full object IDs, types, modes, paths, and deletions, so
-patch-ID-equivalent but byte-distinct content does not count as merged.
+patch-ID-equivalent but byte-distinct content does not count as merged. A
+branch whose complete tree equals a snapshot on the default branch's
+first-parent history also counts as merged (`tree-landed`). These are the
+proofs `git cleanup-repo` uses, so the audit and cleanup agree.
 
-Use `--drop-merged` to report exact local cleanup candidates, including each
-branch's current OID. It intentionally does not delete branches: worktree
-inventory and lock observations cannot prove that another Git process has not
-already resolved a branch for checkout. The compatibility option remains
-confirmation-gated with `--yes` unless `--dry-run` is also given:
-
-```sh
-git branch-audit --drop-merged --dry-run
-git branch-audit --drop-merged --yes
-```
+The audit only reports. The former `--drop-merged`, `--yes`, and `--dry-run`
+options, which listed cleanup candidates without deleting them, were removed;
+preview cleanup with `git cleanup-repo --dry-run` instead.
 
 ### `git cleanup-repo`
 

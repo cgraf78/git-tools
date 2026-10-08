@@ -86,7 +86,7 @@ gt_own_upstream_gone() {
 # commit, or work added and then removed) trivially equals an existing
 # snapshot, and an unlanded revert equals the snapshot before the commit it
 # reverts, yet neither has landed anything.
-_gt_cleanup_tree_landed() {
+gt_tree_landed() {
   local tip="$1" base="$2" merge_base tree base_tree trees
 
   merge_base=$(git merge-base "$base" "$tip" 2>/dev/null) || return 1
@@ -103,11 +103,16 @@ _gt_cleanup_tree_landed() {
 # Sets GT_CLEANUP_PROOF to merged (ancestry), content-merged (an exact squash,
 # rebase, or cherry-pick replay), or tree-landed (its whole tree is a mainline
 # snapshot). Returns 1 when no proof holds, including when Git cannot answer.
+# @param $3 Optional `divergent`: the caller already knows the tip is not an
+#   ancestor (from a left-right count, say), so skip that check.
 gt_merge_proof() {
-  local tip="$1" base="$2" ancestor_status=0
+  local tip="$1" base="$2" ancestor_status=1
 
   GT_CLEANUP_PROOF=""
-  git merge-base --is-ancestor "$tip" "$base" 2>/dev/null || ancestor_status=$?
+  if [[ "${3:-}" != divergent ]]; then
+    ancestor_status=0
+    git merge-base --is-ancestor "$tip" "$base" 2>/dev/null || ancestor_status=$?
+  fi
   case "$ancestor_status" in
     0)
       GT_CLEANUP_PROOF=merged
@@ -120,7 +125,7 @@ gt_merge_proof() {
     GT_CLEANUP_PROOF="content-merged"
     return 0
   fi
-  if _gt_cleanup_tree_landed "$tip" "$base"; then
+  if gt_tree_landed "$tip" "$base"; then
     GT_CLEANUP_PROOF="tree-landed"
     return 0
   fi

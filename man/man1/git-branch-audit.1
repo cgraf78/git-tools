@@ -25,11 +25,14 @@ mainline edit therefore does not erase an exact historical squash proof.
 Multi-commit rebase and cherry-pick matches require every commit's patch ID and
 the exact net delta in the pinned default snapshot. Raw comparisons include
 full object IDs, types, modes, paths, and deletions, so
-patch-ID-equivalent but byte-distinct content does not count as merged. This
-applies to both the
-.B merged
-column and
-.BR \-\-drop-merged .
+patch-ID-equivalent but byte-distinct content does not count as merged. A
+branch whose complete tree equals a snapshot on the default branch's
+first-parent history also counts as merged, which covers stacked landings. These
+are the proofs
+.B git cleanup-repo
+uses, so the audit and cleanup agree. The audit only reports; preview cleanup
+with
+.BR "git cleanup-repo \-\-dry-run" .
 .SH OPTIONS
 .TP
 .B \-\-porcelain
@@ -46,38 +49,24 @@ number (may be empty),
 .B committerdate
 as a Unix timestamp, and
 .B gone
-(true/false for a deleted upstream).
-.TP
-.B \-\-drop-merged
-Report exact local cleanup candidates already merged into the default branch,
-including each branch's current object ID. No branch is deleted automatically:
-Git has no portable primitive that serializes ref deletion with a checkout that
-already resolved the branch. Branch enumeration must complete before reporting.
-Requires
-.B \-\-yes
-unless
-.B \-\-dry-run
-is also used.
-.TP
-.B \-\-yes
-Confirm
-.BR \-\-drop-merged .
+(true/false for a deleted upstream),
+.B proof
+(merged, content-merged, tree-landed, or empty), and the branch's full
+.BR oid .
+New fields are only ever appended.
 .TP
 .BI "\-b, \-\-base " branch
 Use this branch as the default instead of inferring one.
-.TP
-.BR \-n ", " \-\-dry-run
-Print candidate actions without changing anything.
 .TP
 .BR \-h ", " \-\-help
 Show help.
 .SH EXIT STATUS
 .TP
 .B 0
-Audit or cleanup completed.
+Audit completed.
 .TP
 .B 1
-Audit or candidate reporting failed.
+Audit failed.
 .TP
 .B 2
 Usage or local environment error.

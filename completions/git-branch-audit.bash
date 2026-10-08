@@ -6,7 +6,7 @@ _git_branch_audit() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
 
-  COMPREPLY=($(compgen -W "--porcelain --drop-merged --yes -b --base -n --dry-run -h --help" -- "$cur"))
+  COMPREPLY=($(compgen -W "--porcelain -b --base -h --help" -- "$cur"))
 }
 
 complete -F _git_branch_audit git-branch-audit

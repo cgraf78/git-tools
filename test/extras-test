@@ -291,11 +291,11 @@ for command in "${_commands[@]}"; do
   fi
 done
 
-_assert_contains "zsh branch-audit describes candidate reporting" \
-  "--drop-merged[Report branches already merged into the default branch]" \
+_assert_contains "zsh branch-audit describes porcelain records" \
+  "--porcelain[Print stable tab-separated branch records]" \
   "$ROOT/completions/git-branch-audit.zsh"
-_assert_contains "fish branch-audit describes candidate reporting" \
-  'drop-merged -d "Report branches already merged into the default branch"' \
+_assert_contains "fish branch-audit describes porcelain records" \
+  'porcelain -d "Print stable tab-separated branch records"' \
   "$ROOT/completions/git-branch-audit.fish"
 _assert_contains "zsh cleanup describes gone selection" \
   "--gone[Select branches whose own-name upstream is gone]" \

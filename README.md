@@ -386,7 +386,11 @@ base's first-parent history. Its first-parent-to-commit delta must exactly match
 the branch's net delta; this also covers transitions introduced by merge
 commits. Later mainline edits do not erase that historical proof; byte, mode,
 path, deletion, or gitlink differences still reject it. Multi-commit rebase and
-cherry-pick matches retain an exact-current-snapshot check. The complete branch
+cherry-pick matches retain an exact-current-snapshot check. A branch whose
+complete tree equals some snapshot on the base's first-parent history also
+counts as merged (`tree-landed`): a stacked landing can bring a branch to the
+base through several commits that neither detector matches, yet every byte of
+the branch is then recoverable from mainline history. The complete branch
 and upstream-state inventory is validated before the first mutation. Each
 candidate is rechecked before deletion, and the ref is deleted only if it still
 has the exact proven OID. Use `--gone` to also select branches whose own
@@ -474,7 +478,10 @@ directory is kept. That check reads `/proc` on Linux and `lsof` elsewhere; when
 neither can list working directories, worktrees are kept. Only working
 directories count: an editor or build that merely holds files open from
 elsewhere is not detected. Unknown untracked
-or ignored content still blocks removal, and removal never uses `--force`:
+or ignored content still blocks removal, and removal never uses `--force`.
+Git's own final clean check is run with untracked files visible, so a file
+created after these checks stops the removal even in a repository that sets
+`status.showUntrackedFiles=no`:
 
 ```sh
 git cleanup-repo --all --remove-worktrees

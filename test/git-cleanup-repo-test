@@ -4360,29 +4360,33 @@ result=$(git -C "$noreflog_repo" cleanup-repo --min-age 1 --porcelain 2>&1)
 _assert_contains "min-age keeps an ancestry-only branch without a reflog" \
   $'keep-branch\tno-reflog\ttoo-new\t' "$result"
 
-# A closed, unmerged PR retires a selected worktree only with --include-closed,
-# and the branch always stays.
-closed_repo=$(_github_clone)
-git -C "$closed_repo" switch --quiet -c abandoned
-_commit_file "$closed_repo" z.txt z "abandoned work"
-closed_tip=$(git -C "$closed_repo" rev-parse HEAD)
-git -C "$closed_repo" switch --quiet main
-closed_dir=$(_tmpdir)
-rm -rf "$closed_dir"
-git -C "$closed_repo" worktree add --quiet "$closed_dir" abandoned
-printf '[[%s]]\n' "$(_pr_json 11 closed null null)" \
-  >"$gh_dir/commits-$closed_tip.json"
-printf '[[{"sha":"%s"}]]\n' "$closed_tip" >"$gh_dir/members-11.json"
-result=$(cd "$closed_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
-  git cleanup-repo --porcelain --worktree "$closed_dir" 2>&1)
-_assert_contains "a closed PR alone does not retire a selected worktree" \
-  $'keep-worktree\t'"$closed_dir"$'\tmerge-unproven\tabandoned' "$result"
-result=$(cd "$closed_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
-  git cleanup-repo --porcelain --worktree "$closed_dir" --include-closed 2>&1)
-_assert_contains "include-closed retires a closed PR's selected worktree" \
-  $'remove-worktree\t'"$closed_dir"$'\tclosed-pr\tabandoned' "$result"
-_assert_eq "include-closed keeps the closed PR's branch" "$closed_tip" \
-  "$(git -C "$closed_repo" rev-parse refs/heads/abandoned)"
+if command -v jq >/dev/null 2>&1; then
+  # A closed, unmerged PR retires a selected worktree only with --include-closed,
+  # and the branch always stays.
+  closed_repo=$(_github_clone)
+  git -C "$closed_repo" switch --quiet -c abandoned
+  _commit_file "$closed_repo" z.txt z "abandoned work"
+  closed_tip=$(git -C "$closed_repo" rev-parse HEAD)
+  git -C "$closed_repo" switch --quiet main
+  closed_dir=$(_tmpdir)
+  rm -rf "$closed_dir"
+  git -C "$closed_repo" worktree add --quiet "$closed_dir" abandoned
+  printf '[[%s]]\n' "$(_pr_json 11 closed null null)" \
+    >"$gh_dir/commits-$closed_tip.json"
+  printf '[[{"sha":"%s"}]]\n' "$closed_tip" >"$gh_dir/members-11.json"
+  result=$(cd "$closed_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    git cleanup-repo --porcelain --worktree "$closed_dir" 2>&1)
+  _assert_contains "a closed PR alone does not retire a selected worktree" \
+    $'keep-worktree\t'"$closed_dir"$'\tmerge-unproven\tabandoned' "$result"
+  result=$(cd "$closed_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    git cleanup-repo --porcelain --worktree "$closed_dir" --include-closed 2>&1)
+  _assert_contains "include-closed retires a closed PR's selected worktree" \
+    $'remove-worktree\t'"$closed_dir"$'\tclosed-pr\tabandoned' "$result"
+  _assert_eq "include-closed keeps the closed PR's branch" "$closed_tip" \
+    "$(git -C "$closed_repo" rev-parse refs/heads/abandoned)"
+else
+  printf 'skip - closed pull request retirement needs jq\n'
+fi
 
 # Selected worktrees the branch pass leaves alone can still be retired when
 # their own evidence allows, always keeping the branch.

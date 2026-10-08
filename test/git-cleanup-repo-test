@@ -4195,8 +4195,15 @@ rd_out=$(git -C "$rd_old_repo" cleanup-repo --no-update-base --porcelain --min-a
 _assert_eq "a followed default keeps the old default on a merge sweep" 0 "$rd_rc"
 _assert_not_contains "a merge sweep never deletes the old default" \
   $'delete-branch\tmaster' "$rd_out"
-git -C "$rd_old_repo" fetch --quiet origin
+# Prune the stale remote-tracking master so its upstream reads as gone, but
+# keep origin/HEAD naming it: Git 2.48+ may refresh origin/HEAD on fetch
+# (remote.<name>.followRemoteHEAD), and then main is inferred directly and
+# nothing is followed.
+git -C "$rd_old_repo" config remote.origin.followRemoteHEAD never
 git -C "$rd_old_repo" fetch --quiet --prune origin
+git -C "$rd_old_repo" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
+_assert_eq "the gone-sweep fixture still has a stale origin/HEAD" \
+  refs/remotes/origin/master "$(git -C "$rd_old_repo" symbolic-ref refs/remotes/origin/HEAD)"
 rd_rc=0
 rd_out=$(git -C "$rd_old_repo" cleanup-repo --no-update-base --gone --porcelain 2>/dev/null) || rd_rc=$?
 _assert_eq "a followed default keeps the old default on a gone sweep" 0 "$rd_rc"

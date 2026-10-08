@@ -4605,6 +4605,45 @@ result=$(git -C "$rel_parent/here" cleanup-repo --porcelain --no-update-base \
 _assert_contains "the main worktree selected from a linked one is reported as main" \
   $'keep-worktree\t'"$rel_repo"$'\tmain-worktree\t' "$result"
 
+# A worktree holding an index or HEAD lock may be mid-checkout of a branch it
+# has already resolved; deleting any branch then could strand it.
+lock_repo=$(_clone_remote)
+git -C "$lock_repo" switch --quiet -c locked-merged
+_commit_file "$lock_repo" lock.txt lock "add locked-merged"
+git -C "$lock_repo" switch --quiet main
+git -C "$lock_repo" merge --quiet --no-ff locked-merged -m "merge locked-merged"
+git -C "$lock_repo" push --quiet origin main
+lock_dir=$(_tmpdir)
+rm -rf "$lock_dir"
+git -C "$lock_repo" worktree add --quiet --detach "$lock_dir" main
+lock_admin=$(cd -P -- "$(git -C "$lock_dir" rev-parse --git-dir)" && pwd -P)
+: >"$lock_admin/index.lock"
+result=$(git -C "$lock_repo" cleanup-repo --porcelain 2>&1)
+_assert_contains "a checkout lock in any worktree keeps a proven branch" \
+  $'keep-branch\tlocked-merged\tcheckout-in-flight\t'"$lock_admin/index.lock" "$result"
+rm -f "$lock_admin/index.lock"
+result=$(git -C "$lock_repo" cleanup-repo --porcelain 2>&1)
+_assert_contains "the branch goes once the lock is released" \
+  $'delete-branch\tlocked-merged\tmerged\t' "$result"
+
+# A worktree whose own lock is held is busy: it stays, with its branch.
+busy_repo=$(_clone_remote)
+git -C "$busy_repo" switch --quiet -c busy-merged
+_commit_file "$busy_repo" busy.txt busy "add busy-merged"
+git -C "$busy_repo" switch --quiet main
+git -C "$busy_repo" merge --quiet --no-ff busy-merged -m "merge busy-merged"
+git -C "$busy_repo" push --quiet origin main
+busy_dir="$(_tmpdir)/busy"
+git -C "$busy_repo" worktree add --quiet "$busy_dir" busy-merged
+busy_lock=$(cd -P -- "$(git -C "$busy_dir" rev-parse --git-dir)" && pwd -P)/HEAD.lock
+: >"$busy_lock"
+result=$(git -C "$busy_repo" cleanup-repo --porcelain --worktree "$busy_dir" 2>&1)
+_assert_contains "a worktree with its own lock held stays" \
+  $'keep-worktree\t'"$busy_dir"$'\tcheckout-in-flight\t'"$busy_lock" "$result"
+_assert_eq "a busy worktree keeps its branch" busy-merged \
+  "$(git -C "$busy_repo" branch --list --format='%(refname:short)' busy-merged)"
+rm -f "$busy_lock"
+
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2
   exit 1

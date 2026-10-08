@@ -58,32 +58,31 @@ git pr-open --fill --dry-run
 ```
 
 The command refuses dirty worktrees, refuses to open from the base branch, and
-rejects a stale local base branch when it differs from the exact remote base OID.
-Pull request creation and structured default-branch discovery are pinned to the
-host and owner/repository derived from the current checkout. Ambient `GH_REPO`
-and `GH_HOST` values, a foreign remote named `origin`, and local remote-HEAD
-configuration cannot redirect them. The base fetch remote is validated against
-that checkout repository, then the exact `refs/heads/<base>` source is fetched
-through its validated URL without applying the remote's fetch refspecs or
-importing tags. The feature push target is resolved independently;
+rejects a stale local base branch when it differs from the exact remote base
+OID. Pull request creation and structured default-branch discovery are pinned
+to the host and owner/repository derived from the current checkout. Ambient
+`GH_REPO` and `GH_HOST` values, a foreign remote named `origin`, and local
+remote-HEAD configuration cannot redirect them. The base fetch remote is
+validated against that checkout repository, then the exact `refs/heads/<base>`
+source is fetched through its validated URL without applying the remote's fetch
+refspecs or importing tags. The feature push target is resolved independently;
 fork heads are qualified as `owner:branch`, so a base branch tracking upstream
-cannot redirect the feature push upstream.
-OpenSSH `Host` aliases are accepted when their effective hostname matches the
-configured repository host. Git SSH command and variant overrides are rejected
-because a plain OpenSSH expansion cannot prove where those transports will go.
-The feature branch is pushed by immutable OID through the captured validated
-URL, then its remote OID is verified. Upstream tracking is written locally only
-after the named remote is revalidated against that captured URL; a concurrent
-configuration change leaves the pushed branch intact but aborts PR creation
-with a tracking-incomplete diagnostic.
-The remote head is checked again immediately before creation. After GitHub
-returns, the created PR's canonical repository, head and base refs, head
+cannot redirect the feature push upstream. OpenSSH `Host` aliases are accepted
+when their effective hostname matches the configured repository host. Git SSH
+command and variant overrides are rejected because a plain OpenSSH expansion
+cannot prove where those transports will go. The feature branch is pushed by
+immutable OID through the captured validated URL, then its remote OID is
+verified. Upstream tracking is written locally only after the named remote is
+revalidated against that captured URL; a concurrent configuration change leaves
+the pushed branch intact but aborts PR creation with a tracking-incomplete
+diagnostic. The remote head is checked again immediately before creation. After
+GitHub returns, the created PR's canonical repository, head and base refs, head
 repository, cross-repository state, and head OID must match the requested
 topology. A PR created during a server-side race is reported with its URL as an
-actionable nonzero state instead of clean success.
-Composition callers can add `--expect-head <oid>` and
-`--expect-repo <host/owner/repository>` leases. These stop before push when the
-branch commit or checkout identity has changed since the caller inspected it.
+actionable nonzero state instead of clean success. Composition callers can add
+`--expect-head <oid>` and `--expect-repo <host/owner/repository>` leases. These
+stop before push when the branch commit or checkout identity has changed since
+the caller inspected it.
 
 ### `git pr-submit`
 
@@ -540,14 +539,24 @@ git cleanup-repo --remote upstream
 Other tools can drive cleanup without changing the checkout they run from.
 `--no-update-base` proves merges against the pinned remote base but leaves the
 local base, the current branch, and a dirty or mid-operation current checkout
-alone. `--no-fetch` proves against the existing `<remote>/<base>`
-remote-tracking ref as of the last fetch, without network access. A ref that
-is merely behind keeps more branches, but if the remote base was rewound since,
-the ref can still contain commits the remote dropped, so prefer a fetching run
-when the base may have been rewritten. `--worktree <path>` (repeatable, implies `--remove-worktrees`) limits
-removal to the listed linked worktrees, so a caller can apply its own policy,
-such as an age limit, to which checkouts may go. `--porcelain` prints one
-record per decision on stdout and leaves only diagnostics on stderr:
+alone. When the base was inferred, from `<remote>/HEAD` (which Git records at
+clone time and never refreshes) or the `main`/`master`/`trunk` fallback, and a
+fetching run finds the remote no longer has it (it renamed `master` to `main`),
+`--no-update-base` follows the remote's own default branch with a note and
+keeps the old local default protected like the base. A run that updates the
+base stops instead of switching the checkout and suggests `--base <branch>`.
+When `<remote>/HEAD` named the missing branch, the note and the stop also
+suggest `git fetch <remote> && git remote set-head <remote> --auto`. An
+explicit `--base` is never redirected, and `--no-fetch` cannot ask the remote.
+`--no-fetch` proves against the existing `<remote>/<base>` remote-tracking ref
+as of the last fetch, without network access. A ref that is merely behind keeps
+more branches, but if the remote base was rewound since, the ref can still
+contain commits the remote dropped, so prefer a fetching run when the base may
+have been rewritten. `--worktree <path>` (repeatable, implies
+`--remove-worktrees`) limits removal to the listed linked worktrees, so a
+caller can apply its own policy, such as an age limit, to which checkouts may
+go. `--porcelain` prints one record per decision on stdout and leaves only
+diagnostics on stderr:
 
 ```text
 <event> TAB <subject> TAB <code> TAB <detail>
@@ -581,25 +590,24 @@ record per decision on stdout and leaves only diagnostics on stderr:
 
 Every selected worktree gets exactly one `remove-worktree`,
 `would-remove-worktree`, or `keep-worktree` record (two spellings of the same
-worktree select it once). A
-`keep-worktree` carries the code that kept its branch (or the gate code that
-kept the checkout) with the same detail as above, `merge-unproven` with the
-branch name, `current-worktree`, `main-worktree`, `missing` (the path or its
-directory is gone), `not-linked` (not a linked worktree of this repository, including a
-subdirectory of one), `unreachable-head` with the detached HEAD's OID, or
-`pr-unknown` with the branch when a requested retirement could not confirm
-that no open pull request holds it.
-Retirement codes are `requested`, `upstream-gone`, `closed-pr`, or, for a
-detached HEAD, its merge proof.
+worktree select it once). A `keep-worktree` carries the code that kept its
+branch (or the gate code that kept the checkout) with the same detail as above,
+`merge-unproven` with the branch name, `current-worktree`, `main-worktree`,
+`missing` (the path or its directory is gone), `not-linked` (not a linked
+worktree of this repository, including a subdirectory of one),
+`unreachable-head` with the detached HEAD's OID, or `pr-unknown` with the
+branch when a requested retirement could not confirm that no open pull request
+holds it. Retirement codes are `requested`, `upstream-gone`, `closed-pr`, or,
+for a detached HEAD, its merge proof.
 
 Worktree subjects are the paths Git's worktree list records, and selection
-arguments are matched to whole worktrees by those paths. Backslash, tab, and newline
-inside a field are written as `\\`, `\t`, and `\n`. Exit status 0 means
+arguments are matched to whole worktrees by those paths. Backslash, tab, and
+newline inside a field are written as `\\`, `\t`, and `\n`. Exit status 0 means
 every decision was reported, including kept branches and failed removals; 2
 means a usage, repository, or remote error, after which printed records may be
-incomplete; 3 means the remote base could not be reached or fetched, before
-any decision, so retrying with `--no-fetch` is safe. A deletion is reported
-only after it succeeded.
+incomplete; 3 means the remote base could not be reached or fetched, before any
+decision, so retrying with `--no-fetch` is safe. A deletion is reported only
+after it succeeded.
 
 ```sh
 git cleanup-repo --no-update-base --porcelain --worktree ../old-feature
@@ -625,14 +633,15 @@ no commits of its own looks exactly like one that was fast-forward merged, and
 without a reflog its age is unknown.
 
 Unless `--no-update-base` is given, the command refuses to run with a dirty
-current worktree or an active rebase/merge/cherry-pick/revert. Git cannot atomically combine worktree
-reservation checks with ref deletion, so do not create, switch, or mutate
-worktrees concurrently with cleanup. The command rechecks observable state and
-uses expected-old-OID ref deletion to preserve a branch that advances during
-cleanup. It also keeps a worktree whose own index or HEAD lock is held, and
-keeps every branch while any worktree holds one, because a `git switch` in
-progress holds those locks after it has resolved the branch it checks out. A
-lock left behind by a crashed Git keeps branches until it is removed.
+current worktree or an active rebase/merge/cherry-pick/revert. Git cannot
+atomically combine worktree reservation checks with ref deletion, so do not
+create, switch, or mutate worktrees concurrently with cleanup. The command
+rechecks observable state and uses expected-old-OID ref deletion to preserve a
+branch that advances during cleanup. It also keeps a worktree whose own index
+or HEAD lock is held, and keeps every branch while any worktree holds one,
+because a `git switch` in progress holds those locks after it has resolved the
+branch it checks out. A lock left behind by a crashed Git keeps branches until
+it is removed.
 
 ### `git stash-audit`
 
@@ -652,9 +661,9 @@ stash subject identifies a local origin branch and that local branch is gone.
 
 ### `git worktree-audit`
 
-Reports state across every worktree: path, checked-out branch, dirty state, last
-commit age, and the open PR number when GitHub data is available. Worktrees whose
-directory no longer exists are reported as orphans.
+Reports state across every worktree: path, checked-out branch, dirty state,
+last commit age, and the open PR number when GitHub data is available.
+Worktrees whose directory no longer exists are reported as orphans.
 
 ```sh
 git worktree-audit

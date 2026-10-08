@@ -1205,3 +1205,100 @@ REVERT_HEAD	revert
 BISECT_START	bisect
 EOF
 }
+
+# lsof scans every process on the system (seconds on a busy host), so one scan
+# serves the checks that follow it within a short window; /proc reads are cheap
+# and always fresh.
+_GT_LSOF_CWDS=""
+_GT_LSOF_AT=""
+_GT_LSOF_TTL=30
+
+# Print `<pid> TAB <cwd>` records from lsof, reusing a scan younger than
+# _GT_LSOF_TTL seconds. Must run in the main shell for the reuse to stick.
+_gt_lsof_cwds() {
+  local record pid="" records=""
+
+  if [[ -n "$_GT_LSOF_AT" ]] && ((SECONDS - _GT_LSOF_AT < _GT_LSOF_TTL)); then
+    printf '%s' "$_GT_LSOF_CWDS"
+    return 0
+  fi
+  command -v lsof >/dev/null 2>&1 || return 1
+  while IFS= read -r record; do
+    case "$record" in
+      p*) pid=${record#p} ;;
+      n*) [[ -z "$pid" ]] || records+="$pid"$'\t'"${record#n}"$'\n' ;;
+    esac
+  done < <(lsof -n -w -a -d cwd -Fpn 2>/dev/null)
+  [[ -n "$records" ]] || return 1
+  _GT_LSOF_CWDS=$records
+  _GT_LSOF_AT=$SECONDS
+  printf '%s' "$records"
+}
+
+# @brief Succeed when some process's working directory is the worktree or lies
+# inside it. An idle shell or agent session parked in a checkout is still using
+# it, and removing the directory under it strands that session.
+# @param $1 Worktree path.
+# Returns 0 when in use (GT_WORKTREE_USER_PID names one such process), 1 when
+# no visible process uses it, and 2 when process working directories cannot be
+# listed. Linux reads /proc; elsewhere (macOS, BSD) lsof supplies the same view.
+# Processes of other users are invisible either way, so this guards the
+# caller's own sessions, which are the ones a cleanup could strand. Only working
+# directories count: an editor or build that merely holds files open from
+# elsewhere is not seen.
+# shellcheck disable=SC2034 # GT_WORKTREE_USER_PID is consumed by cleanup commands
+gt_worktree_in_use() {
+  local target proc=${GIT_TOOLS_TEST_PROC_ROOT:-/proc} record pid cwd prefix
+  local lsof_records escaped=0
+  local -a records=()
+
+  GT_WORKTREE_USER_PID=""
+  target=$(cd -P -- "$1" 2>/dev/null && pwd -P) || return 2
+  if [[ -d "$proc" ]]; then
+    # One subshell resolves every `<pid>/cwd` link with builtins: `cd -P`
+    # follows the kernel's link and $PWD reads the physical result back, so
+    # there is no process per pid. NUL framing keeps any path literal. An
+    # unreadable or vanished process simply prints nothing.
+    while IFS= read -r -d '' record; do
+      records+=("$record")
+    done < <(
+      for record in "$proc"/[0-9]*/cwd; do
+        cd -P -- "$record" 2>/dev/null || continue
+        pid=${record%/cwd}
+        printf '%s\t%s\0' "${pid##*/}" "$PWD"
+      done
+    )
+  fi
+  # A /proc that resolves nothing at all, not even this process, is masked or
+  # foreign rather than idle, so fall through to lsof instead of reporting
+  # that nothing uses the worktree.
+  if ((${#records[@]} == 0)); then
+    # Capture in the main shell so the scan is reused by later checks.
+    _gt_lsof_cwds >/dev/null || return 2
+    lsof_records=$_GT_LSOF_CWDS
+    while IFS= read -r record; do
+      [[ -n "$record" ]] && records+=("$record")
+    done <<<"$lsof_records"
+    escaped=1
+  fi
+  for record in "${records[@]}"; do
+    pid=${record%%$'\t'*}
+    cwd=${record#*$'\t'}
+    if [[ "$cwd" == "$target" || "$cwd" == "$target"/* ]]; then
+      GT_WORKTREE_USER_PID=$pid
+      return 0
+    fi
+    # lsof escapes tabs, newlines, and (outside a UTF-8 locale) non-ASCII
+    # bytes in names, so such a name cannot be compared exactly. Count it as
+    # a use when the part before its first escape could lead into the
+    # worktree, failing closed rather than stranding a session.
+    if ((escaped == 1)) && [[ "$cwd" == *\\* ]]; then
+      prefix=${cwd%%\\*}
+      if [[ "$target" == "$prefix"* || "$prefix" == "$target"/* ]]; then
+        GT_WORKTREE_USER_PID=$pid
+        return 0
+      fi
+    fi
+  done
+  return 1
+}

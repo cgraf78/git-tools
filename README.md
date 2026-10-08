@@ -468,7 +468,12 @@ It never removes the current worktree or the main worktree, so a branch still
 checked out in either after the base update is kept. The branch checked out in
 the checkout cleanup runs from is never deleted. Only worktrees with no tracked
 changes, index-hidden local content, or active
-rebase/merge/cherry-pick/revert/bisect operation are eligible. Unknown untracked
+rebase/merge/cherry-pick/revert/bisect operation are eligible, and a worktree
+that any visible process (an idle shell or agent session) uses as its working
+directory is kept. That check reads `/proc` on Linux and `lsof` elsewhere; when
+neither can list working directories, worktrees are kept. Only working
+directories count: an editor or build that merely holds files open from
+elsewhere is not detected. Unknown untracked
 or ignored content still blocks removal, and removal never uses `--force`:
 
 ```sh

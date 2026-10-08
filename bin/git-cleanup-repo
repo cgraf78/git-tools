@@ -766,7 +766,7 @@ _branch_still_at() {
 }
 
 _remove_branch_worktree_if_needed() {
-  local branch="$1" branch_oid="$2" operation path state
+  local branch="$1" branch_oid="$2" operation path state in_use_status
 
   if ! gt_find_worktree_reserving_branch "$branch"; then
     _note_uninspectable_worktree
@@ -819,6 +819,23 @@ _remove_branch_worktree_if_needed() {
     _say "skipping $branch; worktree has active $operation: $path"
     return 1
   fi
+  # Git removes a worktree that a shell or agent session is parked in, which
+  # strands that session in a deleted directory. Check before cache pruning
+  # too, since a live session may be using that cache.
+  in_use_status=0
+  gt_worktree_in_use "$path" || in_use_status=$?
+  case "$in_use_status" in
+    0)
+      _say "skipping $branch; worktree is in use by process" \
+        "$GT_WORKTREE_USER_PID: $path"
+      return 1
+      ;;
+    1) ;;
+    *)
+      _say "skipping $branch; could not inspect process working directories: $path"
+      return 1
+      ;;
+  esac
 
   state=$(_worktree_dirty_state "$path")
   case "$state" in

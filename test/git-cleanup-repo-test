@@ -34,9 +34,14 @@ _tmpdir() {
   (cd -P -- "$path" && pwd -P)
 }
 
+_bg_pids=()
 _cleanup() {
-  local status=$?
+  local status=$? pid
   trap - EXIT HUP INT TERM
+  # Parked processes from the in-use cases must not outlive an interrupted run.
+  for pid in ${_bg_pids[@]+"${_bg_pids[@]}"}; do
+    kill "$pid" 2>/dev/null
+  done
   rm -rf -- "$_suite_tmp_root" || status=1
   exit "$status"
 }
@@ -1997,6 +2002,143 @@ _assert_eq "remove-worktrees deletes worktree branch" "main" \
   "$(_branches "$worktree_repo")"
 _assert_eq "remove-worktrees removes linked checkout" "missing" \
   "$(if [[ -e "$worktree_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
+
+# A worktree that a live process uses as its working directory stays, with its
+# branch: removing it would strand an idle shell or agent session.
+_in_use_repo() {
+  local repo dir
+
+  repo=$(_clone_remote) || return 1
+  git -C "$repo" switch --quiet -c busy
+  _commit_file "$repo" busy.txt busy "add busy"
+  git -C "$repo" switch --quiet main
+  dir=$(_tmpdir) || return 1
+  rm -rf "$dir"
+  git -C "$repo" worktree add "$dir" busy >/dev/null 2>&1 || return 1
+  mkdir "$dir/sub"
+  printf '%s\t%s\n' "$repo" "$dir"
+}
+
+# Park a process in a directory and wait, with a bounded deadline, until it is
+# there: its marker is written only after the cd succeeds.
+_park() {
+  local dir="$1" marker tries=0
+
+  marker=$(_tmpdir)/parked
+  (cd "$dir" && : >"$marker" && exec sleep 300) &
+  _parked_pid=$!
+  _bg_pids+=("$_parked_pid")
+  while [[ ! -e "$marker" ]] && ((tries < 500)); do
+    sleep 0.01
+    tries=$((tries + 1))
+  done
+  [[ -e "$marker" ]] || printf 'warning: process %s never reached %s\n' \
+    "$_parked_pid" "$dir" >&2
+}
+
+IFS=$'\t' read -r in_use_repo in_use_dir < <(_in_use_repo)
+_park "$in_use_dir"
+in_use_pid=$_parked_pid
+result=$(git -C "$in_use_repo" cleanup-repo --all --remove-worktrees --dry-run 2>&1)
+_assert_contains "dry run skips a worktree a process is parked in" \
+  "skipping busy; worktree is in use by process $in_use_pid: $in_use_dir" "$result"
+result=$(git -C "$in_use_repo" cleanup-repo --all --remove-worktrees 2>&1)
+_assert_contains "skips a worktree a process is parked in" \
+  "skipping busy; worktree is in use by process $in_use_pid: $in_use_dir" "$result"
+_assert_eq "in-use worktree keeps its branch" "$(printf 'busy\nmain')" \
+  "$(_branches "$in_use_repo")"
+_assert_eq "in-use worktree stays on disk" present \
+  "$(if [[ -d "$in_use_dir" ]]; then printf present; else printf missing; fi)"
+kill "$in_use_pid" 2>/dev/null
+wait "$in_use_pid" 2>/dev/null
+
+IFS=$'\t' read -r in_use_repo in_use_dir < <(_in_use_repo)
+_park "$in_use_dir/sub"
+in_use_pid=$_parked_pid
+result=$(git -C "$in_use_repo" cleanup-repo --all --remove-worktrees 2>&1)
+_assert_contains "skips a worktree a process uses through a subdirectory" \
+  "skipping busy; worktree is in use by process $in_use_pid: $in_use_dir" "$result"
+kill "$in_use_pid" 2>/dev/null
+wait "$in_use_pid" 2>/dev/null
+
+# The check runs before disposable cache pruning: a live session may be using
+# that cache, so the cache must survive too.
+IFS=$'\t' read -r in_use_repo in_use_dir < <(_in_use_repo)
+mkdir "$in_use_dir/.cache"
+printf 'Signature: 8a477f597d28d172789f06886806bc55\n' \
+  >"$in_use_dir/.cache/CACHEDIR.TAG"
+printf 'warm\n' >"$in_use_dir/.cache/entry"
+_park "$in_use_dir"
+in_use_pid=$_parked_pid
+result=$(git -C "$in_use_repo" cleanup-repo --all --remove-worktrees 2>&1)
+_assert_contains "a cache-only worktree in use is skipped" \
+  "skipping busy; worktree is in use by process $in_use_pid: $in_use_dir" "$result"
+_assert_eq "an in-use worktree's cache is not pruned" warm \
+  "$(cat "$in_use_dir/.cache/entry" 2>/dev/null)"
+kill "$in_use_pid" 2>/dev/null
+wait "$in_use_pid" 2>/dev/null
+
+# Process views are injected below, so each case controls exactly what is seen.
+in_use_proc=$(_tmpdir)
+in_use_tools=$(_tmpdir)
+cat >"$in_use_tools/lsof" <<'EOF'
+#!/usr/bin/env bash
+[[ -z "${FAKE_LSOF_CWD:-}" ]] && exit 1
+printf 'p4242\nfcwd\nn%s\n' "$FAKE_LSOF_CWD"
+EOF
+chmod +x "$in_use_tools/lsof"
+
+# A working directory that merely shares the worktree's name prefix is a
+# different directory.
+IFS=$'\t' read -r in_use_repo in_use_dir < <(_in_use_repo)
+mkdir -p "$in_use_proc/77" "$in_use_dir-sibling"
+ln -s "$in_use_dir-sibling" "$in_use_proc/77/cwd"
+result=$(cd "$in_use_repo" && GIT_TOOLS_TEST_PROC_ROOT=$in_use_proc \
+  git cleanup-repo --all --remove-worktrees 2>&1)
+_assert_contains "a sibling path with the same prefix does not count as in use" \
+  "removed worktree $in_use_dir" "$result"
+rm -rf "$in_use_proc/77"
+
+# lsof listing only unrelated directories leaves the worktree removable.
+IFS=$'\t' read -r in_use_repo in_use_dir < <(_in_use_repo)
+result=$(cd "$in_use_repo" && PATH="$in_use_tools:$PATH" \
+  GIT_TOOLS_TEST_PROC_ROOT=$in_use_proc FAKE_LSOF_CWD=$in_use_dir-sibling \
+  git cleanup-repo --all --remove-worktrees 2>&1)
+_assert_contains "lsof listing only other directories allows removal" \
+  "removed worktree $in_use_dir" "$result"
+
+# lsof escapes some bytes in names; an escaped name that could lead into the
+# worktree counts as a use instead of being compared literally.
+IFS=$'\t' read -r in_use_repo in_use_dir < <(_in_use_repo)
+result=$(cd "$in_use_repo" && PATH="$in_use_tools:$PATH" \
+  GIT_TOOLS_TEST_PROC_ROOT=$in_use_proc \
+  FAKE_LSOF_CWD="$in_use_dir/caf\xc3\xa9" \
+  git cleanup-repo --all --remove-worktrees 2>&1)
+_assert_contains "an escaped lsof name inside the worktree counts as a use" \
+  "skipping busy; worktree is in use by process 4242: $in_use_dir" "$result"
+result=$(cd "$in_use_repo" && PATH="$in_use_tools:$PATH" \
+  GIT_TOOLS_TEST_PROC_ROOT=$in_use_proc \
+  FAKE_LSOF_CWD="${in_use_dir%/*}/other\twith-tab" \
+  git cleanup-repo --all --remove-worktrees 2>&1)
+_assert_contains "an escaped lsof name elsewhere does not block removal" \
+  "removed worktree $in_use_dir" "$result"
+
+# A /proc that resolves nothing falls back to lsof.
+IFS=$'\t' read -r in_use_repo in_use_dir < <(_in_use_repo)
+result=$(cd "$in_use_repo" && PATH="$in_use_tools:$PATH" \
+  GIT_TOOLS_TEST_PROC_ROOT=$in_use_proc FAKE_LSOF_CWD=$in_use_dir/sub \
+  git cleanup-repo --all --remove-worktrees 2>&1)
+_assert_contains "lsof reports a worktree in use when /proc lists nothing" \
+  "skipping busy; worktree is in use by process 4242: $in_use_dir" "$result"
+
+# Without any process view, removal is refused rather than assumed safe.
+result=$(cd "$in_use_repo" && PATH="$in_use_tools:$PATH" \
+  GIT_TOOLS_TEST_PROC_ROOT=$in_use_proc \
+  git cleanup-repo --all --remove-worktrees 2>&1)
+_assert_contains "an unlistable process view keeps the worktree" \
+  "skipping busy; could not inspect process working directories: $in_use_dir" "$result"
+_assert_eq "an unlistable process view keeps the branch" "$(printf 'busy\nmain')" \
+  "$(_branches "$in_use_repo")"
 
 # Expected-old-OID deletion must preserve a branch that advances after
 # classification but before the ref transaction.

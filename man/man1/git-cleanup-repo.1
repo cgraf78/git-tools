@@ -129,8 +129,13 @@ pruned.
 The command refuses to run with a dirty current worktree or active rebase,
 merge, cherry-pick, or revert state. Except for explicitly disposable entries,
 a linked worktree is preserved when it has uncommitted, untracked, ignored, or
-index-hidden local content, is unreadable, is locked by an active operation, or
-cannot be removed without force. Git cannot atomically combine worktree
+index-hidden local content, is unreadable, is locked by an active operation, is
+the working directory of a visible process (read from
+.B /proc
+or
+.BR lsof ;
+worktrees are kept when neither can list working directories; open files held
+from another directory are not detected), or cannot be removed without force. Git cannot atomically combine worktree
 reservation checks with ref deletion, so callers must not create, switch, or
 mutate worktrees concurrently with cleanup. Observable state is rechecked, and
 expected-old-object-ID ref deletion preserves a branch that advances during

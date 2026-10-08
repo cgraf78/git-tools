@@ -231,6 +231,48 @@ _use_tracking_base() {
   esac
 }
 
+# The remote lacks the base branch. When this run inferred that base (from
+# <remote>/HEAD, which Git records at clone time and never refreshes, or from
+# the main/master/trunk fallback), the remote may simply have renamed its
+# default branch (master to main). Ask the remote for its own default and
+# prove against that instead: --no-update-base changes no checkout, so
+# following the new name is safe and keeps unattended sweeps working. A run
+# that updates the base would also switch the checkout onto a branch it never
+# had, so it stops and names the fix instead. An explicit --base, or a remote
+# that cannot say, keeps the original verdict: the base is missing (status 2,
+# never the retryable unreachable status 3, since a --no-fetch retry would
+# prove against a base the remote just said it deleted). The inferred name
+# stays protected like the base: a renamed default leaves the old local
+# branch tracking a gone upstream, which says nothing about it having landed.
+_follow_remote_default() {
+  local record target="" ref name refresh=""
+
+  [[ "$_base_explicit" == 0 ]] ||
+    _die "remote base branch does not exist: $_remote/$_base"
+  record=$(git ls-remote --symref -- "$_remote_url" HEAD 2>/dev/null) ||
+    _die "remote base branch does not exist: $_remote/$_base"
+  while IFS=$'\t' read -r ref name; do
+    if [[ "$name" == HEAD && "$ref" == "ref: refs/heads/"* ]]; then
+      target=${ref#"ref: refs/heads/"}
+      break
+    fi
+  done <<<"$record"
+  if [[ -z "$target" || "$target" == "$_base" ]] ||
+    ! git check-ref-format --branch "$target" >/dev/null 2>&1; then
+    _die "remote base branch does not exist: $_remote/$_base"
+  fi
+  # `git remote set-head --auto` needs the new remote-tracking ref, which the
+  # exact fetch below never writes, so the refresh fetches first.
+  if [[ "$(git symbolic-ref -q "refs/remotes/$_remote/HEAD" 2>/dev/null)" == "refs/remotes/$_remote/$_base" ]]; then
+    refresh="; refresh $_remote/HEAD with 'git fetch $_remote && git remote set-head $_remote --auto'"
+  fi
+  [[ "$_sync_base" == 0 ]] ||
+    _die "remote base branch does not exist: $_remote/$_base; $_remote's default branch is now $target (pass --base $target$refresh)"
+  _say "$_remote has no branch $_base; using its default branch $target$refresh"
+  _inferred_base=$_base
+  _base=$target
+}
+
 _pin_remote_base() {
   local record status=0 oid ref extra resolved
 
@@ -243,7 +285,13 @@ _pin_remote_base() {
     "refs/heads/$_base" 2>/dev/null) || status=$?
   case "$status" in
     0) ;;
-    2) _die "remote base branch does not exist: $_remote/$_base" ;;
+    2)
+      _follow_remote_default
+      status=0
+      record=$(git ls-remote --exit-code -- "$_remote_url" \
+        "refs/heads/$_base" 2>/dev/null) ||
+        _die "could not inspect followed default branch: $_remote/$_base"
+      ;;
     *) _die_unreachable "could not inspect remote base branch: $_remote/$_base" ;;
   esac
   [[ -n "$record" && "$record" != *$'\n'* ]] ||
@@ -607,7 +655,7 @@ _inventory_branches() {
     gt_find_ref_commit "$branch_ref" || status=$?
     [[ "$status" == 0 && "$GT_REF_OID" == "$branch_oid" ]] ||
       _die "branch changed while inventory was collected: $branch_ref"
-    [[ "$branch" != "$_base" ]] || continue
+    [[ "$branch" != "$_base" && "$branch" != "$_inferred_base" ]] || continue
     _branches+=("$branch")
     _branch_oids+=("$branch_oid")
     _upstreams+=("$upstream")
@@ -711,6 +759,8 @@ _cleanup_branches() {
 
 _parse_args() {
   _base=""
+  _base_explicit=0
+  _inferred_base=""
   _remote="origin"
   _all=0
   _gone=0
@@ -730,13 +780,15 @@ _parse_args() {
       -b | --base)
         local opt="$1"
         shift
-        (($#)) || _die "$opt requires a value"
+        (($#)) && [[ -n "$1" ]] || _die "$opt requires a value"
         _base="$1"
+        _base_explicit=1
         shift
         ;;
       --base=*)
         _base="${1#--base=}"
         [[ -n "$_base" ]] || _die "--base requires a value"
+        _base_explicit=1
         shift
         ;;
       -r | --remote)

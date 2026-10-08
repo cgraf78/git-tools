@@ -4118,6 +4118,177 @@ _assert_eq "no-fetch without a remote-tracking base fails" 2 "$nf_rc"
 _assert_contains "no-fetch names the missing remote-tracking base" \
   "remote-tracking base does not exist: origin/main" "$nf_out"
 
+# A clone whose local origin/HEAD still names master after the remote renamed
+# its default branch to main and deleted master. Git records origin/HEAD at
+# clone time and never refreshes it. Prints the clone.
+_renamed_default_repo() {
+  local remote repo
+
+  remote=$(_tmpdir)
+  repo=$(_tmpdir)
+  git init --bare --initial-branch=master "$remote" >/dev/null
+  _git_init "$repo"
+  git -C "$repo" switch --quiet -c master
+  _commit_file "$repo" README.md base base
+  git -C "$repo" switch --quiet -c renamed-merged
+  _commit_file "$repo" rn.txt rn "add renamed-merged"
+  git -C "$repo" switch --quiet master
+  git -C "$repo" merge --quiet --no-ff renamed-merged -m "merge renamed-merged"
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push --quiet -u origin master 2>/dev/null
+  git -C "$repo" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
+  git --git-dir="$remote" branch -m master main
+  git --git-dir="$remote" symbolic-ref HEAD refs/heads/main
+  printf '%s\n' "$repo"
+}
+
+# Without a base update, a base inferred from a stale origin/HEAD follows the
+# remote's own default branch, with a note, and changes no checkout or ref
+# beyond the proven deletion.
+rd_repo=$(_renamed_default_repo)
+rd_rc=0
+rd_err=$(_tmpdir)/stderr
+rd_out=$(git -C "$rd_repo" cleanup-repo --no-update-base --porcelain 2>"$rd_err") || rd_rc=$?
+_assert_eq "a renamed remote default is followed without a base update" 0 "$rd_rc"
+_assert_contains "a renamed remote default still proves merges" \
+  $'delete-branch\trenamed-merged\tmerged' "$rd_out"
+_assert_contains "following a renamed remote default is announced with its refresh" \
+  "origin has no branch master; using its default branch main; refresh origin/HEAD with 'git fetch origin && git remote set-head origin --auto'" \
+  "$(cat "$rd_err")"
+_assert_eq "following a renamed remote default leaves origin/HEAD alone" \
+  refs/remotes/origin/master "$(git -C "$rd_repo" symbolic-ref refs/remotes/origin/HEAD)"
+_assert_eq "following a renamed remote default leaves the checkout alone" \
+  refs/heads/master "$(git -C "$rd_repo" symbolic-ref HEAD)"
+
+# A run that updates the base would switch the checkout onto a branch it never
+# had, so it stops and names the fix.
+rd_sync_repo=$(_renamed_default_repo)
+rd_rc=0
+rd_out=$(git -C "$rd_sync_repo" cleanup-repo 2>&1) || rd_rc=$?
+_assert_eq "a renamed remote default stops a base update" 2 "$rd_rc"
+_assert_contains "a stopped base update names the remote's default and the fix" \
+  "origin's default branch is now main (pass --base main; refresh origin/HEAD with 'git fetch origin && git remote set-head origin --auto')" \
+  "$rd_out"
+_assert_eq "a stopped base update deletes nothing" \
+  "$(printf 'master\nrenamed-merged')" "$(_branches "$rd_sync_repo")"
+
+# A dry run follows the same way and only reports.
+rd_dry_repo=$(_renamed_default_repo)
+rd_rc=0
+rd_out=$(git -C "$rd_dry_repo" cleanup-repo --no-update-base --dry-run --porcelain 2>/dev/null) || rd_rc=$?
+_assert_eq "a dry run follows a renamed remote default" 0 "$rd_rc"
+_assert_contains "a dry run reports the proven deletion" \
+  $'would-delete-branch\trenamed-merged\tmerged' "$rd_out"
+_assert_eq "a dry run deletes nothing" \
+  "$(printf 'master\nrenamed-merged')" "$(_branches "$rd_dry_repo")"
+
+# The old default stays protected like the base, even when it is not checked
+# out: the rename left its upstream gone without it having landed.
+rd_old_repo=$(_renamed_default_repo)
+git -C "$rd_old_repo" switch --quiet -c work
+_commit_file "$rd_old_repo" work.txt work "add work"
+git -C "$rd_old_repo" switch --quiet master
+_commit_file "$rd_old_repo" unpushed.txt unpushed "unpushed on master"
+git -C "$rd_old_repo" switch --quiet work
+rd_rc=0
+rd_out=$(git -C "$rd_old_repo" cleanup-repo --no-update-base --porcelain --min-age 0 2>/dev/null) || rd_rc=$?
+_assert_eq "a followed default keeps the old default on a merge sweep" 0 "$rd_rc"
+_assert_not_contains "a merge sweep never deletes the old default" \
+  $'delete-branch\tmaster' "$rd_out"
+# Prune the stale remote-tracking master so its upstream reads as gone, but
+# keep origin/HEAD naming it: Git 2.48+ may refresh origin/HEAD on fetch
+# (remote.<name>.followRemoteHEAD), and then main is inferred directly and
+# nothing is followed.
+git -C "$rd_old_repo" config remote.origin.followRemoteHEAD never
+git -C "$rd_old_repo" fetch --quiet --prune origin
+git -C "$rd_old_repo" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
+_assert_eq "the gone-sweep fixture still has a stale origin/HEAD" \
+  refs/remotes/origin/master "$(git -C "$rd_old_repo" symbolic-ref refs/remotes/origin/HEAD)"
+rd_rc=0
+rd_out=$(git -C "$rd_old_repo" cleanup-repo --no-update-base --gone --porcelain 2>/dev/null) || rd_rc=$?
+_assert_eq "a followed default keeps the old default on a gone sweep" 0 "$rd_rc"
+_assert_not_contains "a gone sweep never deletes the old default with unpushed work" \
+  $'delete-branch\tmaster' "$rd_out"
+_assert_contains "the old default survives both sweeps" "master" "$(_branches "$rd_old_repo")"
+
+# Without origin/HEAD the base comes from the main/master/trunk fallback; it
+# follows too, but no origin/HEAD is blamed or refreshed.
+rd_nohead_repo=$(_renamed_default_repo)
+git -C "$rd_nohead_repo" symbolic-ref --delete refs/remotes/origin/HEAD
+rd_rc=0
+rd_out=$(git -C "$rd_nohead_repo" cleanup-repo --no-update-base --porcelain 2>&1 >/dev/null) || rd_rc=$?
+_assert_eq "a fallback base follows a renamed remote default" 0 "$rd_rc"
+_assert_contains "a fallback base notes the followed default" \
+  "origin has no branch master; using its default branch main" "$rd_out"
+_assert_not_contains "a fallback base does not blame origin/HEAD" "origin/HEAD" "$rd_out"
+
+# When the remote cannot say where its default went, the base is still known
+# to be missing: status 2, never the retryable unreachable status 3.
+rd_symref_repo=$(_renamed_default_repo)
+rd_symref_bin=$(_tmpdir)
+cat >"$rd_symref_bin/git" <<'EOF_GIT'
+#!/usr/bin/env bash
+if [[ "${1:-}" == ls-remote && " $* " == *" --symref "* ]]; then
+  exit 128
+fi
+exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
+EOF_GIT
+chmod +x "$rd_symref_bin/git"
+rd_rc=0
+rd_out=$(cd "$rd_symref_repo" &&
+  PATH="$rd_symref_bin:$PATH" "$ROOT/bin/git-cleanup-repo" --no-update-base 2>&1) || rd_rc=$?
+_assert_eq "a failed default lookup keeps the missing-base status" 2 "$rd_rc"
+_assert_contains "a failed default lookup reports the missing base" \
+  "remote base branch does not exist: origin/master" "$rd_out"
+
+# A followed default that then cannot be looked up names that branch, and
+# keeps status 2: the inferred base is still known to be missing.
+rd_late_repo=$(_renamed_default_repo)
+rd_late_bin=$(_tmpdir)
+rd_late_count=$(_tmpdir)/count
+cat >"$rd_late_bin/git" <<'EOF_GIT'
+#!/usr/bin/env bash
+if [[ "${1:-}" == ls-remote && " $* " != *" --symref "* ]]; then
+  n=$(($(cat "$RD_LATE_COUNT" 2>/dev/null || echo 0) + 1))
+  echo "$n" >"$RD_LATE_COUNT"
+  ((n < 2)) || exit 128
+fi
+exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
+EOF_GIT
+chmod +x "$rd_late_bin/git"
+rd_rc=0
+rd_out=$(cd "$rd_late_repo" && RD_LATE_COUNT="$rd_late_count" \
+  PATH="$rd_late_bin:$PATH" "$ROOT/bin/git-cleanup-repo" --no-update-base 2>&1) || rd_rc=$?
+_assert_eq "a failed followed-default lookup keeps status 2" 2 "$rd_rc"
+_assert_contains "a failed followed-default lookup names the followed branch" \
+  "could not inspect followed default branch: origin/main" "$rd_out"
+
+# An empty --base is rejected rather than read as an inferred base.
+rd_rc=0
+rd_out=$(git -C "$rd_symref_repo" cleanup-repo --no-update-base --base "" 2>&1) || rd_rc=$?
+_assert_eq "an empty separate --base is rejected" 2 "$rd_rc"
+_assert_contains "an empty separate --base names the option" "--base requires a value" "$rd_out"
+
+# An explicit --base is never second-guessed.
+rd_explicit_repo=$(_renamed_default_repo)
+rd_rc=0
+rd_out=$(git -C "$rd_explicit_repo" cleanup-repo --no-update-base --base master 2>&1) || rd_rc=$?
+_assert_eq "an explicit missing base still fails" 2 "$rd_rc"
+_assert_contains "an explicit missing base is reported as missing" \
+  "remote base branch does not exist: origin/master" "$rd_out"
+_assert_not_contains "an explicit missing base is not redirected" \
+  "default branch" "$rd_out"
+
+# A remote whose HEAD names no existing branch cannot say where it moved.
+rd_unborn_repo=$(_renamed_default_repo)
+git --git-dir="$(git -C "$rd_unborn_repo" remote get-url origin)" \
+  symbolic-ref HEAD refs/heads/gone
+rd_rc=0
+rd_out=$(git -C "$rd_unborn_repo" cleanup-repo --no-update-base 2>&1) || rd_rc=$?
+_assert_eq "a remote without a default branch keeps the failure" 2 "$rd_rc"
+_assert_contains "a remote without a default branch reports the missing base" \
+  "remote base branch does not exist: origin/master" "$rd_out"
+
 # --worktree limits removal to the listed checkouts and implies removal.
 ws_repo=$(_clone_remote)
 for ws_branch in first second; do

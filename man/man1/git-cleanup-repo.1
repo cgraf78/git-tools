@@ -17,7 +17,8 @@ candidate must be a transition after the branch merge base on the pinned base's
 first-parent history. Its first-parent-to-commit delta must exactly match the
 branch's net delta; this includes transitions introduced by merge commits.
 Later mainline edits do not erase that historical proof; byte, mode, path,
-deletion, or gitlink differences still reject it. Multi-commit rebase and cherry-pick
+deletion, or gitlink differences still reject it. Multi-commit rebase and
+cherry-pick
 matches retain an exact-current-snapshot check. A branch whose complete tree
 equals a snapshot on the base's first-parent history also counts as merged,
 which covers stacked landings that neither detector matches. With
@@ -64,7 +65,8 @@ by fast-forward only, and leaves the base alone when a rebase or bisect
 reserves it or worktrees cannot be inspected; without a local base, it stops
 instead. From the main worktree,
 .B git switch
-itself refuses a base that a rebase or bisect reserves. Updates to a checkout other than the current one are always reported.
+itself refuses a base that a rebase or bisect reserves. Updates to a checkout
+other than the current one are always reported.
 The branch checked out in the current checkout is never deleted. When the base
 update is skipped, the command still exits 0, but its final summary line ends
 with
@@ -120,6 +122,16 @@ only a closed unmerged pull request contains it.
 Prove merges against the pinned remote base without creating, switching to, or
 fast-forwarding the local base. The current branch is still kept, and a dirty
 or mid-operation current checkout is allowed because nothing touches it.
+When the base was inferred, from a stale
+.IB remote /HEAD
+or the main, master, or trunk fallback, and a fetching run finds the remote no
+longer has it, the remote's own default branch is used instead, with a note,
+and the old local default stays protected like the base. Without this option
+that case stops and suggests
+.B \-\-base
+with the remote's default. An explicit
+.B \-\-base
+is never redirected.
 .TP
 .B \-\-no\-fetch
 Prove against the existing
@@ -291,7 +303,8 @@ pruned.
 Unless
 .B \-\-no\-update\-base
 is given, the command refuses to run with a dirty current worktree or active
-rebase, merge, cherry-pick, or revert state. Except for explicitly disposable entries,
+rebase, merge, cherry-pick, or revert state. Except for explicitly disposable
+entries,
 a linked worktree is preserved when it has uncommitted, untracked, ignored, or
 index-hidden local content, is unreadable, is locked by an active operation, is
 the working directory of a visible process (read from
@@ -299,7 +312,8 @@ the working directory of a visible process (read from
 or
 .BR lsof ;
 worktrees are kept when neither can list working directories; open files held
-from another directory are not detected), or cannot be removed without force. Git cannot atomically combine worktree
+from another directory are not detected), or cannot be removed without force.
+Git cannot atomically combine worktree
 reservation checks with ref deletion, so callers must not create, switch, or
 mutate worktrees concurrently with cleanup. Observable state is rechecked, and
 expected-old-object-ID ref deletion preserves a branch that advances during

@@ -4360,6 +4360,247 @@ result=$(git -C "$noreflog_repo" cleanup-repo --min-age 1 --porcelain 2>&1)
 _assert_contains "min-age keeps an ancestry-only branch without a reflog" \
   $'keep-branch\tno-reflog\ttoo-new\t' "$result"
 
+# A closed, unmerged PR retires a selected worktree only with --include-closed,
+# and the branch always stays.
+closed_repo=$(_github_clone)
+git -C "$closed_repo" switch --quiet -c abandoned
+_commit_file "$closed_repo" z.txt z "abandoned work"
+closed_tip=$(git -C "$closed_repo" rev-parse HEAD)
+git -C "$closed_repo" switch --quiet main
+closed_dir=$(_tmpdir)
+rm -rf "$closed_dir"
+git -C "$closed_repo" worktree add --quiet "$closed_dir" abandoned
+printf '[[%s]]\n' "$(_pr_json 11 closed null null)" \
+  >"$gh_dir/commits-$closed_tip.json"
+printf '[[{"sha":"%s"}]]\n' "$closed_tip" >"$gh_dir/members-11.json"
+result=$(cd "$closed_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+  git cleanup-repo --porcelain --worktree "$closed_dir" 2>&1)
+_assert_contains "a closed PR alone does not retire a selected worktree" \
+  $'keep-worktree\t'"$closed_dir"$'\tmerge-unproven\tabandoned' "$result"
+result=$(cd "$closed_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+  git cleanup-repo --porcelain --worktree "$closed_dir" --include-closed 2>&1)
+_assert_contains "include-closed retires a closed PR's selected worktree" \
+  $'remove-worktree\t'"$closed_dir"$'\tclosed-pr\tabandoned' "$result"
+_assert_eq "include-closed keeps the closed PR's branch" "$closed_tip" \
+  "$(git -C "$closed_repo" rev-parse refs/heads/abandoned)"
+
+# Selected worktrees the branch pass leaves alone can still be retired when
+# their own evidence allows, always keeping the branch.
+rt_repo=$(_clone_remote)
+git -C "$rt_repo" switch --quiet -c published
+_commit_file "$rt_repo" pub.txt pub "published work"
+git -C "$rt_repo" push --quiet -u origin published
+git -C "$rt_repo" push --quiet origin --delete published
+git -C "$rt_repo" switch --quiet -c unproven main
+_commit_file "$rt_repo" un.txt un "unproven work"
+git -C "$rt_repo" switch --quiet -c requested main
+_commit_file "$rt_repo" rq.txt rq "requested work"
+git -C "$rt_repo" switch --quiet -c messy main
+_commit_file "$rt_repo" ms.txt ms "messy work"
+git -C "$rt_repo" switch --quiet main
+rt_detached="$(_tmpdir)/detached"
+rt_published="$(_tmpdir)/published"
+rt_unproven="$(_tmpdir)/unproven"
+rt_requested="$(_tmpdir)/requested"
+rt_messy="$(_tmpdir)/messy"
+git -C "$rt_repo" worktree add --quiet --detach "$rt_detached" main
+git -C "$rt_repo" worktree add --quiet "$rt_published" published
+git -C "$rt_repo" worktree add --quiet "$rt_unproven" unproven
+git -C "$rt_repo" worktree add --quiet "$rt_requested" requested
+git -C "$rt_repo" worktree add --quiet "$rt_messy" messy
+printf 'edit\n' >>"$rt_messy/ms.txt"
+rt_outside=$(_tmpdir)
+result=$(git -C "$rt_repo" cleanup-repo --porcelain \
+  --worktree "$rt_detached" --worktree "$rt_published" \
+  --worktree "$rt_unproven" --worktree "$rt_outside" \
+  --retire-worktree "$rt_requested" --retire-worktree "$rt_messy" 2>&1)
+_assert_contains "a detached worktree proven merged is retired" \
+  $'remove-worktree\t'"$rt_detached"$'\tmerged\t' "$result"
+_assert_contains "a worktree whose own upstream is gone is retired" \
+  $'remove-worktree\t'"$rt_published"$'\tupstream-gone\tpublished' "$result"
+_assert_contains "an unproven selected worktree stays" \
+  $'keep-worktree\t'"$rt_unproven"$'\tmerge-unproven\tunproven' "$result"
+_assert_contains "a requested worktree is retired" \
+  $'remove-worktree\t'"$rt_requested"$'\trequested\trequested' "$result"
+_assert_contains "a requested worktree still passes every gate" \
+  $'keep-worktree\t'"$rt_messy"$'\tdirty\t' "$result"
+_assert_contains "a directory outside the repository is not retired" \
+  $'keep-worktree\t'"$rt_outside"$'\tnot-linked\t' "$result"
+_assert_eq "retired worktrees keep their branches" \
+  "$(printf 'main\nmessy\npublished\nrequested\nunproven')" "$(_branches "$rt_repo")"
+_assert_eq "a dirty requested worktree stays on disk" present \
+  "$(if [[ -d "$rt_messy" ]]; then printf present; else printf missing; fi)"
+
+# --retire-worktree alone touches only the named worktree: an unrelated
+# merged checkout and its new branch stay.
+solo_repo=$(_clone_remote)
+git -C "$solo_repo" switch --quiet -c solo-target
+_commit_file "$solo_repo" st.txt st "solo target work"
+git -C "$solo_repo" switch --quiet main
+git -C "$solo_repo" branch solo-bystander
+solo_target="$(_tmpdir)/target"
+solo_bystander="$(_tmpdir)/bystander"
+git -C "$solo_repo" worktree add --quiet "$solo_target" solo-target
+git -C "$solo_repo" worktree add --quiet "$solo_bystander" solo-bystander
+result=$(git -C "$solo_repo" cleanup-repo --porcelain \
+  --retire-worktree "$solo_target" 2>&1)
+_assert_contains "retire-worktree removes the named worktree" \
+  $'remove-worktree\t'"$solo_target"$'\trequested\tsolo-target' "$result"
+_assert_contains "retire-worktree leaves an unrelated merged checkout alone" \
+  $'keep-branch\tsolo-bystander\tchecked-out\t'"$solo_bystander" "$result"
+_assert_eq "retire-worktree keeps the unrelated checkout on disk" present \
+  "$(if [[ -d "$solo_bystander" ]]; then printf present; else printf missing; fi)"
+
+# A relative name or a subdirectory never selects some other worktree, even
+# where Git's own name matching would accept it.
+suffix_repo=$(_clone_remote)
+mkdir -p "$suffix_repo/feature"
+_commit_file "$suffix_repo" feature/tracked.txt tracked "add tracked feature dir"
+git -C "$suffix_repo" push --quiet origin main
+suffix_parent=$(_tmpdir)
+git -C "$suffix_repo" switch --quiet -c other-feature
+git -C "$suffix_repo" switch --quiet main
+git -C "$suffix_repo" worktree add --quiet "$suffix_parent/feature" other-feature
+printf 'secret\n' >"$suffix_parent/feature/local.env"
+printf 'local.env\n' >>"$(git -C "$suffix_repo" rev-parse --git-path info/exclude)"
+result=$(cd "$suffix_repo" && git cleanup-repo --porcelain \
+  --retire-worktree feature 2>&1)
+_assert_contains "a relative name inside the main checkout is not a worktree" \
+  $'keep-worktree\tfeature\tnot-linked\t' "$result"
+_assert_eq "a suffix match never removes another worktree" secret \
+  "$(cat "$suffix_parent/feature/local.env" 2>/dev/null)"
+mkdir -p "$suffix_parent/feature/build"
+printf 'precious\n' >"$suffix_parent/feature/build/keep.txt"
+result=$(git -C "$suffix_repo" cleanup-repo --porcelain \
+  --retire-worktree "$suffix_parent/feature/build" 2>&1)
+_assert_contains "a worktree subdirectory is not a worktree" \
+  $'keep-worktree\t'"$suffix_parent/feature/build"$'\tnot-linked\t' "$result"
+_assert_eq "a worktree subdirectory selection deletes nothing" precious \
+  "$(cat "$suffix_parent/feature/build/keep.txt" 2>/dev/null)"
+
+# A detached checkout whose HEAD no ref reaches is never retired on request:
+# its commits would become unreachable.
+orphan_head_repo=$(_clone_remote)
+orphan_head_dir="$(_tmpdir)/detached"
+git -C "$orphan_head_repo" worktree add --quiet --detach "$orphan_head_dir" main
+_commit_file "$orphan_head_dir" lonely.txt lonely "unreferenced detached work"
+orphan_head_oid=$(git -C "$orphan_head_dir" rev-parse HEAD)
+result=$(git -C "$orphan_head_repo" cleanup-repo --porcelain \
+  --retire-worktree "$orphan_head_dir" 2>&1)
+_assert_contains "an unreferenced detached HEAD keeps its worktree" \
+  $'keep-worktree\t'"$orphan_head_dir"$'\tunreachable-head\t'"$orphan_head_oid" "$result"
+
+# Every selected worktree gets exactly one outcome record, whichever pass
+# decides it, in a dry run too.
+one_repo=$(_clone_remote)
+# Squash landings prove these by content, which --min-age does not hold back.
+for one_branch in gated clean-merged; do
+  git -C "$one_repo" switch --quiet -c "$one_branch"
+  _commit_file "$one_repo" "$one_branch.txt" "$one_branch" "$one_branch work"
+  git -C "$one_repo" switch --quiet main
+  _commit_file "$one_repo" "$one_branch.txt" "$one_branch" "land $one_branch"
+done
+git -C "$one_repo" push --quiet origin main
+git -C "$one_repo" branch fresh-one
+one_gated="$(_tmpdir)/gated"
+one_clean="$(_tmpdir)/clean"
+one_fresh="$(_tmpdir)/fresh"
+one_missing="$(_tmpdir)/missing"
+git -C "$one_repo" worktree add --quiet "$one_gated" gated
+git -C "$one_repo" worktree add --quiet "$one_clean" clean-merged
+git -C "$one_repo" worktree add --quiet "$one_fresh" fresh-one
+git -C "$one_repo" worktree add --quiet --detach "$one_missing" main
+printf 'edit\n' >>"$one_gated/gated.txt"
+rm -rf "$one_missing"
+for one_mode in --dry-run ""; do
+  result=$(git -C "$one_repo" cleanup-repo --porcelain --min-age 1 $one_mode \
+    --worktree "$one_gated" --worktree "$one_clean" --worktree "$one_fresh" \
+    --worktree "$one_missing" 2>&1)
+  for one_path in "$one_gated" "$one_clean" "$one_fresh" "$one_missing"; do
+    one_count=0
+    while IFS=$'\t' read -r one_event one_subject _; do
+      case "$one_event" in
+        remove-worktree | would-remove-worktree | keep-worktree)
+          [[ "$one_subject" != "$one_path" ]] || one_count=$((one_count + 1))
+          ;;
+      esac
+    done <<<"$result"
+    _assert_eq "one outcome record for ${one_path##*/} ${one_mode:-applied}" 1 "$one_count"
+  done
+  _assert_contains "a branch-pass gate failure is a worktree outcome ${one_mode:-applied}" \
+    $'keep-worktree\t'"$one_gated"$'\tdirty\t' "$result"
+  _assert_contains "a too-new branch keeps its selected worktree ${one_mode:-applied}" \
+    $'keep-worktree\t'"$one_fresh"$'\ttoo-new\t' "$result"
+  _assert_contains "a vanished selected worktree is reported missing ${one_mode:-applied}" \
+    $'keep-worktree\t'"$one_missing"$'\tmissing\t' "$result"
+done
+
+# An explicit --remove-worktrees keeps its meaning beside a retirement
+# request: other eligible worktrees still go.
+both_repo=$(_clone_remote)
+for both_branch in both-merged both-target; do
+  git -C "$both_repo" switch --quiet -c "$both_branch"
+  _commit_file "$both_repo" "$both_branch.txt" "$both_branch" "add $both_branch"
+  git -C "$both_repo" switch --quiet main
+done
+git -C "$both_repo" merge --quiet --no-ff both-merged -m "merge both-merged"
+git -C "$both_repo" push --quiet origin main
+both_merged="$(_tmpdir)/merged"
+both_target="$(_tmpdir)/target"
+git -C "$both_repo" worktree add --quiet "$both_merged" both-merged
+git -C "$both_repo" worktree add --quiet "$both_target" both-target
+result=$(git -C "$both_repo" cleanup-repo --porcelain --remove-worktrees \
+  --retire-worktree "$both_target" 2>&1)
+_assert_contains "remove-worktrees still removes other merged worktrees beside a request" \
+  $'remove-worktree\t'"$both_merged"$'\tmerged\tboth-merged' "$result"
+_assert_contains "the requested worktree is retired too" \
+  $'remove-worktree\t'"$both_target"$'\trequested\tboth-target' "$result"
+
+# A requested detached checkout whose HEAD is proven merged is retired by
+# that proof, the same way in a dry run and for real, even when the branch
+# pass deletes the only branch pointing at it.
+pick_repo=$(_clone_remote)
+git -C "$pick_repo" switch --quiet -c picked
+_commit_file "$pick_repo" pick.txt pick "picked work"
+pick_oid=$(git -C "$pick_repo" rev-parse HEAD)
+git -C "$pick_repo" switch --quiet main
+# Unrelated mainline work first, so the pick is a new commit rather than an
+# identical one that ancestry alone would prove.
+_commit_file "$pick_repo" other.txt other "unrelated mainline work"
+git -C "$pick_repo" cherry-pick "$pick_oid" >/dev/null
+git -C "$pick_repo" push --quiet origin main
+pick_dir="$(_tmpdir)/detached"
+git -C "$pick_repo" worktree add --quiet --detach "$pick_dir" "$pick_oid"
+for pick_mode in --dry-run ""; do
+  result=$(git -C "$pick_repo" cleanup-repo --porcelain $pick_mode \
+    --retire-worktree "$pick_dir" 2>&1)
+  _assert_contains "a requested detached HEAD proven merged is retired by its proof ${pick_mode:-applied}" \
+    "remove-worktree"$'\t'"$pick_dir"$'\tcontent-merged\t' "$result"
+done
+
+# Records name worktrees by Git's recorded paths: a relative spelling of a
+# vanished worktree and a duplicate spelling both resolve to it, once; the
+# main worktree selected from a linked one is reported as such.
+rel_repo=$(_clone_remote)
+rel_parent=$(_tmpdir)
+git -C "$rel_repo" worktree add --quiet --detach "$rel_parent/gone" main
+git -C "$rel_repo" worktree add --quiet --detach "$rel_parent/twice" main
+git -C "$rel_repo" worktree add --quiet --detach "$rel_parent/here" main
+rm -rf "$rel_parent/gone"
+result=$(cd "$rel_parent/here" && git cleanup-repo --porcelain --no-update-base \
+  --worktree ../gone --worktree ../twice --worktree ../twice/ 2>&1)
+_assert_contains "a relative spelling of a vanished worktree resolves to its recorded path" \
+  $'keep-worktree\t'"$rel_parent/gone"$'\tmissing\t' "$result"
+rel_count=0
+while IFS=$'\t' read -r _ rel_subject _; do
+  [[ "$rel_subject" == "$rel_parent/twice" ]] && rel_count=$((rel_count + 1))
+done <<<"$result"
+_assert_eq "duplicate spellings of one worktree give one record" 1 "$rel_count"
+result=$(git -C "$rel_parent/here" cleanup-repo --porcelain --no-update-base \
+  --worktree "$rel_repo" 2>&1)
+_assert_contains "the main worktree selected from a linked one is reported as main" \
+  $'keep-worktree\t'"$rel_repo"$'\tmain-worktree\t' "$result"
+
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2
   exit 1

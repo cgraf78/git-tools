@@ -545,7 +545,8 @@ record per decision on stdout and leaves only diagnostics on stderr:
 | --- | --- | --- | --- |
 | `delete-branch`, `would-delete-branch` | branch | `merged`, `content-merged`, `tree-landed`, `merged-pr`, `upstream-gone`, `all` | proven OID |
 | `keep-branch` | branch | see below | see below |
-| `remove-worktree`, `would-remove-worktree` | worktree path | its branch's deletion code | branch |
+| `remove-worktree`, `would-remove-worktree` | worktree path | its branch's deletion code, or its retirement code | branch, or empty when detached |
+| `keep-worktree` | selected worktree path | see below | see below |
 | `prune-entry`, `would-prune-entry` | worktree path | `disposable` | entry name |
 
 `keep-branch` codes, with their detail:
@@ -565,8 +566,19 @@ record per decision on stdout and leaves only diagnostics on stderr:
 | `prune-failed`, `remove-failed` | worktree path | the worktree could not be removed safely |
 | `ref-delete-failed` | proven OID | the exact ref deletion failed |
 
-Worktree subjects are the paths Git's worktree list records, and
-`--worktree` arguments are matched to those paths. Backslash, tab, and newline
+Every selected worktree gets exactly one `remove-worktree`,
+`would-remove-worktree`, or `keep-worktree` record (two spellings of the same
+worktree select it once). A
+`keep-worktree` carries the code that kept its branch (or the gate code that
+kept the checkout) with the same detail as above, `merge-unproven` with the
+branch name, `current-worktree`, `main-worktree`, `missing` (the path or its
+directory is gone), `not-linked` (not a linked worktree of this repository, including a
+subdirectory of one), or `unreachable-head` with the detached HEAD's OID.
+Retirement codes are `requested`, `upstream-gone`, `closed-pr`, or, for a
+detached HEAD, its merge proof.
+
+Worktree subjects are the paths Git's worktree list records, and selection
+arguments are matched to whole worktrees by those paths. Backslash, tab, and newline
 inside a field are written as `\\`, `\t`, and `\n`. Exit status 0 means
 every decision was reported, including kept branches and failed removals; 2
 means a usage, repository, or remote error, after which printed records may be
@@ -575,6 +587,20 @@ incomplete.
 ```sh
 git cleanup-repo --no-update-base --porcelain --worktree ../old-feature
 ```
+
+A selected worktree whose branch cleanup keeps can still be retired, keeping
+the branch, when its own evidence allows: a detached HEAD proven merged, an
+own-name upstream that is gone, or, with `--include-closed`, a branch only a
+closed unmerged pull request contains. `--retire-worktree <path>` retires a
+linked worktree on the caller's say-so, except a detached HEAD that no branch,
+remote branch, or tag reaches, whose commits would become unreachable. Its
+branch stays unless cleanup proves it merged, in which case the branch goes as
+it would for `--worktree`, and a branch kept for a protective reason
+(`open-pr`, `too-new`) keeps its checkout. With `--remove-worktrees`, every
+eligible worktree is still considered; selections only add their own
+retirement.
+Every removal gate still applies, and a worktree whose HEAD moves during
+cleanup is kept.
 
 `--min-age <days>` keeps a branch proven only by ancestry whose reflog shows it
 created or moved more recently than that, or that has no reflog: a branch with

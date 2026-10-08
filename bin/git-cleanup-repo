@@ -53,13 +53,21 @@ Options:
       --min-age <days>      Keep branches proven only by ancestry that their
                             reflog shows created or moved less than this many
                             days ago (or that have no reflog).
+      --retire-worktree <path>
+                            Remove this linked worktree (repeatable); the
+                            caller vouches for it. Its branch is kept unless
+                            cleanup proves it merged, and an open-pr or
+                            too-new branch keeps the worktree too.
+      --include-closed      Also retire a selected worktree whose branch only
+                            a closed, unmerged pull request contains.
   -n, --dry-run             Print actions without changing anything.
   -h, --help                Show this help.
 
 Porcelain records are <event> TAB <subject> TAB <code> TAB <detail>. Events:
-delete-branch, keep-branch, remove-worktree, and prune-entry, with
-would-delete-branch, would-remove-worktree, and would-prune-entry in a dry
-run. Backslash, tab, and newline in a field are written as \\, \t, and \n.
+delete-branch, keep-branch, remove-worktree, keep-worktree, and prune-entry,
+with would-delete-branch, would-remove-worktree, and would-prune-entry in a
+dry run. Every selected worktree gets exactly one remove-worktree,
+would-remove-worktree, or keep-worktree record. Backslash, tab, and newline in a field are written as \\, \t, and \n.
 Worktree subjects are the paths Git's worktree list records.
 
 Exit status:
@@ -502,8 +510,8 @@ _branch_touched_at() {
 
 # Decide one branch. Prints `<code> TAB <detail>` and succeeds with a deletion
 # reason (merged, content-merged, tree-landed, merged-pr, upstream-gone, or
-# all), or fails, printing a keep code when one applies (too-new or open-pr)
-# and nothing when the merge is simply unproven.
+# all), or fails, printing a keep code when one applies (too-new, open-pr, or
+# closed-pr) and nothing when the merge is simply unproven.
 _delete_reason() {
   local branch="$1" branch_oid="$2" upstream_track="$3" remote_name="$4"
   local remote_ref="$5" proof touched now lineage kind="" number=""
@@ -548,7 +556,7 @@ _delete_reason() {
     printf 'upstream-gone\t\n'
     return 0
   fi
-
+  [[ "$kind" != closed ]] || printf 'closed-pr\t%s\n' "$number"
   return 1
 }
 
@@ -633,17 +641,24 @@ _cleanup_branches() {
     detail=${decision#*$'\t'}
     case "$code" in
       too-new)
+        _decided_branches+=("$branch")
+        _decided_codes+=("too-new")
+        _decided_details+=("$detail")
         gt_cleanup_report keep-branch "$branch" too-new "$detail" \
           "keeping $branch; merged by ancestry but created or moved less than $_min_age day(s) ago, or it has no reflog"
         skipped=$((skipped + 1))
         continue
         ;;
       open-pr)
+        _decided_branches+=("$branch")
+        _decided_codes+=("open-pr")
+        _decided_details+=("$detail")
         gt_cleanup_report keep-branch "$branch" open-pr "$detail" \
           "keeping $branch; open PR #$detail"
         skipped=$((skipped + 1))
         continue
         ;;
+      closed-pr) _closed_branches+=("$branch") ;;
     esac
     # Upstream state comes from remote-tracking refs as of the last fetch;
     # cleanup fetches only the base, so say so rather than claim it is live.
@@ -691,6 +706,9 @@ _parse_args() {
   _fetch=1
   _porcelain=0
   _worktree_scope=()
+  _retire_paths=()
+  _remove_all=0
+  _include_closed=0
   _min_age=0
 
   while (($#)); do
@@ -729,6 +747,7 @@ _parse_args() {
         ;;
       --remove-worktrees)
         _remove_worktrees=1
+        _remove_all=1
         shift
         ;;
       --worktree)
@@ -755,6 +774,25 @@ _parse_args() {
         ;;
       --porcelain)
         _porcelain=1
+        shift
+        ;;
+      --include-closed)
+        _include_closed=1
+        shift
+        ;;
+      --retire-worktree)
+        shift
+        (($#)) || _die "--retire-worktree requires a value"
+        [[ -n "$1" ]] || _die "--retire-worktree requires a value"
+        _retire_paths+=("$1")
+        _remove_worktrees=1
+        shift
+        ;;
+      --retire-worktree=*)
+        [[ -n "${1#--retire-worktree=}" ]] ||
+          _die "--retire-worktree requires a value"
+        _retire_paths+=("${1#--retire-worktree=}")
+        _remove_worktrees=1
         shift
         ;;
       --min-age)
@@ -790,42 +828,205 @@ _parse_args() {
     _die "--min-age requires a whole number of days up to 99999: $_min_age"
 }
 
-# Map each --worktree argument to the path Git's worktree list records for it,
-# once, so a relative, trailing-slash, or symlinked spelling selects exactly
-# that worktree and records name it the same way Git does. An argument that
-# names no linked worktree of this repository selects nothing.
+# Print the path Git's worktree list records for a selection argument, or
+# fail when it names no worktree of this repository. Matching whole worktree
+# roots only means a relative name, a subdirectory, or a suffix Git itself
+# would accept can never select some other worktree.
+# Print an absolute path with `.`, `..`, empty, and trailing components
+# resolved lexically. A worktree whose directory is gone cannot be resolved
+# through the filesystem, so this is how its relative spelling still matches
+# the path Git recorded.
+_lexical_path() {
+  local path="$1" part
+  local -a parts=() out=()
+
+  [[ "$path" == /* ]] || path=$PWD/$path
+  IFS=/ read -r -a parts <<<"$path"
+  for part in ${parts[@]+"${parts[@]}"}; do
+    case "$part" in
+      "" | .) ;;
+      ..) ((${#out[@]} == 0)) || unset 'out[${#out[@]}-1]' ;;
+      *) out+=("$part") ;;
+    esac
+  done
+  ((${#out[@]} > 0)) || {
+    printf '/\n'
+    return 0
+  }
+  printf '/%s' "${out[@]}"
+  printf '\n'
+}
+
+_recorded_worktree() {
+  local arg field path
+
+  arg=$(_lexical_path "$1")
+
+  for field in ${_GT_WORKTREE_FIELDS[@]+"${_GT_WORKTREE_FIELDS[@]}"}; do
+    case "$field" in
+      "worktree "*) path=${field#worktree } ;;
+      *) continue ;;
+    esac
+    if [[ "$path" == "$arg" || "$path" -ef "$arg" ]]; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Resolve --worktree and --retire-worktree arguments to recorded worktree
+# paths, once, so a relative, trailing-slash, or symlinked spelling selects
+# exactly that worktree and records name it the way Git does. The scope is
+# their union; an argument naming no linked worktree selects nothing and is
+# reported by the worktree pass.
 _resolve_worktree_scope() {
-  local arg field path matched resolved
-  local -a scope=()
+  local arg matched resolved
+  local -a scope=() retire=()
 
   _unmatched_scope=()
-  ((${#_worktree_scope[@]} > 0)) || return 0
+  _retire_scope=()
+  _selected_worktrees=()
+  ((${#_worktree_scope[@]} + ${#_retire_paths[@]} > 0)) || return 0
   gt_find_main_worktree || _die "could not inspect worktrees"
-  for arg in "${_worktree_scope[@]}"; do
-    matched=""
-    for field in ${_GT_WORKTREE_FIELDS[@]+"${_GT_WORKTREE_FIELDS[@]}"}; do
-      case "$field" in
-        "worktree "*) path=${field#worktree } ;;
-        *) continue ;;
-      esac
-      if [[ "$path" == "$arg" || "$path" -ef "$arg" ]]; then
-        matched=$path
-        break
-      fi
-    done
-    if [[ -z "$matched" ]]; then
-      _unmatched_scope+=("$arg")
+  for arg in ${_worktree_scope[@]+"${_worktree_scope[@]}"} \
+    ${_retire_paths[@]+"${_retire_paths[@]}"}; do
+    if ! matched=$(_recorded_worktree "$arg"); then
+      _listed "$arg" ${_unmatched_scope[@]+"${_unmatched_scope[@]}"} ||
+        _unmatched_scope+=("$arg")
       continue
     fi
-    for resolved in ${scope[@]+"${scope[@]}"}; do
-      [[ "$resolved" != "$matched" ]] || continue 2
-    done
-    scope+=("$matched")
+    _listed "$matched" ${scope[@]+"${scope[@]}"} || scope+=("$matched")
   done
+  for arg in ${_retire_paths[@]+"${_retire_paths[@]}"}; do
+    matched=$(_recorded_worktree "$arg") || continue
+    _listed "$matched" ${retire[@]+"${retire[@]}"} || retire+=("$matched")
+  done
+  _retire_scope=(${retire[@]+"${retire[@]}"})
+  _selected_worktrees=(${scope[@]+"${scope[@]}"})
+  # An explicit --remove-worktrees keeps its meaning, every eligible
+  # worktree; selections then only add the retirement pass for themselves.
+  [[ "$_remove_all" == 1 ]] && return 0
   # shellcheck disable=SC2034 # read by lib/git-tools-cleanup.sh
   GT_CLEANUP_WORKTREE_SCOPE=(${scope[@]+"${scope[@]}"})
   # Every argument named nothing: select nothing rather than everything.
   ((${#scope[@]} > 0)) || GT_CLEANUP_REMOVE_WORKTREES=0
+}
+
+_listed() {
+  local needle="$1" item
+  shift
+
+  for item; do
+    [[ "$item" != "$needle" ]] || return 0
+  done
+  return 1
+}
+
+# Report one worktree pass outcome.
+_keep_worktree() {
+  gt_cleanup_report keep-worktree "$1" "$2" "$3" "skipping worktree $1; $4"
+}
+
+# Give every selected worktree exactly one outcome record. Outcomes the
+# branch pass reached are carried over; worktrees it left alone are retired,
+# keeping their branches, when their own evidence allows: a detached HEAD
+# proven merged, an own-name upstream that is gone, a closed unmerged PR with
+# --include-closed, or an explicit --retire-worktree request.
+_retire_worktrees() {
+  local arg path head_oid branch status index code main
+
+  for arg in ${_unmatched_scope[@]+"${_unmatched_scope[@]}"}; do
+    if [[ -e "$arg" ]]; then
+      _keep_worktree "$arg" not-linked "" \
+        "not a linked worktree of this repository"
+    else
+      _keep_worktree "$arg" missing "" "no such path"
+    fi
+  done
+  gt_find_main_worktree || GT_WORKTREE_PATH=""
+  main=$GT_WORKTREE_PATH
+  for path in ${_selected_worktrees[@]+"${_selected_worktrees[@]}"}; do
+    if gt_cleanup_worktree_outcome "$path"; then
+      [[ "$GT_CLEANUP_WT_OUTCOME" == removed ]] ||
+        _keep_worktree "$path" "$GT_CLEANUP_WT_CODE" "$GT_CLEANUP_WT_DETAIL" \
+          "kept with its branch ($GT_CLEANUP_WT_CODE)"
+      continue
+    fi
+    if [[ ! -e "$path" ]]; then
+      _keep_worktree "$path" missing "" "its directory no longer exists"
+      continue
+    fi
+    if [[ -n "$GT_CLEANUP_CURRENT_WORKTREE" &&
+      "$path" -ef "$GT_CLEANUP_CURRENT_WORKTREE" ]]; then
+      _keep_worktree "$path" current-worktree "" "it is the current worktree"
+      continue
+    fi
+    if [[ -n "$main" && ("$path" == "$main" || "$path" -ef "$main") ]]; then
+      _keep_worktree "$path" main-worktree "" "it is the main worktree"
+      continue
+    fi
+    head_oid=$(gt_git_without_local_env -C "$path" rev-parse --verify -q \
+      HEAD 2>/dev/null) || head_oid=""
+    status=0
+    branch=$(gt_git_without_local_env -C "$path" symbolic-ref -q --short \
+      HEAD 2>/dev/null) || status=$?
+    if [[ -z "$head_oid" || "$status" -gt 1 ]]; then
+      _keep_worktree "$path" uninspectable "" "could not read its HEAD"
+      continue
+    fi
+    [[ "$status" == 0 ]] || branch=""
+    # A branch the branch pass kept for a protective reason keeps its
+    # checkout for the same reason.
+    index=0
+    while [[ -n "$branch" ]] && ((index < ${#_decided_branches[@]})); do
+      if [[ "${_decided_branches[$index]}" == "$branch" ]]; then
+        _keep_worktree "$path" "${_decided_codes[$index]}" \
+          "${_decided_details[$index]}" "its branch is kept (${_decided_codes[$index]})"
+        continue 2
+      fi
+      index=$((index + 1))
+    done
+    code=""
+    if [[ -z "$branch" ]] && gt_merge_proof "$head_oid" "$_base_oid"; then
+      # A detached HEAD proven merged needs no request, and the proof does
+      # not depend on refs the branch pass may just have deleted.
+      code=$GT_CLEANUP_PROOF
+    elif _listed "$path" ${_retire_scope[@]+"${_retire_scope[@]}"}; then
+      # Removing a detached checkout drops the only reference to commits its
+      # HEAD reaches but no ref does; a request cannot vouch for those.
+      if [[ -z "$branch" ]] && [[ -z "$(git for-each-ref --count=1 \
+        --contains "$head_oid" --format='%(refname)' refs/heads refs/remotes \
+        refs/tags 2>/dev/null)" ]]; then
+        _keep_worktree "$path" unreachable-head "$head_oid" \
+          "its detached HEAD is on no branch, remote branch, or tag"
+        continue
+      fi
+      code=requested
+    elif [[ -n "$branch" ]]; then
+      index=0
+      while ((index < ${#_branches[@]})); do
+        if [[ "${_branches[$index]}" == "$branch" ]] &&
+          gt_own_upstream_gone "$branch" "${_upstream_tracks[$index]}" \
+            "${_upstream_remotes[$index]}" "${_upstream_refs[$index]}"; then
+          code="upstream-gone"
+        fi
+        index=$((index + 1))
+      done
+      if [[ -z "$code" && "$_include_closed" == 1 ]] &&
+        _listed "$branch" ${_closed_branches[@]+"${_closed_branches[@]}"}; then
+        code="closed-pr"
+      fi
+    fi
+    if [[ -z "$code" ]]; then
+      _keep_worktree "$path" merge-unproven "$branch" \
+        "merge not proven for ${branch:-its detached HEAD}"
+      continue
+    fi
+    gt_cleanup_retire_worktree "$path" "$branch" "$code" "$head_oid" ||
+      _keep_worktree "$path" "$GT_CLEANUP_KEEP_CODE" "$GT_CLEANUP_KEEP_DETAIL" \
+        "$GT_CLEANUP_KEEP_WHY"
+  done
 }
 
 # Escape a porcelain field so a path can never forge a field or record break.
@@ -864,6 +1065,10 @@ _resolve_worktree_scope
 # Pull request evidence needs the network, gh, jq, and a GitHub remote. It is
 # pinned to the exact repository the cleanup remote reaches; anything else
 # simply leaves that evidence out.
+_decided_branches=()
+_decided_codes=()
+_decided_details=()
+_closed_branches=()
 _github_host=""
 _github_repo=""
 if [[ "$_fetch" == 1 ]] && command -v gh >/dev/null 2>&1 &&
@@ -895,3 +1100,4 @@ else
   _base_oid=$_remote_oid
 fi
 _cleanup_branches
+_retire_worktrees

@@ -28,9 +28,10 @@ full object IDs, types, modes, paths, and deletions, so
 patch-ID-equivalent but byte-distinct content does not count as merged. A
 branch whose complete tree equals a snapshot on the default branch's
 first-parent history also counts as merged, which covers stacked landings. These
-are the proofs
+are the local proofs
 .B git cleanup-repo
-uses, so the audit and cleanup agree. The audit only reports; preview cleanup
+uses; cleanup can additionally use network pull request evidence and an age
+limit. The audit only reports; preview cleanup
 with
 .BR "git cleanup-repo \-\-dry-run" .
 .SH OPTIONS

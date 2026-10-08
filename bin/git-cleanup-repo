@@ -19,6 +19,8 @@ _root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
 # shellcheck disable=SC1091
 . "$_root/lib/git-tools-base.sh"
 # shellcheck disable=SC1091
+. "$_root/lib/git-tools-pr.sh"
+# shellcheck disable=SC1091
 . "$_root/lib/git-tools-cleanup.sh"
 # shellcheck disable=SC2034 # read by lib/git-tools-cleanup.sh
 GT_CLEANUP_COMMAND="git cleanup-repo"
@@ -48,6 +50,9 @@ Options:
                             of fetching it.
       --porcelain           Print one tab-separated record per decision on
                             stdout instead of messages on stderr.
+      --min-age <days>      Keep branches proven only by ancestry that their
+                            reflog shows created or moved less than this many
+                            days ago (or that have no reflog).
   -n, --dry-run             Print actions without changing anything.
   -h, --help                Show this help.
 
@@ -480,24 +485,67 @@ _update_base() {
   _base_oid=$GT_REF_OID
 }
 
-# Name the strongest proof that a pinned branch OID is already in the base, or
-# the explicit opt-in that selected it. The proof code is the deletion reason:
-# merged, content-merged, tree-landed, upstream-gone, or all.
+# Print the epoch second of a branch's newest reflog entry: when it was last
+# created or moved. Fails when the branch has no reflog, which happens with
+# core.logAllRefUpdates=false or after reflog expiry; its tip's committer time
+# would be no substitute, since a new branch on an old commit looks old.
+_branch_touched_at() {
+  local branch="$1" when
+
+  when=$(git reflog show -n 1 --date=unix --format=%gd \
+    "refs/heads/$branch" -- 2>/dev/null) || return 1
+  when=${when##*@\{}
+  when=${when%\}}
+  [[ "$when" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$when"
+}
+
+# Decide one branch. Prints `<code> TAB <detail>` and succeeds with a deletion
+# reason (merged, content-merged, tree-landed, merged-pr, upstream-gone, or
+# all), or fails, printing a keep code when one applies (too-new or open-pr)
+# and nothing when the merge is simply unproven.
 _delete_reason() {
   local branch="$1" branch_oid="$2" upstream_track="$3" remote_name="$4"
-  local remote_ref="$5"
+  local remote_ref="$5" proof touched now lineage kind="" number=""
 
   if [[ "$_all" == 1 ]]; then
-    printf 'all\n'
+    printf 'all\t\n'
     return 0
   fi
   if gt_merge_proof "$branch_oid" "$_base_oid"; then
-    printf '%s\n' "$GT_CLEANUP_PROOF"
+    proof=$GT_CLEANUP_PROOF
+    # A branch with no commits of its own is indistinguishable from one that
+    # was fast-forward merged; a young one is more likely new work.
+    if [[ "$proof" == merged && "$_min_age" != 0 ]]; then
+      touched=$(_branch_touched_at "$branch") || touched=""
+      now=$(date +%s) || now=""
+      if [[ -z "$touched" || -z "$now" ]] ||
+        ((now - touched < _min_age * 86400)); then
+        printf 'too-new\t%s\n' "$touched"
+        return 1
+      fi
+    fi
+    printf '%s\t\n' "$proof"
     return 0
+  fi
+  if [[ -n "$_github_repo" ]]; then
+    lineage=$(gt_cleanup_pr_lineage "$_github_host" "$_github_repo" \
+      "$branch" "$branch_oid" "$_base_oid" "$_base") || lineage=""
+    IFS=$'\t' read -r kind number <<<"$lineage"
+    case "$kind" in
+      merged)
+        printf 'merged-pr\t%s\n' "$number"
+        return 0
+        ;;
+      open)
+        printf 'open-pr\t%s\n' "$number"
+        return 1
+        ;;
+    esac
   fi
   if [[ "$_gone" == 1 ]] &&
     gt_own_upstream_gone "$branch" "$upstream_track" "$remote_name" "$remote_ref"; then
-    printf 'upstream-gone\n'
+    printf 'upstream-gone\t\n'
     return 0
   fi
 
@@ -550,7 +598,7 @@ _inventory_branches() {
 
 _cleanup_branches() {
   local branch branch_oid upstream upstream_track remote_name remote_ref
-  local reason index summary
+  local decision code detail label index summary
   local candidates=0 skipped=0 unproven="merge not proven"
 
   # Merges are proven against the local base. When its update was skipped,
@@ -567,34 +615,54 @@ _cleanup_branches() {
     remote_name=${_upstream_remotes[$index]}
     remote_ref=${_upstream_refs[$index]}
 
-    reason=$(_delete_reason "$branch" "$branch_oid" "$upstream_track" \
-      "$remote_name" "$remote_ref") || {
-      # Upstream state comes from remote-tracking refs as of the last fetch;
-      # cleanup fetches only the base, so say so rather than claim it is live.
-      if gt_own_upstream_gone "$branch" "$upstream_track" "$remote_name" \
-        "$remote_ref"; then
-        gt_cleanup_report keep-branch "$branch" merge-unproven upstream-gone \
-          "keeping $branch; $unproven; upstream is gone; --gone selects it for cleanup"
-      elif [[ "$upstream_track" == "[gone]" ]]; then
-        gt_cleanup_report keep-branch "$branch" merge-unproven \
-          other-upstream-gone \
-          "keeping $branch; $unproven; upstream $upstream is gone, but it is not this branch's own remote branch"
-      elif [[ -n "$upstream" ]]; then
-        gt_cleanup_report keep-branch "$branch" merge-unproven upstream \
-          "keeping $branch; $unproven; upstream $upstream still exists as of the last fetch"
-      else
-        gt_cleanup_report keep-branch "$branch" merge-unproven no-upstream \
-          "keeping $branch; $unproven; no upstream is configured"
+    decision=""
+    if decision=$(_delete_reason "$branch" "$branch_oid" "$upstream_track" \
+      "$remote_name" "$remote_ref"); then
+      code=${decision%%$'\t'*}
+      detail=${decision#*$'\t'}
+      label=""
+      [[ "$code" != merged-pr ]] || label="merged PR #$detail"
+      if ! gt_cleanup_retire_branch "$branch" "$branch_oid" "$code" "$label"; then
+        skipped=$((skipped + 1))
+        continue
       fi
-      skipped=$((skipped + 1))
-      continue
-    }
-
-    if ! gt_cleanup_retire_branch "$branch" "$branch_oid" "$reason"; then
-      skipped=$((skipped + 1))
+      candidates=$((candidates + 1))
       continue
     fi
-    candidates=$((candidates + 1))
+    code=${decision%%$'\t'*}
+    detail=${decision#*$'\t'}
+    case "$code" in
+      too-new)
+        gt_cleanup_report keep-branch "$branch" too-new "$detail" \
+          "keeping $branch; merged by ancestry but created or moved less than $_min_age day(s) ago, or it has no reflog"
+        skipped=$((skipped + 1))
+        continue
+        ;;
+      open-pr)
+        gt_cleanup_report keep-branch "$branch" open-pr "$detail" \
+          "keeping $branch; open PR #$detail"
+        skipped=$((skipped + 1))
+        continue
+        ;;
+    esac
+    # Upstream state comes from remote-tracking refs as of the last fetch;
+    # cleanup fetches only the base, so say so rather than claim it is live.
+    if gt_own_upstream_gone "$branch" "$upstream_track" "$remote_name" \
+      "$remote_ref"; then
+      gt_cleanup_report keep-branch "$branch" merge-unproven upstream-gone \
+        "keeping $branch; $unproven; upstream is gone; --gone selects it for cleanup"
+    elif [[ "$upstream_track" == "[gone]" ]]; then
+      gt_cleanup_report keep-branch "$branch" merge-unproven \
+        other-upstream-gone \
+        "keeping $branch; $unproven; upstream $upstream is gone, but it is not this branch's own remote branch"
+    elif [[ -n "$upstream" ]]; then
+      gt_cleanup_report keep-branch "$branch" merge-unproven upstream \
+        "keeping $branch; $unproven; upstream $upstream still exists as of the last fetch"
+    else
+      gt_cleanup_report keep-branch "$branch" merge-unproven no-upstream \
+        "keeping $branch; $unproven; no upstream is configured"
+    fi
+    skipped=$((skipped + 1))
   done
 
   [[ -z "$GT_CLEANUP_UNINSPECTABLE_HINT" ]] ||
@@ -623,6 +691,7 @@ _parse_args() {
   _fetch=1
   _porcelain=0
   _worktree_scope=()
+  _min_age=0
 
   while (($#)); do
     case "$1" in
@@ -688,6 +757,16 @@ _parse_args() {
         _porcelain=1
         shift
         ;;
+      --min-age)
+        shift
+        (($#)) || _die "--min-age requires a value"
+        _min_age=$1
+        shift
+        ;;
+      --min-age=*)
+        _min_age=${1#--min-age=}
+        shift
+        ;;
       -n | --dry-run)
         _dry_run=1
         shift
@@ -705,6 +784,10 @@ _parse_args() {
         ;;
     esac
   done
+  # Decimal without leading zeros, so Bash arithmetic never reads it as octal,
+  # and at most five digits, so the seconds product cannot overflow.
+  [[ "$_min_age" =~ ^(0|[1-9][0-9]{0,4})$ ]] ||
+    _die "--min-age requires a whole number of days up to 99999: $_min_age"
 }
 
 # Map each --worktree argument to the path Git's worktree list records for it,
@@ -777,6 +860,19 @@ fi
 _resolve_remote
 _locate_worktrees
 _resolve_worktree_scope
+
+# Pull request evidence needs the network, gh, jq, and a GitHub remote. It is
+# pinned to the exact repository the cleanup remote reaches; anything else
+# simply leaves that evidence out.
+_github_host=""
+_github_repo=""
+if [[ "$_fetch" == 1 ]] && command -v gh >/dev/null 2>&1 &&
+  command -v jq >/dev/null 2>&1 &&
+  _github_identity=$(gt_github_repo_transport_identity_from_url "$_remote_url" \
+    2>/dev/null); then
+  _github_host=${_github_identity%%/*}
+  _github_repo=${_github_identity#*/}
+fi
 
 # A non-writing hash probe detects the native SHA width without requiring the
 # newer rev-parse --show-object-format option.

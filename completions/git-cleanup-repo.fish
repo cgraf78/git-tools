@@ -18,5 +18,6 @@ complete -c git-cleanup-repo -l worktree -r -F -d "Remove only this linked workt
 complete -c git-cleanup-repo -l no-update-base -d "Prove against the remote base without changing the local base"
 complete -c git-cleanup-repo -l no-fetch -d "Prove against the remote-tracking base ref instead of fetching"
 complete -c git-cleanup-repo -l porcelain -d "Print one tab-separated record per decision"
+complete -c git-cleanup-repo -l min-age -r -d "Keep young ancestry-only branches"
 complete -c git-cleanup-repo -s n -l dry-run -d "Print deletion actions without changing anything"
 complete -c git-cleanup-repo -s h -l help -d "Show help"

@@ -24,6 +24,7 @@ _git_cleanup_repo() {
     '--no-update-base[Prove against the remote base without changing the local base]' \
     '--no-fetch[Prove against the remote-tracking base ref instead of fetching]' \
     '--porcelain[Print one tab-separated record per decision]' \
+    '--min-age[Keep young ancestry-only branches]:days' \
     '(-n --dry-run)'{-n,--dry-run}'[Print deletion actions without changing anything]' \
     '(-h --help)'{-h,--help}'[Show help]'
 }

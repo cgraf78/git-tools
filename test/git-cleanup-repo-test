@@ -4195,6 +4195,165 @@ tab_out=$(git -C "$tab_repo" cleanup-repo --remove-worktrees --porcelain \
 _assert_contains "porcelain escapes a tab in a worktree path" \
   $'would-remove-worktree\t'"${tab_dir%$'\t'tab}"$'\\ttab\tmerged\ttabbed' "$tab_out"
 
+# --- Pull request evidence and age limits ---
+
+# A fake gh answers the three GitHub endpoints cleanup reads from per-test
+# files and logs every call. --slurp output is an array of pages.
+gh_bin=$(_tmpdir)
+cat >"$gh_bin/gh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$FAKE_GH_DIR/calls"
+[[ -z "${FAKE_GH_FAIL:-}" ]] || exit 1
+endpoint="" head=""
+for arg; do
+  case "$arg" in
+    repos/*) endpoint=$arg ;;
+    head=*) head=${arg#head=} ;;
+  esac
+done
+case "$endpoint" in
+  repos/acme/widgets/commits/*/pulls)
+    oid=${endpoint#repos/acme/widgets/commits/}
+    file=$FAKE_GH_DIR/commits-${oid%/pulls}.json
+    ;;
+  repos/acme/widgets/pulls) file=$FAKE_GH_DIR/named-${head#acme:}.json ;;
+  repos/acme/widgets/pulls/*/commits)
+    number=${endpoint#repos/acme/widgets/pulls/}
+    file=$FAKE_GH_DIR/members-${number%/commits}.json
+    ;;
+  *) exit 1 ;;
+esac
+if [[ -f "$file" ]]; then cat "$file"; else printf '[[]]\n'; fi
+EOF
+chmod +x "$gh_bin/gh"
+
+# A clone whose origin is spelled as a GitHub URL but resolves to a local bare
+# repository, so pull request evidence is pinned to acme/widgets offline.
+_github_clone() {
+  local repo remote
+
+  repo=$(_clone_remote) || return 1
+  remote=$(git -C "$repo" remote get-url origin)
+  git -C "$repo" config "url.$remote.insteadOf" https://github.com/acme/widgets.git
+  git -C "$repo" remote set-url origin https://github.com/acme/widgets.git
+  printf '%s\n' "$repo"
+}
+
+_pr_json() {
+  local number="$1" state="$2" merged_at="$3" merge_sha="$4" head="${5:-}"
+
+  printf '{"number":%s,"state":"%s","merged_at":%s,"merge_commit_sha":%s,' \
+    "$number" "$state" "$merged_at" "$merge_sha"
+  printf '"base":{"ref":"main","repo":{"full_name":"acme/widgets"}},'
+  printf '"head":{"ref":"%s","repo":{"full_name":"acme/widgets"}}}' "$head"
+}
+
+# A branch whose tip is an earlier snapshot of a merged PR has no local proof
+# (the PR landed later work as one squash), but the PR holds its commit and
+# its merge commit is on the base.
+gh_dir=$(_tmpdir)
+pr_repo=$(_github_clone)
+git -C "$pr_repo" switch --quiet -c pr-snapshot
+_commit_file "$pr_repo" p.txt one "early snapshot"
+pr_tip=$(git -C "$pr_repo" rev-parse HEAD)
+git -C "$pr_repo" switch --quiet main
+_commit_file "$pr_repo" p.txt two "land the PR (#7)"
+pr_merge=$(git -C "$pr_repo" rev-parse HEAD)
+git -C "$pr_repo" push --quiet origin main
+printf '[[%s]]\n' "$(_pr_json 7 closed '"2026-01-01T00:00:00Z"' "\"$pr_merge\"")" \
+  >"$gh_dir/commits-$pr_tip.json"
+printf '[[{"sha":"%s"}]]\n' "$pr_tip" >"$gh_dir/members-7.json"
+result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+  git cleanup-repo --porcelain 2>&1)
+_assert_contains "a merged PR containing the tip proves deletion" \
+  $'delete-branch\tpr-snapshot\tmerged-pr\t'"$pr_tip" "$result"
+result=$(git -C "$pr_repo" branch --list pr-snapshot)
+_assert_eq "the merged-PR snapshot branch is deleted" "" "$result"
+
+# The same evidence is withheld when gh fails or the network is off.
+pr_repo=$(_github_clone)
+git -C "$pr_repo" switch --quiet -c pr-snapshot
+_commit_file "$pr_repo" p.txt one "early snapshot"
+pr_tip=$(git -C "$pr_repo" rev-parse HEAD)
+git -C "$pr_repo" switch --quiet main
+_commit_file "$pr_repo" p.txt two "land the PR (#7)"
+pr_merge=$(git -C "$pr_repo" rev-parse HEAD)
+git -C "$pr_repo" push --quiet origin main
+printf '[[%s]]\n' "$(_pr_json 7 closed '"2026-01-01T00:00:00Z"' "\"$pr_merge\"")" \
+  >"$gh_dir/commits-$pr_tip.json"
+printf '[[{"sha":"%s"}]]\n' "$pr_tip" >"$gh_dir/members-7.json"
+result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir FAKE_GH_FAIL=1 \
+  git cleanup-repo 2>&1)
+_assert_contains "a failing gh is no proof" \
+  "keeping pr-snapshot; merge not proven" "$result"
+: >"$gh_dir/calls"
+result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+  git cleanup-repo --no-fetch 2>&1)
+_assert_contains "no-fetch withholds pull request evidence" \
+  "keeping pr-snapshot; merge not proven" "$result"
+_assert_eq "no-fetch never calls gh" "" "$(cat "$gh_dir/calls")"
+
+# A merge commit that is not on the pinned base proves nothing.
+printf '[[%s]]\n' "$(_pr_json 7 closed '"2026-01-01T00:00:00Z"' \
+  '"1111111111111111111111111111111111111111"')" >"$gh_dir/commits-$pr_tip.json"
+result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+  git cleanup-repo 2>&1)
+_assert_contains "a merge commit outside the base is no proof" \
+  "keeping pr-snapshot; merge not proven" "$result"
+
+# An open PR named after the branch protects it, even beside a merged PR.
+printf '[[%s]]\n' "$(_pr_json 7 closed '"2026-01-01T00:00:00Z"' "\"$pr_merge\"")" \
+  >"$gh_dir/commits-$pr_tip.json"
+printf '[[%s]]\n' "$(_pr_json 9 open null null pr-snapshot)" \
+  >"$gh_dir/named-pr-snapshot.json"
+result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+  git cleanup-repo --porcelain 2>&1)
+_assert_contains "an open PR keeps the branch" \
+  $'keep-branch\tpr-snapshot\topen-pr\t9' "$result"
+rm -f "$gh_dir/named-pr-snapshot.json"
+
+# --min-age keeps a young branch proven only by ancestry, which is
+# indistinguishable from a branch just created for new work.
+age_repo=$(_clone_remote)
+git -C "$age_repo" branch fresh-start
+GIT_COMMITTER_DATE="@$(($(date +%s) - 3 * 86400)) +0000" \
+  git -C "$age_repo" branch old-merged
+git -C "$age_repo" switch --quiet -c fresh-squash
+_commit_file "$age_repo" fs.txt fs "fresh squash work"
+git -C "$age_repo" switch --quiet main
+printf '%s\n' fs >"$age_repo/fs.txt"
+git -C "$age_repo" add fs.txt
+git -C "$age_repo" commit --quiet -m "squash fresh work"
+git -C "$age_repo" push --quiet origin main
+result=$(git -C "$age_repo" cleanup-repo --min-age 1 --porcelain 2>&1)
+_assert_contains "min-age keeps a young ancestry-only branch" \
+  $'keep-branch\tfresh-start\ttoo-new\t' "$result"
+_assert_contains "min-age still deletes an old ancestry-only branch" \
+  $'delete-branch\told-merged\tmerged\t' "$result"
+_assert_contains "min-age does not hold back a content proof" \
+  $'delete-branch\tfresh-squash\tcontent-merged\t' "$result"
+result=$(git -C "$age_repo" cleanup-repo --porcelain 2>&1)
+_assert_contains "without min-age a young ancestry-only branch is deleted" \
+  $'delete-branch\tfresh-start\tmerged\t' "$result"
+age_rc=0
+result=$(git -C "$age_repo" cleanup-repo --min-age soon 2>&1) || age_rc=$?
+_assert_eq "a non-numeric min-age is a usage error" 2 "$age_rc"
+for age_bad in 08 010 100000 -1; do
+  age_rc=0
+  result=$(git -C "$age_repo" cleanup-repo --min-age "$age_bad" 2>&1) || age_rc=$?
+  _assert_eq "min-age $age_bad is a usage error" 2 "$age_rc"
+done
+
+# Without a reflog the branch's age is unknown, so min-age keeps it: a new
+# branch on an old commit would otherwise look old.
+noreflog_repo=$(_clone_remote)
+git -C "$noreflog_repo" config core.logAllRefUpdates false
+git -C "$noreflog_repo" branch no-reflog
+rm -f "$(git -C "$noreflog_repo" rev-parse --git-path logs/refs/heads/no-reflog)"
+result=$(git -C "$noreflog_repo" cleanup-repo --min-age 1 --porcelain 2>&1)
+_assert_contains "min-age keeps an ancestry-only branch without a reflog" \
+  $'keep-branch\tno-reflog\ttoo-new\t' "$result"
+
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2
   exit 1

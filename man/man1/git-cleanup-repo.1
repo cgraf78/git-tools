@@ -110,7 +110,11 @@ and Git's final clean check sees untracked files even in a repository that sets
 .BI \-\-worktree " path"
 Remove only this linked worktree; repeat for more. Implies
 .BR \-\-remove\-worktrees .
-A branch checked out in an unlisted worktree is kept.
+A branch checked out in an unlisted worktree is kept. A listed worktree whose
+branch cleanup keeps is still retired, keeping the branch, when its HEAD is
+detached and proven merged, its own-name upstream is gone, or, with
+.BR \-\-include\-closed ,
+only a closed unmerged pull request contains it.
 .TP
 .B \-\-no\-update\-base
 Prove merges against the pinned remote base without creating, switching to, or
@@ -135,6 +139,20 @@ and only diagnostics on standard error.
 Keep a branch proven only by ancestry whose reflog shows it created or moved
 less than this many days ago, or that has no reflog; such a branch looks
 exactly like a fast-forward-merged one. At most 99999.
+.TP
+.BI \-\-retire\-worktree " path"
+Remove this linked worktree; repeat for more. The caller vouches for the
+removal and every removal gate still applies. Its branch is kept unless cleanup
+proves it merged; a branch kept as
+.B open\-pr
+or
+.B too\-new
+keeps the worktree too, and so does a detached HEAD that no branch, remote
+branch, or tag reaches.
+.TP
+.B \-\-include\-closed
+Also retire a selected worktree whose branch only a closed, unmerged pull
+request contains. The branch is kept.
 .TP
 .BR \-n ", " \-\-dry\-run
 Print actions without changing anything.
@@ -199,9 +217,31 @@ or
 .B ref\-delete\-failed
 (detail the proven object ID).
 .TP
+.B keep\-worktree
+The subject is a selected worktree and the code why it stays: the code that
+kept its branch,
+.B merge\-unproven
+(detail the branch),
+.BR current\-worktree ,
+.BR main\-worktree ,
+.BR missing ,
+.BR not\-linked ,
+or
+.B unreachable\-head
+(detail the detached HEAD). Every selected worktree gets exactly one
+.BR remove\-worktree ,
+.BR would\-remove\-worktree ,
+or
+.B keep\-worktree
+record.
+.TP
 .BR remove\-worktree ", " would\-remove\-worktree
 The subject is a worktree path, the code why it goes (its branch's deletion
-code), and the detail its branch.
+code, or a retirement code:
+.BR requested ,
+.BR upstream\-gone ,
+.BR closed\-pr ,
+or a detached HEAD's merge proof), and the detail its branch.
 .TP
 .BR prune\-entry ", " would\-prune\-entry
 The subject is a worktree path and the detail the disposable entry.

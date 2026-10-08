@@ -43,6 +43,12 @@ unset _gt_lib_dir
   GT_CLEANUP_KEEP_DETAIL=""
   GT_CLEANUP_KEEP_WHY=""
 }
+# What the branch pass decided for each scoped worktree it reached, so a
+# caller can give every selected worktree exactly one outcome record.
+_GT_CLEANUP_WT_PATHS=()
+_GT_CLEANUP_WT_OUTCOMES=()
+_GT_CLEANUP_WT_CODES=()
+_GT_CLEANUP_WT_DETAILS=()
 
 # @brief Report one cleanup decision. Callers may redefine this after sourcing.
 # @param $1 Event: keep-branch, delete-branch, remove-worktree, or prune-entry;
@@ -610,6 +616,31 @@ gt_cleanup_in_scope() {
   return 1
 }
 
+_gt_cleanup_note_worktree() {
+  _GT_CLEANUP_WT_PATHS+=("$1")
+  _GT_CLEANUP_WT_OUTCOMES+=("$2")
+  _GT_CLEANUP_WT_CODES+=("$3")
+  _GT_CLEANUP_WT_DETAILS+=("$4")
+}
+
+# @brief Look up what the branch pass decided for a scoped worktree. Sets
+# GT_CLEANUP_WT_OUTCOME (removed or kept), GT_CLEANUP_WT_CODE, and
+# GT_CLEANUP_WT_DETAIL, or fails when the branch pass never reached it.
+gt_cleanup_worktree_outcome() {
+  local path="$1" index=0
+
+  while ((index < ${#_GT_CLEANUP_WT_PATHS[@]})); do
+    if [[ "${_GT_CLEANUP_WT_PATHS[$index]}" == "$path" ]]; then
+      GT_CLEANUP_WT_OUTCOME=${_GT_CLEANUP_WT_OUTCOMES[$index]}
+      GT_CLEANUP_WT_CODE=${_GT_CLEANUP_WT_CODES[$index]}
+      GT_CLEANUP_WT_DETAIL=${_GT_CLEANUP_WT_DETAILS[$index]}
+      return 0
+    fi
+    index=$((index + 1))
+  done
+  return 1
+}
+
 # @brief Release a branch from its worktree when cleanup may remove it.
 # Returns 0 when the branch is not checked out (or no longer will be), and 1
 # after reporting why its checkout keeps it.
@@ -644,6 +675,8 @@ _gt_cleanup_release_branch() {
       "$path" -ef "$GT_CLEANUP_CURRENT_WORKTREE" ]]; then
     gt_cleanup_report keep-branch "$branch" current-worktree "$path" \
       "keeping $branch; checked out in the current worktree"
+    [[ -z "$path" ]] || ! gt_cleanup_in_scope "$path" ||
+      _gt_cleanup_note_worktree "$path" kept current-worktree ""
     return 1
   fi
   [[ -n "$path" ]] || return 0
@@ -652,21 +685,20 @@ _gt_cleanup_release_branch() {
       "checked out in worktree $path"
     return 1
   fi
+  # Each failed step leaves its keep fields set for the report below.
   if ! gt_cleanup_worktree_gate "$path" "$branch" "$branch_oid"; then
-    _gt_cleanup_keep "$branch" "$GT_CLEANUP_KEEP_CODE" \
-      "$GT_CLEANUP_KEEP_DETAIL" "$GT_CLEANUP_KEEP_WHY"
-    return 1
+    :
+  elif ! gt_branch_still_at "$branch" "$branch_oid"; then
+    _gt_cleanup_block branch-changed "$path" "branch changed during cleanup" || :
+  elif gt_cleanup_remove_worktree "$path" "$branch" "$code"; then
+    _gt_cleanup_note_worktree "$path" removed "$code" "$branch"
+    return 0
   fi
-  if ! gt_branch_still_at "$branch" "$branch_oid"; then
-    _gt_cleanup_keep "$branch" branch-changed "$path" \
-      "branch changed during cleanup"
-    return 1
-  fi
-  if ! gt_cleanup_remove_worktree "$path" "$branch" "$code"; then
-    _gt_cleanup_keep "$branch" "$GT_CLEANUP_KEEP_CODE" \
-      "$GT_CLEANUP_KEEP_DETAIL" "$GT_CLEANUP_KEEP_WHY"
-    return 1
-  fi
+  _gt_cleanup_note_worktree "$path" kept "$GT_CLEANUP_KEEP_CODE" \
+    "$GT_CLEANUP_KEEP_DETAIL"
+  _gt_cleanup_keep "$branch" "$GT_CLEANUP_KEEP_CODE" \
+    "$GT_CLEANUP_KEEP_DETAIL" "$GT_CLEANUP_KEEP_WHY"
+  return 1
 }
 
 # @brief Delete a proven branch, removing its eligible worktree first when
@@ -829,3 +861,25 @@ gt_cleanup_pr_lineage() (
     printf 'none\t-\n'
   fi
 )
+
+# @brief Remove one linked worktree while keeping its branch, after the caller
+# has established why it may go (a detached HEAD proven merged, an own-name
+# upstream that is gone, a closed PR, or an explicit request). Every removal
+# gate still applies. On success the removal is reported; on failure the keep
+# fields are set for the caller to report, and it returns 1.
+# @param $1 Worktree path as Git's worktree list records it.
+# @param $2 Branch checked out there, or "" when detached. @param $3 Reason
+# code. @param $4 HEAD OID the reason was proven for; a worktree whose HEAD
+# moved since is kept.
+gt_cleanup_retire_worktree() {
+  local path="$1" branch="$2" code="$3" head_oid="$4" current
+
+  gt_cleanup_worktree_gate "$path" "$branch" "" || return 1
+  current=$(gt_git_without_local_env -C "$path" rev-parse --verify -q \
+    HEAD 2>/dev/null) || current=""
+  if [[ "$current" != "$head_oid" ]]; then
+    _gt_cleanup_block branch-changed "$path" "HEAD changed during cleanup"
+    return 1
+  fi
+  gt_cleanup_remove_worktree "$path" "$branch" "$code"
+}

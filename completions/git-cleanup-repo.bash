@@ -24,13 +24,13 @@ _git_cleanup_repo() {
       COMPREPLY=($(compgen -W "$(_git_cleanup_repo_remotes)" -- "$cur"))
       return
       ;;
-    --worktree)
+    --worktree | --retire-worktree)
       COMPREPLY=($(compgen -d -- "$cur"))
       return
       ;;
   esac
 
-  COMPREPLY=($(compgen -W "-b --base -r --remote --gone -a --all --remove-worktrees --worktree --no-update-base --no-fetch --porcelain --min-age -n --dry-run -h --help" -- "$cur"))
+  COMPREPLY=($(compgen -W "-b --base -r --remote --gone -a --all --remove-worktrees --worktree --no-update-base --no-fetch --porcelain --min-age --retire-worktree --include-closed -n --dry-run -h --help" -- "$cur"))
 }
 
 complete -F _git_cleanup_repo git-cleanup-repo

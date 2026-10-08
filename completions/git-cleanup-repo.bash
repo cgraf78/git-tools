@@ -30,7 +30,7 @@ _git_cleanup_repo() {
       ;;
   esac
 
-  COMPREPLY=($(compgen -W "-b --base -r --remote --gone -a --all --remove-worktrees --worktree --no-update-base --no-fetch --porcelain -n --dry-run -h --help" -- "$cur"))
+  COMPREPLY=($(compgen -W "-b --base -r --remote --gone -a --all --remove-worktrees --worktree --no-update-base --no-fetch --porcelain --min-age -n --dry-run -h --help" -- "$cur"))
 }
 
 complete -F _git_cleanup_repo git-cleanup-repo

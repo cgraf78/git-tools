@@ -360,7 +360,9 @@ full object IDs, types, modes, paths, and deletions, so
 patch-ID-equivalent but byte-distinct content does not count as merged. A
 branch whose complete tree equals a snapshot on the default branch's
 first-parent history also counts as merged (`tree-landed`). These are the
-proofs `git cleanup-repo` uses, so the audit and cleanup agree.
+local proofs `git cleanup-repo` uses. Cleanup can additionally use network
+pull request evidence and an age limit, so it may delete or keep a branch the
+audit reports differently.
 
 The audit only reports. The former `--drop-merged`, `--yes`, and `--dry-run`
 options, which listed cleanup candidates without deleting them, were removed;
@@ -387,7 +389,13 @@ cherry-pick matches retain an exact-current-snapshot check. A branch whose
 complete tree equals some snapshot on the base's first-parent history also
 counts as merged (`tree-landed`): a stacked landing can bring a branch to the
 base through several commits that neither detector matches, yet every byte of
-the branch is then recoverable from mainline history. The complete branch
+the branch is then recoverable from mainline history. When `gh` and `jq` are
+available and the remote is on GitHub, a branch whose tip belongs to a merged
+pull request on the base also counts (`merged-pr`): the PR's own commit list
+must contain the tip and its merge commit must be in the pinned base, so an
+earlier snapshot of a squash-merged PR is recognized. An open PR containing the
+tip, or named after the branch, keeps it (`open-pr`). Missing tools, API
+failures, and `--no-fetch` simply leave this evidence out. The complete branch
 and upstream-state inventory is validated before the first mutation. Each
 candidate is rechecked before deletion, and the ref is deleted only if it still
 has the exact proven OID. Use `--gone` to also select branches whose own
@@ -535,7 +543,7 @@ record per decision on stdout and leaves only diagnostics on stderr:
 
 | Event | Subject | Code | Detail |
 | --- | --- | --- | --- |
-| `delete-branch`, `would-delete-branch` | branch | `merged`, `content-merged`, `tree-landed`, `upstream-gone`, `all` | proven OID |
+| `delete-branch`, `would-delete-branch` | branch | `merged`, `content-merged`, `tree-landed`, `merged-pr`, `upstream-gone`, `all` | proven OID |
 | `keep-branch` | branch | see below | see below |
 | `remove-worktree`, `would-remove-worktree` | worktree path | its branch's deletion code | branch |
 | `prune-entry`, `would-prune-entry` | worktree path | `disposable` | entry name |
@@ -545,6 +553,8 @@ record per decision on stdout and leaves only diagnostics on stderr:
 | Code | Detail | Meaning |
 | --- | --- | --- |
 | `merge-unproven` | `upstream-gone`, `other-upstream-gone`, `upstream`, or `no-upstream` | no proof; the detail is the upstream state |
+| `open-pr` | PR number | an open pull request contains the tip or is named after the branch |
+| `too-new` | reflog time, or empty without a reflog | proven only by ancestry, but younger than `--min-age` |
 | `current-worktree` | worktree path | checked out in the checkout cleanup runs from |
 | `checked-out` | worktree path | checked out in a worktree cleanup may not remove |
 | `main-worktree`, `locked`, `dirty`, `hidden` | worktree path | that worktree must stay |
@@ -565,6 +575,11 @@ incomplete.
 ```sh
 git cleanup-repo --no-update-base --porcelain --worktree ../old-feature
 ```
+
+`--min-age <days>` keeps a branch proven only by ancestry whose reflog shows it
+created or moved more recently than that, or that has no reflog: a branch with
+no commits of its own looks exactly like one that was fast-forward merged, and
+without a reflog its age is unknown.
 
 Unless `--no-update-base` is given, the command refuses to run with a dirty
 current worktree or an active rebase/merge/cherry-pick/revert. Git cannot atomically combine worktree

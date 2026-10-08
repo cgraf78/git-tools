@@ -673,10 +673,11 @@ _gt_cleanup_release_branch() {
 # GT_CLEANUP_REMOVE_WORKTREES allows. The ref is deleted only while it still
 # holds the proven OID and no worktree has claimed it in the meantime.
 # @param $1 Branch. @param $2 Proven tip OID. @param $3 Proof reason code:
-#   merged, content-merged, tree-landed, upstream-gone, or all.
+#   merged, content-merged, tree-landed, merged-pr, upstream-gone, or all.
+# @param $4 Optional human label for the reason; defaults to the code.
 # Returns 0 when the branch was deleted (or would be in a dry run).
 gt_cleanup_retire_branch() {
-  local branch="$1" branch_oid="$2" code="$3" reason
+  local branch="$1" branch_oid="$2" code="$3" reason="${4:-}"
 
   _gt_cleanup_release_branch "$branch" "$branch_oid" "$code" || return 1
 
@@ -696,8 +697,10 @@ gt_cleanup_retire_branch() {
     return 1
   fi
 
-  reason=$code
-  [[ "$code" != upstream-gone ]] || reason="upstream gone"
+  if [[ -z "$reason" ]]; then
+    reason=$code
+    [[ "$code" != upstream-gone ]] || reason="upstream gone"
+  fi
   if [[ "$GT_CLEANUP_DRY_RUN" == 1 ]]; then
     gt_cleanup_report would-delete-branch "$branch" "$code" "$branch_oid" \
       "would delete $branch at $branch_oid ($reason)"
@@ -711,3 +714,118 @@ gt_cleanup_retire_branch() {
     return 1
   fi
 }
+
+# @brief Print `<kind> TAB <number>` for the GitHub pull request evidence about
+# an exact commit on a repository's base branch: open (a PR still under review
+# contains it, or an open PR is named after the branch), merged (a merged PR
+# contains it and its merge commit is in the pinned base), closed (only a closed,
+# unmerged PR contains it), or none after a complete observation. Prints nothing
+# and fails on any tool, transport, paging, or shape problem: missing evidence
+# is never proof. Membership is checked against the PR's own commit list, so a
+# commit that merely shares a branch name proves nothing.
+# @param $1 GitHub host. @param $2 owner/repository. @param $3 Branch name.
+# @param $4 Commit OID. @param $5 Pinned base OID. @param $6 Base branch name.
+gt_cleanup_pr_lineage() (
+  local host="$1" repo="$2" branch="$3" target_oid="$4" base_oid="$5" ref="$6"
+  local owner named associated pages candidates number state merged merge_oid
+  local members verified merged_number='' closed_number='' open_number=''
+  export LC_ALL=C
+
+  command -v gh >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ $target_oid =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ &&
+    $base_oid =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || return 1
+  [[ $repo =~ ^[a-z0-9][a-z0-9-]*/[a-z0-9._-]+$ ]] || return 1
+  [[ -n "$host" && -n "$branch" && -n "$ref" ]] || return 1
+  owner=${repo%%/*}
+  # Ambient GH_REPO and GH_HOST must not redirect any query.
+  unset GH_REPO GH_HOST
+
+  # gh must finish every page before any record is considered.
+  if ! associated=$(gh api --hostname "$host" --paginate --slurp \
+    "repos/$repo/commits/$target_oid/pulls" 2>/dev/null); then
+    # An unpublished local commit has no server object. That endpoint's
+    # structured 422 response still permits the branch-name observation;
+    # any other failure withholds evidence. Never parse error prose.
+    jq -se 'length == 1 and (.[0] | type == "array" and length == 1
+      and (.[0] | type == "object" and (.status == "422" or .status == 422)
+        and .errors == null))' <<<"$associated" >/dev/null 2>&1 || return 1
+    associated='[[]]'
+  fi
+  named=$(gh api --hostname "$host" --method GET --paginate --slurp \
+    "repos/$repo/pulls" -f state=all -f "head=$owner:$branch" \
+    -f per_page=100 2>/dev/null) || return 1
+  named=$(jq -sce --arg repo "$repo" --arg branch "$branch" '
+    if length != 1 then error("response") else .[0] end
+    | if type != "array" or any(.[]; type != "array") then error("pages") else . end
+    | add // []
+    | if any(.[]; type != "object" or (.head.ref | type != "string") or
+        (.head.repo.full_name | type != "string")) then error("head shape") else . end
+    | [.[] | select(.head.ref == $branch and
+        (.head.repo.full_name | ascii_downcase) == $repo)]
+    | [.]
+  ' <<<"$named" 2>/dev/null) || return 1
+  pages=$(jq -sc --argjson named "$named" '
+    if length != 1 or (.[0] | type != "array" or any(.[]; type != "array"))
+    then error("pages") else .[0] + $named end
+  ' <<<"$associated" 2>/dev/null) || return 1
+  candidates=$(jq --slurp --raw-output --arg repo "$repo" --arg ref "$ref" '
+    if length != 1 then error("response") else .[0] end
+    | if type != "array" or any(.[]; type != "array") then error("pages") else . end
+    | add // []
+    | if any(.[]; type != "object" or
+        (.number | type != "number") or .number < 1 or (.number | floor) != .number or
+        (.state != "open" and .state != "closed") or
+        (.base.ref | type != "string") or (.base.repo.full_name | type != "string") or
+        (.merged_at != null and (.merged_at | type != "string")) or
+        (.merge_commit_sha != null and (.merge_commit_sha | type != "string")))
+      then error("pull request shape") else . end
+    | unique_by(.number) | .[]
+    | select((.base.repo.full_name | ascii_downcase) == $repo and .base.ref == $ref)
+    | [.number, .state, (.merged_at != null), (.merge_commit_sha // "-")] | @tsv
+  ' <<<"$pages" 2>/dev/null) || return 1
+  while IFS=$'\t' read -r number state merged merge_oid; do
+    [[ -n $number ]] || continue
+    # An open PR on the branch itself protects later unpublished local work.
+    # Associated PRs on other branches still require exact membership below.
+    if [[ $state == open ]] && jq -e --argjson number "$number" \
+      'any(.[][]; .number == $number)' <<<"$named" >/dev/null 2>&1; then
+      open_number=$number
+      continue
+    fi
+    members=$(gh api --hostname "$host" --paginate --slurp \
+      "repos/$repo/pulls/$number/commits" 2>/dev/null) || return 1
+    verified=$(jq --slurp --exit-status --raw-output --arg oid "$target_oid" '
+      if length != 1 then error("response") else .[0] end
+      | if type != "array" or any(.[]; type != "array") then error("pages") else . end
+      | add // []
+      | if any(.[]; type != "object" or (.sha | type != "string") or
+          (.sha | test("^([0-9a-f]{40}|[0-9a-f]{64})$") | not)) then error("commit shape") else . end
+      | any(.[]; .sha == $oid) | tostring
+    ' <<<"$members" 2>/dev/null) || return 1
+    [[ $verified == true ]] || continue
+    if [[ $state == open ]]; then
+      open_number=$number
+    elif [[ $merged == true ]]; then
+      # A server merge record proves landing only on this pinned local base.
+      # Never fetch an unknown merge or substitute the current remote head.
+      if [[ $merge_oid =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] &&
+        git merge-base --is-ancestor "$merge_oid" "$base_oid" 2>/dev/null; then
+        merged_number=$number
+      fi
+    else
+      closed_number=$number
+    fi
+  done <<<"$candidates"
+  # An exact commit still under review in another PR is live work even if an
+  # earlier PR landed it, so an open PR outranks every other observation.
+  if [[ -n $open_number ]]; then
+    printf 'open\t%s\n' "$open_number"
+  elif [[ -n $merged_number ]]; then
+    printf 'merged\t%s\n' "$merged_number"
+  elif [[ -n $closed_number ]]; then
+    printf 'closed\t%s\n' "$closed_number"
+  else
+    printf 'none\t-\n'
+  fi
+)

@@ -40,8 +40,28 @@ Options:
       --gone                Select branches whose own-name upstream is gone.
   -a, --all                 Delete all local branches except the base branch.
       --remove-worktrees    Remove eligible linked worktrees for deleted branches.
+      --worktree <path>     Remove only this linked worktree (repeatable);
+                            implies --remove-worktrees.
+      --no-update-base      Prove against the remote base without changing the
+                            local base or the current checkout.
+      --no-fetch            Prove against the remote-tracking base ref instead
+                            of fetching it.
+      --porcelain           Print one tab-separated record per decision on
+                            stdout instead of messages on stderr.
   -n, --dry-run             Print actions without changing anything.
   -h, --help                Show this help.
+
+Porcelain records are <event> TAB <subject> TAB <code> TAB <detail>. Events:
+delete-branch, keep-branch, remove-worktree, and prune-entry, with
+would-delete-branch, would-remove-worktree, and would-prune-entry in a dry
+run. Backslash, tab, and newline in a field are written as \\, \t, and \n.
+Worktree subjects are the paths Git's worktree list records.
+
+Exit status:
+  0  Cleanup ran; every decision was reported, including kept branches and
+     failed removals.
+  2  Usage, repository, or remote error; records already printed may be
+     incomplete.
 EOF
 }
 
@@ -78,6 +98,9 @@ _ensure_repo_ready() {
     _die "could not inspect repository type"
   [[ "$bare" == "false" ]] ||
     _die "bare repositories are not supported"
+  # Operation state and a clean worktree only protect the base switch and
+  # fast-forward; without a base update nothing touches the invoking checkout.
+  [[ "$_sync_base" == 1 ]] || return 0
 
   for state in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
     state_rc=0
@@ -173,8 +196,26 @@ _enable_dry_object_store() {
   fi
 }
 
+# Without a fetch, prove against the remote-tracking ref as of the last fetch.
+# A stale ref can only be older than the remote, which keeps more branches.
+_use_tracking_base() {
+  local status=0
+
+  gt_find_ref_commit "refs/remotes/$_remote/$_base" || status=$?
+  case "$status" in
+    0) _remote_oid=$GT_REF_OID ;;
+    1) _die "remote-tracking base does not exist: $_remote/$_base" ;;
+    *) _die "could not inspect remote-tracking base: $_remote/$_base" ;;
+  esac
+}
+
 _pin_remote_base() {
   local record status=0 oid ref extra resolved
+
+  if [[ "$_fetch" == 0 ]]; then
+    _use_tracking_base
+    return 0
+  fi
 
   record=$(git ls-remote --exit-code -- "$_remote_url" \
     "refs/heads/$_base" 2>/dev/null) || status=$?
@@ -532,16 +573,18 @@ _cleanup_branches() {
       # cleanup fetches only the base, so say so rather than claim it is live.
       if gt_own_upstream_gone "$branch" "$upstream_track" "$remote_name" \
         "$remote_ref"; then
-        _say "keeping $branch; $unproven; upstream is gone;" \
-          "--gone selects it for cleanup"
+        gt_cleanup_report keep-branch "$branch" merge-unproven upstream-gone \
+          "keeping $branch; $unproven; upstream is gone; --gone selects it for cleanup"
       elif [[ "$upstream_track" == "[gone]" ]]; then
-        _say "keeping $branch; $unproven; upstream $upstream is gone," \
-          "but it is not this branch's own remote branch"
+        gt_cleanup_report keep-branch "$branch" merge-unproven \
+          other-upstream-gone \
+          "keeping $branch; $unproven; upstream $upstream is gone, but it is not this branch's own remote branch"
       elif [[ -n "$upstream" ]]; then
-        _say "keeping $branch; $unproven; upstream $upstream still" \
-          "exists as of the last fetch"
+        gt_cleanup_report keep-branch "$branch" merge-unproven upstream \
+          "keeping $branch; $unproven; upstream $upstream still exists as of the last fetch"
       else
-        _say "keeping $branch; $unproven; no upstream is configured"
+        gt_cleanup_report keep-branch "$branch" merge-unproven no-upstream \
+          "keeping $branch; $unproven; no upstream is configured"
       fi
       skipped=$((skipped + 1))
       continue
@@ -565,7 +608,8 @@ _cleanup_branches() {
   # the local base was left behind the remote, so it is not taken as current.
   [[ -z "$_base_skip_reason" ]] ||
     summary="$summary; $_base not updated ($_base_skip_reason)"
-  _say "$summary"
+  # Porcelain callers tally the records themselves.
+  [[ "$_porcelain" == 1 ]] || _say "$summary"
 }
 
 _parse_args() {
@@ -575,6 +619,10 @@ _parse_args() {
   _gone=0
   _dry_run=0
   _remove_worktrees=0
+  _sync_base=1
+  _fetch=1
+  _porcelain=0
+  _worktree_scope=()
 
   while (($#)); do
     case "$1" in
@@ -614,6 +662,32 @@ _parse_args() {
         _remove_worktrees=1
         shift
         ;;
+      --worktree)
+        shift
+        (($#)) || _die "--worktree requires a value"
+        [[ -n "$1" ]] || _die "--worktree requires a value"
+        _worktree_scope+=("$1")
+        _remove_worktrees=1
+        shift
+        ;;
+      --worktree=*)
+        [[ -n "${1#--worktree=}" ]] || _die "--worktree requires a value"
+        _worktree_scope+=("${1#--worktree=}")
+        _remove_worktrees=1
+        shift
+        ;;
+      --no-update-base)
+        _sync_base=0
+        shift
+        ;;
+      --no-fetch)
+        _fetch=0
+        shift
+        ;;
+      --porcelain)
+        _porcelain=1
+        shift
+        ;;
       -n | --dry-run)
         _dry_run=1
         shift
@@ -633,18 +707,76 @@ _parse_args() {
   done
 }
 
+# Map each --worktree argument to the path Git's worktree list records for it,
+# once, so a relative, trailing-slash, or symlinked spelling selects exactly
+# that worktree and records name it the same way Git does. An argument that
+# names no linked worktree of this repository selects nothing.
+_resolve_worktree_scope() {
+  local arg field path matched resolved
+  local -a scope=()
+
+  _unmatched_scope=()
+  ((${#_worktree_scope[@]} > 0)) || return 0
+  gt_find_main_worktree || _die "could not inspect worktrees"
+  for arg in "${_worktree_scope[@]}"; do
+    matched=""
+    for field in ${_GT_WORKTREE_FIELDS[@]+"${_GT_WORKTREE_FIELDS[@]}"}; do
+      case "$field" in
+        "worktree "*) path=${field#worktree } ;;
+        *) continue ;;
+      esac
+      if [[ "$path" == "$arg" || "$path" -ef "$arg" ]]; then
+        matched=$path
+        break
+      fi
+    done
+    if [[ -z "$matched" ]]; then
+      _unmatched_scope+=("$arg")
+      continue
+    fi
+    for resolved in ${scope[@]+"${scope[@]}"}; do
+      [[ "$resolved" != "$matched" ]] || continue 2
+    done
+    scope+=("$matched")
+  done
+  # shellcheck disable=SC2034 # read by lib/git-tools-cleanup.sh
+  GT_CLEANUP_WORKTREE_SCOPE=(${scope[@]+"${scope[@]}"})
+  # Every argument named nothing: select nothing rather than everything.
+  ((${#scope[@]} > 0)) || GT_CLEANUP_REMOVE_WORKTREES=0
+}
+
+# Escape a porcelain field so a path can never forge a field or record break.
+_porcelain_field() {
+  local value="$1"
+
+  value=${value//\\/\\\\}
+  value=${value//$'\t'/\\t}
+  value=${value//$'\n'/\\n}
+  printf '%s' "$value"
+}
+
 _base_skip_reason=""
 _parse_args "$@"
 # shellcheck disable=SC2034 # read by lib/git-tools-cleanup.sh
 GT_CLEANUP_DRY_RUN=$_dry_run
 # shellcheck disable=SC2034 # read by lib/git-tools-cleanup.sh
 GT_CLEANUP_REMOVE_WORKTREES=$_remove_worktrees
+if [[ "$_porcelain" == 1 ]]; then
+  # shellcheck disable=SC2034 # read by lib/git-tools-cleanup.sh
+  GT_CLEANUP_ECHO_DRY_RUN=0
+  # Records go to stdout, one per decision; diagnostics stay on stderr.
+  gt_cleanup_report() {
+    printf '%s\t%s\t%s\t%s\n' "$1" "$(_porcelain_field "$2")" "$3" \
+      "$(_porcelain_field "$4")"
+  }
+fi
 _ensure_repo_ready
 if [[ "$_remove_worktrees" == 1 ]]; then
   gt_cleanup_load_prune_paths || _die "$GT_CLEANUP_ERROR"
 fi
 _resolve_remote
 _locate_worktrees
+_resolve_worktree_scope
 
 # A non-writing hash probe detects the native SHA width without requiring the
 # newer rev-parse --show-object-format option.
@@ -660,5 +792,10 @@ esac
 _base=$(_default_branch)
 git check-ref-format --branch "$_base" >/dev/null 2>&1 ||
   _die "invalid base branch name: $_base"
-_update_base
+if [[ "$_sync_base" == 1 ]]; then
+  _update_base
+else
+  _pin_remote_base
+  _base_oid=$_remote_oid
+fi
 _cleanup_branches

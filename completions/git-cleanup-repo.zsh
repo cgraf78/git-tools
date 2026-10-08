@@ -20,6 +20,10 @@ _git_cleanup_repo() {
     '--gone[Select branches whose own-name upstream is gone]' \
     '(-a --all)'{-a,--all}'[Delete all local branches except the base branch]' \
     '--remove-worktrees[Remove eligible linked worktrees for deleted branches]' \
+    '*--worktree[Remove only this linked worktree]:worktree:_files -/' \
+    '--no-update-base[Prove against the remote base without changing the local base]' \
+    '--no-fetch[Prove against the remote-tracking base ref instead of fetching]' \
+    '--porcelain[Print one tab-separated record per decision]' \
     '(-n --dry-run)'{-n,--dry-run}'[Print deletion actions without changing anything]' \
     '(-h --help)'{-h,--help}'[Show help]'
 }

@@ -517,8 +517,57 @@ git cleanup-repo --base main
 git cleanup-repo --remote upstream
 ```
 
-The command refuses to run with a dirty current worktree or an active
-rebase/merge/cherry-pick/revert. Git cannot atomically combine worktree
+Other tools can drive cleanup without changing the checkout they run from.
+`--no-update-base` proves merges against the pinned remote base but leaves the
+local base, the current branch, and a dirty or mid-operation current checkout
+alone. `--no-fetch` proves against the existing `<remote>/<base>`
+remote-tracking ref as of the last fetch, without network access. A ref that
+is merely behind keeps more branches, but if the remote base was rewound since,
+the ref can still contain commits the remote dropped, so prefer a fetching run
+when the base may have been rewritten. `--worktree <path>` (repeatable, implies `--remove-worktrees`) limits
+removal to the listed linked worktrees, so a caller can apply its own policy,
+such as an age limit, to which checkouts may go. `--porcelain` prints one
+record per decision on stdout and leaves only diagnostics on stderr:
+
+```text
+<event> TAB <subject> TAB <code> TAB <detail>
+```
+
+| Event | Subject | Code | Detail |
+| --- | --- | --- | --- |
+| `delete-branch`, `would-delete-branch` | branch | `merged`, `content-merged`, `tree-landed`, `upstream-gone`, `all` | proven OID |
+| `keep-branch` | branch | see below | see below |
+| `remove-worktree`, `would-remove-worktree` | worktree path | its branch's deletion code | branch |
+| `prune-entry`, `would-prune-entry` | worktree path | `disposable` | entry name |
+
+`keep-branch` codes, with their detail:
+
+| Code | Detail | Meaning |
+| --- | --- | --- |
+| `merge-unproven` | `upstream-gone`, `other-upstream-gone`, `upstream`, or `no-upstream` | no proof; the detail is the upstream state |
+| `current-worktree` | worktree path | checked out in the checkout cleanup runs from |
+| `checked-out` | worktree path | checked out in a worktree cleanup may not remove |
+| `main-worktree`, `locked`, `dirty`, `hidden` | worktree path | that worktree must stay |
+| `operation` | operation name | the worktree has an active rebase, merge, or similar |
+| `in-use` | process ID | a process's working directory is in the worktree |
+| `uninspectable` | worktree path or empty | Git or the process view could not be read |
+| `branch-changed`, `reserved` | path or empty | the branch moved or was checked out during cleanup |
+| `prune-failed`, `remove-failed` | worktree path | the worktree could not be removed safely |
+| `ref-delete-failed` | proven OID | the exact ref deletion failed |
+
+Worktree subjects are the paths Git's worktree list records, and
+`--worktree` arguments are matched to those paths. Backslash, tab, and newline
+inside a field are written as `\\`, `\t`, and `\n`. Exit status 0 means
+every decision was reported, including kept branches and failed removals; 2
+means a usage, repository, or remote error, after which printed records may be
+incomplete.
+
+```sh
+git cleanup-repo --no-update-base --porcelain --worktree ../old-feature
+```
+
+Unless `--no-update-base` is given, the command refuses to run with a dirty
+current worktree or an active rebase/merge/cherry-pick/revert. Git cannot atomically combine worktree
 reservation checks with ref deletion, so do not create, switch, or mutate
 worktrees concurrently with cleanup. The command rechecks observable state and
 uses expected-old-OID ref deletion to preserve a branch that advances during

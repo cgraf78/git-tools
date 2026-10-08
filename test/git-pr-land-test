@@ -456,12 +456,12 @@ _assert_eq "uses squash merge without unleased server deletion" \
   "$(cat "$log")"
 _assert_eq "syncs base branch" "main" "$(git -C "$repo" branch --show-current)"
 if git -C "$repo" show-ref --verify --quiet refs/heads/feature; then
-  _pass "preserves local feature branch for manual cleanup"
+  _fail "deletes the landed local feature branch"
 else
-  _fail "preserves local feature branch for manual cleanup"
+  _pass "deletes the landed local feature branch"
 fi
-_assert_contains "reports manual local cleanup" \
-  "preserving local PR head feature at " \
+_assert_contains "reports the landed local branch deletion" \
+  "deleting feature (merged in PR #4)" \
   "$result"
 if git -C "$remote" show-ref --verify --quiet refs/heads/feature; then
   _pass "preserves remote feature branch for manual cleanup"
@@ -916,8 +916,9 @@ _assert_eq "in-flight checkout completes" "0" "$(cat "$checkout_state/switch.rc"
 _assert_eq "in-flight checkout retains a resolvable HEAD" \
   "$(git -C "$checkout_repo" rev-parse refs/heads/feature)" \
   "$(git -C "$checkout_worktree" rev-parse HEAD)"
-_assert_contains "in-flight checkout reports local preservation" \
-  "preserving local PR head feature" "$checkout_output"
+_assert_contains "in-flight checkout keeps the landed branch" \
+  "skipping feature; a checkout may be in progress (lock $(cd -P -- "$checkout_repo/.git" && pwd -P)/worktrees/" \
+  "$checkout_output"
 
 repo_keep=$(_tmpdir)
 remote_keep=$(_tmpdir)
@@ -1131,10 +1132,12 @@ result=$(GH_PR_CASE=checkout-head-after-merge GH_TEST_REPO="$repo_race" \
   _pr_land "$repo_race" 4 2>&1)
 rc=$?
 _assert_eq "checkout race: landing remains successful" "0" "$rc"
-_assert_contains "checkout race: reports local preservation" \
-  "preserving local PR head feature at " "$result"
-_assert_eq "checkout race: linked worktree retains feature" "feature" \
-  "$(git -C "$feature_race" branch --show-current)"
+# A clean linked worktree holding the landed head goes with the branch, behind
+# the same gates git cleanup-repo applies.
+_assert_contains "checkout race: removes the clean linked worktree" \
+  "removed worktree $feature_race" "$result"
+_assert_contains "checkout race: deletes the landed branch" \
+  "deleting feature (merged in PR #4)" "$result"
 
 repo_advance=$(_tmpdir)
 remote_advance=$(_tmpdir)
@@ -1179,9 +1182,83 @@ _assert_contains "advanced remote head: reports manual cleanup" \
   "delete it manually after verifying no pull request consumes it" "$result"
 _assert_eq "advanced remote head: preserves concurrent commit" "$remote_feature_after" \
   "$(git -C "$remote_remote_advance" rev-parse refs/heads/feature)"
-_assert_eq "advanced remote head: preserves local branch" \
-  "feature" \
+# The local head still equals what landed, so it goes; the remote's newer
+# commit stays on the remote.
+_assert_eq "advanced remote head: deletes the landed local branch" \
+  "" \
   "$(git -C "$repo_remote_advance" branch --format='%(refname:short)' --list feature)"
+
+# --keep-branch keeps the landed local head; so does a local head with commits
+# the landed head does not have, and the current worktree's own branch.
+repo_kept=$(_tmpdir)
+remote_kept=$(_tmpdir)
+log_kept=$(_tmpdir)/gh.log
+_init_repo "$repo_kept" "$remote_kept"
+result=$(GH_LOG="$log_kept" PATH="$bin_dir:$PATH" _pr_land "$repo_kept" 4 --keep-branch 2>&1)
+_assert_contains "keep-branch reports the kept local head" \
+  "preserving local PR head feature at $(git -C "$repo_kept" rev-parse refs/heads/feature); --keep-branch was given" \
+  "$result"
+
+repo_linked_land=$(_tmpdir)
+remote_linked_land=$(_tmpdir)
+log_linked_land=$(_tmpdir)/gh.log
+linked_land_dir=$(_tmpdir)
+rm -rf "$linked_land_dir"
+_init_repo "$repo_linked_land" "$remote_linked_land"
+git -C "$repo_linked_land" switch --quiet main
+git -C "$repo_linked_land" worktree add --quiet "$linked_land_dir" feature
+result=$(GH_LOG="$log_linked_land" PATH="$bin_dir:$PATH" \
+  _pr_land "$linked_land_dir" 4 2>&1)
+_assert_contains "landing from the head's own worktree keeps that branch" \
+  "keeping feature; checked out in the current worktree" "$result"
+_assert_eq "landing from the head's own worktree keeps it on disk" present \
+  "$(if [[ -d "$linked_land_dir" ]]; then printf present; else printf missing; fi)"
+
+repo_dirty_land=$(_tmpdir)
+remote_dirty_land=$(_tmpdir)
+log_dirty_land=$(_tmpdir)/gh.log
+dirty_land_dir=$(_tmpdir)
+rm -rf "$dirty_land_dir"
+_init_repo "$repo_dirty_land" "$remote_dirty_land"
+git -C "$repo_dirty_land" switch --quiet main
+git -C "$repo_dirty_land" worktree add --quiet "$dirty_land_dir" feature
+printf 'local notes\n' >"$dirty_land_dir/notes.txt"
+result=$(GH_LOG="$log_dirty_land" PATH="$bin_dir:$PATH" \
+  _pr_land "$repo_dirty_land" 4 2>&1)
+_assert_contains "a worktree with local content keeps the landed branch" \
+  "skipping feature; worktree has hidden local content: $dirty_land_dir" "$result"
+_assert_eq "a worktree with local content keeps its files" "local notes" \
+  "$(cat "$dirty_land_dir/notes.txt" 2>/dev/null)"
+
+# An older local head lost nothing to the landing, but only a branch that
+# tracks the PR head is that PR's earlier snapshot; a same-named branch that
+# does not (another fork's PR, a new local branch) is left alone.
+repo_older=$(_tmpdir)
+remote_older=$(_tmpdir)
+log_older=$(_tmpdir)/gh.log
+_init_repo "$repo_older" "$remote_older"
+git -C "$repo_older" switch --quiet main
+git -C "$repo_older" branch --quiet -f feature main
+result=$(GH_PR_HEAD_OID=$(git -C "$repo_older" rev-parse refs/remotes/origin/feature) \
+GH_LOG="$log_older" PATH="$bin_dir:$PATH" _pr_land "$repo_older" 4 2>&1)
+_assert_contains "an older local head tracking the PR head is deleted" \
+  "deleting feature (merged in PR #4)" "$result"
+
+repo_untracked=$(_tmpdir)
+remote_untracked=$(_tmpdir)
+log_untracked=$(_tmpdir)/gh.log
+_init_repo "$repo_untracked" "$remote_untracked"
+git -C "$repo_untracked" switch --quiet main
+git -C "$repo_untracked" branch --quiet -f feature main
+git -C "$repo_untracked" branch --quiet --unset-upstream feature
+untracked_oid=$(git -C "$repo_untracked" rev-parse refs/heads/feature)
+result=$(GH_PR_HEAD_OID=$(git -C "$repo_untracked" rev-parse refs/remotes/origin/feature) \
+GH_LOG="$log_untracked" PATH="$bin_dir:$PATH" _pr_land "$repo_untracked" 4 2>&1)
+_assert_contains "an older same-named head that does not track the PR is kept" \
+  "preserving local PR head feature at $untracked_oid; it is older than the landed head" \
+  "$result"
+_assert_eq "an untracked same-named head survives" "$untracked_oid" \
+  "$(git -C "$repo_untracked" rev-parse refs/heads/feature)"
 
 # A PR whose structured head OID is absent from the live remote must fail before
 # merge. There is no exact commit to pin or a safe cleanup snapshot to take.

@@ -44,9 +44,9 @@ _snapshot_tool_dir() {
   cp "$_root/bin/git-pr-land" "$_tool_tmp/bin/git-pr-land"
   cp "$_root/bin/git-pr-restack" "$_tool_tmp/bin/git-pr-restack"
   cp "$_root/bin/git-pr-stack" "$_tool_tmp/bin/git-pr-stack"
-  cp "$_root/lib/git-tools-base.sh" "$_tool_tmp/lib/git-tools-base.sh"
-  cp "$_root/lib/git-tools-git.sh" "$_tool_tmp/lib/git-tools-git.sh"
-  cp "$_root/lib/git-tools-pr.sh" "$_tool_tmp/lib/git-tools-pr.sh"
+  # Every library, so a helper a snapshotted tool starts sourcing can never be
+  # missing from the copy.
+  cp "$_root"/lib/*.sh "$_tool_tmp/lib/"
   _tool_dir="$_tool_tmp/bin"
 }
 
@@ -59,9 +59,11 @@ _usage() {
 Usage: git pr-land-stack [options] <number|url|branch>
 
 Land a linear stack of ready GitHub PRs from parent to child. The command is a
-thin orchestrator over git pr-stack, git pr-land, and git pr-restack. Local and
-remote PR heads are reported for manual cleanup and are never deleted
-automatically.
+thin orchestrator over git pr-stack, git pr-land, and git pr-restack. Parents
+keep their local heads for the next restack; the final PR's local head is
+deleted as git pr-land would. Run git cleanup-repo afterward to remove the
+landed parents.
+Remote PR heads are reported for manual cleanup and are never deleted.
 
 Options:
   -m, --method <method>   Merge method: squash, merge, or rebase (default: squash).

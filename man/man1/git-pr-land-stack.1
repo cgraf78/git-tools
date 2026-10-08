@@ -37,7 +37,15 @@ fork boundary. The rewritten child OID is accepted only when a fresh PR record
 matches the local branch. Retargeting during discovery, a parent action, or
 readiness polling fails closed.
 .PP
-Local and remote heads are retained for manual cleanup. Stack topology is
+Each parent is landed with
+.B \-\-keep\-branch
+because the next restack still needs its head; the final pull request's local
+head is deleted as
+.BR git-pr-land (1)
+would; run
+.BR git-cleanup-repo (1)
+afterward to remove the landed parents. Remote heads are retained for manual
+cleanup. Stack topology is
 repository-qualified, so a
 same-named fork head is not treated as a base-repository parent. Cycles and
 ambiguous same-repository parents fail closed.

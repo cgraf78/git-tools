@@ -18,7 +18,9 @@ first-parent history. Its first-parent-to-commit delta must exactly match the
 branch's net delta; this includes transitions introduced by merge commits.
 Later mainline edits do not erase that historical proof; byte, mode, path,
 deletion, or gitlink differences still reject it. Multi-commit rebase and cherry-pick
-matches retain an exact-current-snapshot check. Branch and upstream-state
+matches retain an exact-current-snapshot check. A branch whose complete tree
+equals a snapshot on the base's first-parent history also counts as merged,
+which covers stacked landings that neither detector matches. Branch and upstream-state
 enumeration must complete and validate before the first deletion. Each
 candidate is rechecked, and its ref is deleted only if it still has the exact
 proven object ID. It can also select branches whose own-name remote branch is
@@ -95,7 +97,9 @@ Remove eligible, operation-free linked worktrees for branches selected for
 deletion. The current worktree and the main worktree are never removed, so a
 branch still checked out in either after the base update is kept. Removal never
 uses
-.BR \-\-force .
+.BR \-\-force ,
+and Git's final clean check sees untracked files even in a repository that sets
+.BR status.showUntrackedFiles=no .
 .TP
 .BR \-n ", " \-\-dry\-run
 Print actions without changing anything.

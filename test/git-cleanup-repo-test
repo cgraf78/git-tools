@@ -461,6 +461,67 @@ _assert_contains "default deletes squash-merged branches" \
   "deleting squashed (content-merged)" "$result"
 _assert_eq "squash-merged branch is deleted" "main" "$(_branches "$squash_repo")"
 
+# A stacked landing can bring a branch's complete tree to the base through
+# several mainline commits. Neither the squash detector (no single matching
+# transition) nor the replay detector (the first step never landed alone) can
+# prove it, but every byte of the branch is a mainline snapshot.
+tree_repo=$(_clone_remote)
+git -C "$tree_repo" switch --quiet -c stacked
+_commit_file "$tree_repo" a.txt one "stacked a draft"
+_commit_file "$tree_repo" a.txt two "stacked a final"
+_commit_file "$tree_repo" b.txt b "stacked b"
+git -C "$tree_repo" switch --quiet main
+_commit_file "$tree_repo" a.txt two "land a (#1)"
+_commit_file "$tree_repo" b.txt b "land b (#2)"
+git -C "$tree_repo" push --quiet origin main
+result=$(git -C "$tree_repo" cleanup-repo 2>&1)
+_assert_contains "deletes a branch whose whole tree landed on the base" \
+  "deleting stacked (tree-landed)" "$result"
+_assert_eq "tree-landed branch is deleted" main "$(_branches "$tree_repo")"
+
+# A branch that differs from every mainline snapshot by one byte is not proven.
+tree_near_repo=$(_clone_remote)
+git -C "$tree_near_repo" switch --quiet -c almost
+_commit_file "$tree_near_repo" a.txt one "almost a draft"
+_commit_file "$tree_near_repo" a.txt two "almost a final"
+_commit_file "$tree_near_repo" b.txt b "almost b"
+git -C "$tree_near_repo" switch --quiet main
+_commit_file "$tree_near_repo" a.txt two "land a (#1)"
+_commit_file "$tree_near_repo" b.txt c "land other b (#2)"
+git -C "$tree_near_repo" push --quiet origin main
+result=$(git -C "$tree_near_repo" cleanup-repo 2>&1)
+_assert_contains "keeps a branch whose tree never appeared on the base" \
+  "keeping almost; merge not proven" "$result"
+
+# A matching mainline snapshot proves nothing unless the branch changed
+# something and the match came after the branch point. Each of these branches
+# equals some mainline snapshot but landed nothing, so each is kept.
+tree_fp_repo=$(_clone_remote)
+_commit_file "$tree_fp_repo" c.txt c "add c"
+git -C "$tree_fp_repo" push --quiet origin main
+git -C "$tree_fp_repo" switch --quiet -c wip-empty
+git -C "$tree_fp_repo" commit --quiet --allow-empty -m "WIP: plan feature"
+git -C "$tree_fp_repo" switch --quiet main
+git -C "$tree_fp_repo" switch --quiet -c revert-c
+git -C "$tree_fp_repo" revert --no-edit HEAD >/dev/null
+git -C "$tree_fp_repo" switch --quiet main
+git -C "$tree_fp_repo" switch --quiet -c netzero
+_commit_file "$tree_fp_repo" s.txt secret "add s"
+git -C "$tree_fp_repo" rm --quiet s.txt
+git -C "$tree_fp_repo" commit --quiet -m "drop s for now"
+git -C "$tree_fp_repo" switch --quiet main
+git -C "$tree_fp_repo" switch --quiet --orphan empty-orphan
+git -C "$tree_fp_repo" commit --quiet --allow-empty -m "orphan start"
+git -C "$tree_fp_repo" switch --quiet main
+result=$(git -C "$tree_fp_repo" cleanup-repo 2>&1)
+for tree_fp_branch in wip-empty revert-c netzero empty-orphan; do
+  _assert_contains "keeps $tree_fp_branch, which matches a snapshot but landed nothing" \
+    "keeping $tree_fp_branch; merge not proven" "$result"
+done
+_assert_eq "branches that landed nothing all remain" \
+  "$(printf 'empty-orphan\nmain\nnetzero\nrevert-c\nwip-empty')" \
+  "$(_branches "$tree_fp_repo")"
+
 # Dry-run classification is read-only and cannot depend on author identity or
 # writable object storage.
 readonly_repo=$(_clone_remote)
@@ -468,6 +529,10 @@ git -C "$readonly_repo" switch --quiet -c readonly-squash
 _commit_file "$readonly_repo" readonly.txt one "readonly step 1"
 _commit_file "$readonly_repo" readonly.txt two "readonly step 2"
 git -C "$readonly_repo" switch --quiet main
+# An unrelated mainline commit before the squash keeps the squash's exact
+# delta but gives it a tree the branch never had, so only the content proof
+# can prove this branch; the failure-injection cases below depend on that.
+_commit_file "$readonly_repo" unrelated.txt unrelated "unrelated mainline work"
 printf '%s\n' two >"$readonly_repo/readonly.txt"
 git -C "$readonly_repo" add readonly.txt
 git -C "$readonly_repo" commit --quiet -m "squash readonly branch"
@@ -2195,6 +2260,21 @@ _assert_eq "active bisect preserves worktree" present \
   "$(if [[ -e "$operation_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
 git -C "$operation_dir" bisect reset >/dev/null
 
+# A locked worktree is its owner's request to leave it alone: it stays, with
+# its branch, and Git is never asked to remove it.
+locked_repo=$(_clone_remote)
+git -C "$locked_repo" switch --quiet -c locked-work
+_commit_file "$locked_repo" locked.txt locked "add locked work"
+git -C "$locked_repo" switch --quiet main
+locked_dir=$(_tmpdir)
+rm -rf "$locked_dir"
+git -C "$locked_repo" worktree add --quiet --lock "$locked_dir" locked-work
+locked_output=$(git -C "$locked_repo" cleanup-repo --all --remove-worktrees 2>&1)
+_assert_contains "a locked worktree is skipped as locked" \
+  "skipping locked-work; worktree is locked: $locked_dir" "$locked_output"
+_assert_eq "a locked worktree keeps its branch" locked-work \
+  "$(git -C "$locked_repo" branch --list --format='%(refname:short)' locked-work)"
+
 # Git's own final worktree-remove check must catch a file created after our
 # clean preflight and leave both the worktree and branch intact.
 late_dirty_repo=$(_clone_remote)
@@ -2208,10 +2288,13 @@ late_dirty_bin=$(_tmpdir)
 cat >"$late_dirty_bin/git" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${1:-}" == worktree && "${2:-}" == remove &&
-  "${3:-}" == "$GIT_LATE_DIRTY_PATH" ]]; then
-  printf 'late\n' >"$GIT_LATE_DIRTY_PATH/late-untracked.txt"
-fi
+# Cleanup passes `-c` options before the subcommand, so match the arguments
+# rather than their positions.
+case " $* " in
+  *" worktree remove $GIT_LATE_DIRTY_PATH "*)
+    printf 'late\n' >"$GIT_LATE_DIRTY_PATH/late-untracked.txt"
+    ;;
+esac
 exec "$GIT_LATE_DIRTY_REAL" "$@"
 EOF
 chmod +x "$late_dirty_bin/git"
@@ -2226,6 +2309,26 @@ _assert_eq "late dirty worktree preserves branch" late-dirty \
   "$(git -C "$late_dirty_repo" branch --list --format='%(refname:short)' late-dirty)"
 _assert_eq "late dirty worktree remains" present \
   "$(if [[ -e "$late_dirty_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
+
+# A repository that hides untracked files from status (as a dotfiles checkout
+# of $HOME does) must not hide a late file from Git's own removal check.
+late_hidden_repo=$(_clone_remote)
+git -C "$late_hidden_repo" config status.showUntrackedFiles no
+git -C "$late_hidden_repo" switch --quiet -c late-hidden
+_commit_file "$late_hidden_repo" late.txt clean "add late hidden work"
+git -C "$late_hidden_repo" switch --quiet main
+late_hidden_dir=$(_tmpdir)
+rm -rf "$late_hidden_dir"
+git -C "$late_hidden_repo" worktree add --quiet "$late_hidden_dir" late-hidden
+late_hidden_output=$(cd "$late_hidden_repo" &&
+  PATH="$late_dirty_bin:$PATH" \
+    GIT_LATE_DIRTY_PATH="$late_hidden_dir" \
+    GIT_LATE_DIRTY_REAL="$GIT_TOOLS_TEST_REAL_GIT" \
+    "$ROOT/bin/git-cleanup-repo" --base main --all --remove-worktrees 2>&1)
+_assert_contains "late untracked file stops removal when status hides untracked files" \
+  "worktree could not be removed safely: $late_hidden_dir" "$late_hidden_output"
+_assert_eq "late untracked file survives when status hides untracked files" late \
+  "$(cat "$late_hidden_dir/late-untracked.txt" 2>/dev/null)"
 
 dirty_worktree_repo=$(_clone_remote)
 git -C "$dirty_worktree_repo" switch --quiet -c dirty-work

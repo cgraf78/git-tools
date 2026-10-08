@@ -1144,6 +1144,25 @@ _assert_eq "dotfiles-style stack landing runs no stack tool" "" \
 _assert_eq "dotfiles-style stack landing leaves the checkout on its branch" \
   refs/heads/feature/b "$(git --git-dir="$dotfiles_gitdir" symbolic-ref HEAD)"
 
+# The orchestrator runs snapshot copies of git pr-land, pr-restack, and
+# pr-stack; every library those copies source must be in the snapshot.
+# shellcheck disable=SC2016,SC2154 # sed matches literal source lines; the
+# eval'd function assigns _tool_tmp
+snapshot_out=$(
+  set -e
+  _root=$ROOT
+  unset GIT_TOOLS_TOOL_DIR
+  eval "$(sed -n '/^_snapshot_tool_dir() {/,/^}/p' "$ROOT/bin/git-pr-land-stack")"
+  _snapshot_tool_dir
+  for tool in git-pr-land git-pr-restack git-pr-stack; do
+    while IFS= read -r lib; do
+      [[ -f "$_tool_tmp/lib/$lib" ]] || printf 'missing %s for %s\n' "$lib" "$tool"
+    done < <(sed -n 's|^\. "\$_root/lib/\(.*\)"$|\1|p' "$_tool_tmp/bin/$tool")
+  done
+  rm -rf "$_tool_tmp"
+)
+_assert_eq "snapshot includes every library the landing tools source" "" "$snapshot_out"
+
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2
   exit 1

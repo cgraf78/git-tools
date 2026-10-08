@@ -10,7 +10,7 @@ _git_pr_land_refs() {
 _git_pr_land() {
   _arguments -s \
     '(-m --method)'{-m,--method}'[Merge method]:method:(squash merge rebase)' \
-    '--keep-branch[Compatibility option; branches are preserved]' \
+    '--keep-branch[Keep the local PR head and its worktree]' \
     '(-n --dry-run)'{-n,--dry-run}'[Print actions without changing anything]' \
     '(-h --help)'{-h,--help}'[Show help]' \
     '1:pull request number, URL, or branch:_git_pr_land_refs'

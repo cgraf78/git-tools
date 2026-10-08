@@ -243,8 +243,9 @@ git pr-restack 123 --base main --fork parent-branch
 
 ### `git pr-land`
 
-Verifies and merges one ready GitHub PR and syncs the base branch locally. Local
-and remote PR heads are retained and reported with exact OIDs for manual cleanup.
+Verifies and merges one ready GitHub PR, syncs the base branch locally, and
+deletes the local PR head when every local commit is in what landed. Remote PR
+heads are retained and reported with exact OIDs for manual cleanup.
 
 ```sh
 git pr-land 123
@@ -289,12 +290,19 @@ and exits 1 instead of describing a landing.
 If GitHub reports an error after completing the server-side merge,
 the command rechecks structured PR state and identifies any remaining work as
 incomplete cleanup instead of incorrectly reporting that the merge failed.
-Local deletion is intentionally manual because Git has no portable primitive
-that serializes branch deletion with a checkout that already resolved the ref
-but has not yet updated its worktree `HEAD`. Remote deletion is also manual: a
-repository-scoped open-PR query cannot prove that a fork head is unused by PRs
-targeting another base repository, and a new consumer can appear after any
-query. `--keep-branch` remains accepted for compatibility; all branches are kept.
+After a successful merge, the local PR head is deleted when it is exactly the
+landed head, or an earlier snapshot of it that tracks the PR head, through the
+same engine as
+`git cleanup-repo`: a clean linked worktree holding it is removed first, while
+the current worktree, a worktree with local content or an active operation, or
+one a process is using keeps the branch. A local head with commits the landed
+head lacks is kept and reported. Git has no portable primitive that serializes
+branch deletion with a checkout that already resolved the ref, so deletion is
+also refused while any worktree of the repository holds an index or HEAD lock,
+which a checkout in progress does. Use `--keep-branch` to keep the local head
+and its worktree. Remote deletion stays manual: a repository-scoped open-PR
+query cannot prove that a fork head is unused by PRs targeting another base
+repository, and a new consumer can appear after any query.
 
 ### `git pr-land-stack`
 
@@ -319,7 +327,11 @@ instead of conflicting
 when they are replayed onto the root base. This works for every merge method.
 After each restack, the next expected topology accepts the rewritten head OID
 only when it matches both the local branch and a fresh GitHub PR record.
-Local and remote heads are retained for manual cleanup. Stack topology uses
+Each parent is landed with `--keep-branch`, because the next restack still
+needs its head; the final PR's local head is deleted as `git pr-land` would,
+and running `git cleanup-repo` afterward removes the landed parents. Remote
+heads are
+retained for manual cleanup. Stack topology uses
 repository identity as well as branch names, so a same-named fork head cannot
 be mistaken for a base-repository parent. Cycles and ambiguous parents fail
 closed.

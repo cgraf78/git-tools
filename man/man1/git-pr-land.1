@@ -8,8 +8,15 @@ git-pr-land \- land one ready GitHub pull request
 .SH DESCRIPTION
 .B git pr-land
 verifies that one GitHub pull request is ready, merges it, syncs the base
-branch locally, and reports local and remote pull request heads with exact object
-IDs for manual cleanup. It never deletes those branches automatically.
+branch locally, and deletes the local pull request head when it is exactly the
+landed head, or an earlier snapshot of it that tracks the pull request head. A clean linked worktree holding that
+branch is removed first, under the same gates as
+.BR git-cleanup-repo (1);
+the current worktree, a worktree with local content, an active operation, or a
+process using it, and a head with commits the landed head lacks all keep the
+branch. Deletion is also refused while any worktree holds an index or HEAD
+lock, as a checkout in progress does. Remote heads are reported with exact
+object IDs for manual cleanup and never deleted.
 .PP
 URL targets are required to belong to the current GitHub repository before the
 pull request is looked up or merged.
@@ -73,7 +80,7 @@ Defaults to
 .BR squash .
 .TP
 .B \-\-keep\-branch
-Accepted for compatibility. Local and remote branches are always retained.
+Keep the local pull request head and its worktree.
 .TP
 .BR \-n ", " \-\-dry\-run
 Print actions without changing anything. A dry run makes the same local checks

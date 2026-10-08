@@ -23,6 +23,8 @@ _root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
 . "$_root/lib/git-tools-pr.sh"
 # shellcheck disable=SC1091
 . "$_root/lib/git-tools-base.sh"
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-cleanup.sh"
 
 _usage() {
   cat <<'EOF'
@@ -33,30 +35,24 @@ age, ahead/behind counts, whether they are merged into the default branch, and
 the open PR number when GitHub data is available. The default branch itself is
 the reference point and is omitted from the listing.
 
-Squash, rebase, and cherry-pick matches require both patch history and exact
-raw-delta evidence. Historical squash proof survives later mainline edits.
-Candidate reporting includes each branch's exact object ID. Incomplete branch
-enumeration aborts reporting. No local branch is deleted automatically.
+Merge status uses the same proofs as git cleanup-repo: ancestry, an exact
+squash, rebase, or cherry-pick replay, or a branch tree that is a mainline
+snapshot. Incomplete branch enumeration aborts reporting. The audit only
+reports; preview cleanup with git cleanup-repo --dry-run.
 
 Options:
       --porcelain        Print stable tab-separated branch records.
-      --drop-merged      Report exact merged-branch cleanup candidates.
-      --yes              Confirm --drop-merged.
   -b, --base <branch>    Use this branch as the default instead of inferring one.
-  -n, --dry-run          Print candidate actions without changing anything.
   -h, --help             Show this help.
 
 Exit status:
-  0  Audit or cleanup completed.
-  1  Audit or candidate reporting failed.
+  0  Audit completed.
+  1  Audit failed.
   2  Usage or local environment error.
 EOF
 }
 
 _porcelain=0
-_drop_merged=0
-_yes=0
-_dry_run=0
 _base=""
 
 while (($#)); do
@@ -65,13 +61,10 @@ while (($#)); do
       _porcelain=1
       shift
       ;;
-    --drop-merged)
-      _drop_merged=1
-      shift
-      ;;
-    --yes)
-      _yes=1
-      shift
+    --drop-merged | --yes | -n | --dry-run)
+      # The audit used to report cleanup candidates without deleting them.
+      # cleanup-repo now owns that decision, with the same proofs.
+      gt_usage_error "$1 was removed; branch-audit only reports, preview cleanup with: git cleanup-repo --dry-run"
       ;;
     -b | --base)
       shift
@@ -82,10 +75,6 @@ while (($#)); do
     --base=*)
       _base="${1#--base=}"
       [[ -n "$_base" ]] || gt_usage_error "--base requires a value"
-      shift
-      ;;
-    -n | --dry-run)
-      _dry_run=1
       shift
       ;;
     -h | --help)
@@ -145,6 +134,7 @@ _branch_records() {
 
 _list() {
   local records ref name oid cdate crel track behind ahead merged gone pr counts
+  local proof
 
   records=$(_branch_records) || gt_die "could not enumerate branches"
 
@@ -160,66 +150,39 @@ _list() {
       gt_die "could not compare branch to default: $name"
     read -r behind ahead <<<"$counts"
     merged=false
+    proof=""
     # The count walk already classifies both one-sided histories. No branch-only
     # commits means an ordinary merge; no default-only commits means the branch
     # was based on the current default, which therefore cannot already contain
-    # a squash/rebase replay. Only genuinely divergent histories need the more
-    # expensive exact-delta and patch-ID proof.
+    # a landing of it. Only genuinely divergent histories need the more
+    # expensive exact-delta, patch-ID, and mainline-tree proofs, which are the
+    # ones gt_merge_proof runs after its ancestry check.
     if [[ "$ahead" == 0 ]]; then
-      merged=true
+      proof=merged
     elif [[ "$behind" != 0 ]] &&
-      _gt_branch_content_merged_oids "$oid" "$_default_oid"; then
-      merged=true
+      gt_merge_proof "$oid" "$_default_oid" divergent; then
+      proof=$GT_CLEANUP_PROOF
     fi
+    [[ -z "$proof" ]] || merged=true
     gone=false
     [[ "$track" == "[gone]" ]] && gone=true
     pr=$(gt_pr_number_for_branch "$name" || true)
 
     if [[ "$_porcelain" == 1 ]]; then
-      printf 'branch\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$name" "$merged" "$ahead" "$behind" "$pr" "$cdate" "$gone"
+      printf 'branch\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$name" "$merged" "$ahead" "$behind" "$pr" "$cdate" "$gone" \
+        "$proof" "$oid"
     else
       printf '%s merged=%s ahead=%s behind=%s gone=%s' "$name" "$merged" "$ahead" "$behind" "$gone"
+      [[ -z "$proof" ]] || printf ' proof=%s' "$proof"
       [[ -z "$pr" ]] || printf ' pr=#%s' "$pr"
       printf ' (%s)\n' "$crel"
     fi
   done <<<"$records"
 }
 
-_drop() {
-  local records ref name oid candidates=0
-
-  if [[ "$_dry_run" == 0 && "$_yes" == 0 ]]; then
-    gt_usage_error "--drop-merged requires --yes or --dry-run"
-  fi
-
-  records=$(git for-each-ref \
-    --format='%(refname)%09%(objectname)' refs/heads) ||
-    gt_die "could not enumerate branches"
-
-  while IFS=$'\t' read -r ref oid; do
-    [[ -n "$ref" ]] || continue
-    case "$ref" in
-      refs/heads/*) name=${ref#refs/heads/} ;;
-      *) gt_die "invalid branch inventory record: $ref" ;;
-    esac
-    [[ "$name" != "$_default" ]] || continue
-    gt_branch_merged "$oid" "$_default_oid" || continue
-
-    gt_say "preserving local cleanup candidate $name at $oid (merged); delete it manually after verifying no checkout is in flight"
-    candidates=$((candidates + 1))
-  done <<<"$records"
-
-  gt_say "done; reported $candidates local cleanup candidate(s); no local branches deleted"
-}
-
 gt_require_repo
 _resolve_default
-
-if [[ "$_drop_merged" == 1 ]]; then
-  _drop
-  exit 0
-fi
 
 gt_pr_load
 _list

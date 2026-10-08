@@ -684,25 +684,6 @@ gt_branch_content_merged() {
   _gt_branch_content_merged_oids "$branch" "$base"
 }
 
-# @brief Return 0 when <branch> is merged into <base> by any means.
-# True when the branch tip is an ancestor of the base (plain merge / fast
-# forward) OR when matching patch IDs and exact raw deltas prove a squash,
-# rebase, or cherry-pick replay. Historical squash proof remains valid after a
-# later mainline edit. This is the merge predicate branch-cleanup tooling should
-# use so replay-merged branches are not stranded as "unmerged".
-gt_branch_merged() {
-  local branch base ancestor_status=0
-  branch=$(git rev-parse --verify "$1^{commit}" 2>/dev/null) || return 1
-  base=$(git rev-parse --verify "$2^{commit}" 2>/dev/null) || return 1
-  git merge-base --is-ancestor "$branch" "$base" 2>/dev/null ||
-    ancestor_status=$?
-  case "$ancestor_status" in
-    0) return 0 ;;
-    1) _gt_branch_content_merged_oids "$branch" "$base" ;;
-    *) return 1 ;;
-  esac
-}
-
 # @brief Run git after clearing repository-local environment inherited from git.
 # @param ... Arguments passed to git.
 #

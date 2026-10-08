@@ -4248,69 +4248,75 @@ _pr_json() {
   printf '"head":{"ref":"%s","repo":{"full_name":"acme/widgets"}}}' "$head"
 }
 
-# A branch whose tip is an earlier snapshot of a merged PR has no local proof
-# (the PR landed later work as one squash), but the PR holds its commit and
-# its merge commit is on the base.
-gh_dir=$(_tmpdir)
-pr_repo=$(_github_clone)
-git -C "$pr_repo" switch --quiet -c pr-snapshot
-_commit_file "$pr_repo" p.txt one "early snapshot"
-pr_tip=$(git -C "$pr_repo" rev-parse HEAD)
-git -C "$pr_repo" switch --quiet main
-_commit_file "$pr_repo" p.txt two "land the PR (#7)"
-pr_merge=$(git -C "$pr_repo" rev-parse HEAD)
-git -C "$pr_repo" push --quiet origin main
-printf '[[%s]]\n' "$(_pr_json 7 closed '"2026-01-01T00:00:00Z"' "\"$pr_merge\"")" \
-  >"$gh_dir/commits-$pr_tip.json"
-printf '[[{"sha":"%s"}]]\n' "$pr_tip" >"$gh_dir/members-7.json"
-result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
-  git cleanup-repo --porcelain 2>&1)
-_assert_contains "a merged PR containing the tip proves deletion" \
-  $'delete-branch\tpr-snapshot\tmerged-pr\t'"$pr_tip" "$result"
-result=$(git -C "$pr_repo" branch --list pr-snapshot)
-_assert_eq "the merged-PR snapshot branch is deleted" "" "$result"
+# Pull request evidence needs jq; without it cleanup leaves the evidence out,
+# which these cases cannot observe.
+if command -v jq >/dev/null 2>&1; then
+  # A branch whose tip is an earlier snapshot of a merged PR has no local proof
+  # (the PR landed later work as one squash), but the PR holds its commit and
+  # its merge commit is on the base.
+  gh_dir=$(_tmpdir)
+  pr_repo=$(_github_clone)
+  git -C "$pr_repo" switch --quiet -c pr-snapshot
+  _commit_file "$pr_repo" p.txt one "early snapshot"
+  pr_tip=$(git -C "$pr_repo" rev-parse HEAD)
+  git -C "$pr_repo" switch --quiet main
+  _commit_file "$pr_repo" p.txt two "land the PR (#7)"
+  pr_merge=$(git -C "$pr_repo" rev-parse HEAD)
+  git -C "$pr_repo" push --quiet origin main
+  printf '[[%s]]\n' "$(_pr_json 7 closed '"2026-01-01T00:00:00Z"' "\"$pr_merge\"")" \
+    >"$gh_dir/commits-$pr_tip.json"
+  printf '[[{"sha":"%s"}]]\n' "$pr_tip" >"$gh_dir/members-7.json"
+  result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    git cleanup-repo --porcelain 2>&1)
+  _assert_contains "a merged PR containing the tip proves deletion" \
+    $'delete-branch\tpr-snapshot\tmerged-pr\t'"$pr_tip" "$result"
+  result=$(git -C "$pr_repo" branch --list pr-snapshot)
+  _assert_eq "the merged-PR snapshot branch is deleted" "" "$result"
 
-# The same evidence is withheld when gh fails or the network is off.
-pr_repo=$(_github_clone)
-git -C "$pr_repo" switch --quiet -c pr-snapshot
-_commit_file "$pr_repo" p.txt one "early snapshot"
-pr_tip=$(git -C "$pr_repo" rev-parse HEAD)
-git -C "$pr_repo" switch --quiet main
-_commit_file "$pr_repo" p.txt two "land the PR (#7)"
-pr_merge=$(git -C "$pr_repo" rev-parse HEAD)
-git -C "$pr_repo" push --quiet origin main
-printf '[[%s]]\n' "$(_pr_json 7 closed '"2026-01-01T00:00:00Z"' "\"$pr_merge\"")" \
-  >"$gh_dir/commits-$pr_tip.json"
-printf '[[{"sha":"%s"}]]\n' "$pr_tip" >"$gh_dir/members-7.json"
-result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir FAKE_GH_FAIL=1 \
-  git cleanup-repo 2>&1)
-_assert_contains "a failing gh is no proof" \
-  "keeping pr-snapshot; merge not proven" "$result"
-: >"$gh_dir/calls"
-result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
-  git cleanup-repo --no-fetch 2>&1)
-_assert_contains "no-fetch withholds pull request evidence" \
-  "keeping pr-snapshot; merge not proven" "$result"
-_assert_eq "no-fetch never calls gh" "" "$(cat "$gh_dir/calls")"
+  # The same evidence is withheld when gh fails or the network is off.
+  pr_repo=$(_github_clone)
+  git -C "$pr_repo" switch --quiet -c pr-snapshot
+  _commit_file "$pr_repo" p.txt one "early snapshot"
+  pr_tip=$(git -C "$pr_repo" rev-parse HEAD)
+  git -C "$pr_repo" switch --quiet main
+  _commit_file "$pr_repo" p.txt two "land the PR (#7)"
+  pr_merge=$(git -C "$pr_repo" rev-parse HEAD)
+  git -C "$pr_repo" push --quiet origin main
+  printf '[[%s]]\n' "$(_pr_json 7 closed '"2026-01-01T00:00:00Z"' "\"$pr_merge\"")" \
+    >"$gh_dir/commits-$pr_tip.json"
+  printf '[[{"sha":"%s"}]]\n' "$pr_tip" >"$gh_dir/members-7.json"
+  result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir FAKE_GH_FAIL=1 \
+    git cleanup-repo 2>&1)
+  _assert_contains "a failing gh is no proof" \
+    "keeping pr-snapshot; merge not proven" "$result"
+  : >"$gh_dir/calls"
+  result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    git cleanup-repo --no-fetch 2>&1)
+  _assert_contains "no-fetch withholds pull request evidence" \
+    "keeping pr-snapshot; merge not proven" "$result"
+  _assert_eq "no-fetch never calls gh" "" "$(cat "$gh_dir/calls")"
 
-# A merge commit that is not on the pinned base proves nothing.
-printf '[[%s]]\n' "$(_pr_json 7 closed '"2026-01-01T00:00:00Z"' \
-  '"1111111111111111111111111111111111111111"')" >"$gh_dir/commits-$pr_tip.json"
-result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
-  git cleanup-repo 2>&1)
-_assert_contains "a merge commit outside the base is no proof" \
-  "keeping pr-snapshot; merge not proven" "$result"
+  # A merge commit that is not on the pinned base proves nothing.
+  printf '[[%s]]\n' "$(_pr_json 7 closed '"2026-01-01T00:00:00Z"' \
+    '"1111111111111111111111111111111111111111"')" >"$gh_dir/commits-$pr_tip.json"
+  result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    git cleanup-repo 2>&1)
+  _assert_contains "a merge commit outside the base is no proof" \
+    "keeping pr-snapshot; merge not proven" "$result"
 
-# An open PR named after the branch protects it, even beside a merged PR.
-printf '[[%s]]\n' "$(_pr_json 7 closed '"2026-01-01T00:00:00Z"' "\"$pr_merge\"")" \
-  >"$gh_dir/commits-$pr_tip.json"
-printf '[[%s]]\n' "$(_pr_json 9 open null null pr-snapshot)" \
-  >"$gh_dir/named-pr-snapshot.json"
-result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
-  git cleanup-repo --porcelain 2>&1)
-_assert_contains "an open PR keeps the branch" \
-  $'keep-branch\tpr-snapshot\topen-pr\t9' "$result"
-rm -f "$gh_dir/named-pr-snapshot.json"
+  # An open PR named after the branch protects it, even beside a merged PR.
+  printf '[[%s]]\n' "$(_pr_json 7 closed '"2026-01-01T00:00:00Z"' "\"$pr_merge\"")" \
+    >"$gh_dir/commits-$pr_tip.json"
+  printf '[[%s]]\n' "$(_pr_json 9 open null null pr-snapshot)" \
+    >"$gh_dir/named-pr-snapshot.json"
+  result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    git cleanup-repo --porcelain 2>&1)
+  _assert_contains "an open PR keeps the branch" \
+    $'keep-branch\tpr-snapshot\topen-pr\t9' "$result"
+  rm -f "$gh_dir/named-pr-snapshot.json"
+else
+  printf 'skip - pull request evidence cases need jq\n'
+fi
 
 # --min-age keeps a young branch proven only by ancestry, which is
 # indistinguishable from a branch just created for new work.

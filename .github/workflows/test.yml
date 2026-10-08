@@ -20,7 +20,7 @@ jobs:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@e3a25ae946aea8fd57da3bf2ffbf9f94ea84b8d9
     with:
       matrix-set: full
-      profiles: base
+      profiles: base,jq
       shellcheck-inventory-path: .github/shellcheck-files.txt
       test-command: GIT_TOOLS_SKIP_SHELLCHECK=1 test/run
 

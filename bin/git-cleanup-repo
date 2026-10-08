@@ -75,12 +75,21 @@ Exit status:
      failed removals.
   2  Usage, repository, or remote error; records already printed may be
      incomplete.
+  3  The remote base could not be reached or fetched; nothing was decided,
+     so retrying with --no-fetch is safe.
 EOF
 }
 
 _die() {
   printf 'git cleanup-repo: %s\n' "$*" >&2
   exit 2
+}
+
+# The remote base could not be reached or fetched. This happens before any
+# decision, so callers can retry offline (--no-fetch) without double counting.
+_die_unreachable() {
+  printf 'git cleanup-repo: %s\n' "$*" >&2
+  exit 3
 }
 
 _say() {
@@ -235,7 +244,7 @@ _pin_remote_base() {
   case "$status" in
     0) ;;
     2) _die "remote base branch does not exist: $_remote/$_base" ;;
-    *) _die "could not inspect remote base branch: $_remote/$_base" ;;
+    *) _die_unreachable "could not inspect remote base branch: $_remote/$_base" ;;
   esac
   [[ -n "$record" && "$record" != *$'\n'* ]] ||
     _die "remote base lookup returned multiple records: $_remote/$_base"
@@ -252,7 +261,7 @@ _pin_remote_base() {
   git fetch --quiet --no-tags --no-write-fetch-head \
     --no-auto-gc --no-recurse-submodules \
     -- "$_remote_url" "refs/heads/$_base" ||
-    _die "could not fetch exact remote base: $_remote/$_base"
+    _die_unreachable "could not fetch exact remote base: $_remote/$_base"
   resolved=$(git rev-parse --verify "$_remote_oid^{commit}" 2>/dev/null) ||
     _die "exact remote base object was not fetched: $_remote/$_base"
   [[ "$resolved" == "$_remote_oid" ]] ||
@@ -510,8 +519,9 @@ _branch_touched_at() {
 
 # Decide one branch. Prints `<code> TAB <detail>` and succeeds with a deletion
 # reason (merged, content-merged, tree-landed, merged-pr, upstream-gone, or
-# all), or fails, printing a keep code when one applies (too-new, open-pr, or
-# closed-pr) and nothing when the merge is simply unproven.
+# all), or fails, printing a keep code when one applies (too-new, open-pr,
+# closed-pr, or pr-unknown when pull request evidence was wanted but could not
+# be read) and nothing when the merge is simply unproven.
 _delete_reason() {
   local branch="$1" branch_oid="$2" upstream_track="$3" remote_name="$4"
   local remote_ref="$5" proof touched now lineage kind="" number=""
@@ -538,7 +548,7 @@ _delete_reason() {
   fi
   if [[ -n "$_github_repo" ]]; then
     lineage=$(gt_cleanup_pr_lineage "$_github_host" "$_github_repo" \
-      "$branch" "$branch_oid" "$_base_oid" "$_base") || lineage=""
+      "$branch" "$branch_oid" "$_base_oid" "$_base") || lineage="unknown"
     IFS=$'\t' read -r kind number <<<"$lineage"
     case "$kind" in
       merged)
@@ -556,7 +566,10 @@ _delete_reason() {
     printf 'upstream-gone\t\n'
     return 0
   fi
-  [[ "$kind" != closed ]] || printf 'closed-pr\t%s\n' "$number"
+  case "$kind" in
+    closed) printf 'closed-pr\t%s\n' "$number" ;;
+    unknown) printf 'pr-unknown\t\n' ;;
+  esac
   return 1
 }
 
@@ -659,6 +672,7 @@ _cleanup_branches() {
         continue
         ;;
       closed-pr) _closed_branches+=("$branch") ;;
+      pr-unknown) _pr_unknown_branches+=("$branch") ;;
     esac
     # Upstream state comes from remote-tracking refs as of the last fetch;
     # cleanup fetches only the base, so say so rather than claim it is live.
@@ -1002,6 +1016,14 @@ _retire_worktrees() {
           "its detached HEAD is on no branch, remote branch, or tag"
         continue
       fi
+      # A request cannot vouch that no open pull request still holds the
+      # branch; when that lookup was wanted but failed, keep the checkout.
+      if [[ -n "$branch" ]] &&
+        _listed "$branch" ${_pr_unknown_branches[@]+"${_pr_unknown_branches[@]}"}; then
+        _keep_worktree "$path" pr-unknown "$branch" \
+          "could not confirm that no open pull request holds $branch"
+        continue
+      fi
       code=requested
     elif [[ -n "$branch" ]]; then
       index=0
@@ -1069,6 +1091,7 @@ _decided_branches=()
 _decided_codes=()
 _decided_details=()
 _closed_branches=()
+_pr_unknown_branches=()
 _github_host=""
 _github_repo=""
 if [[ "$_fetch" == 1 ]] && command -v gh >/dev/null 2>&1 &&

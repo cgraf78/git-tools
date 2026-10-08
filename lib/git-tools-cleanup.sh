@@ -786,15 +786,18 @@ gt_cleanup_retire_branch() {
   if [[ "$GT_CLEANUP_DRY_RUN" == 1 ]]; then
     gt_cleanup_report would-delete-branch "$branch" "$code" "$branch_oid" \
       "would delete $branch at $branch_oid ($reason)"
-  else
-    gt_cleanup_report delete-branch "$branch" "$code" "$branch_oid" \
-      "deleting $branch ($reason)"
+    gt_cleanup_run git update-ref -d "refs/heads/$branch" "$branch_oid"
+    return 0
   fi
-  if ! gt_cleanup_run git update-ref -d "refs/heads/$branch" "$branch_oid"; then
+  # Report a deletion only once it happened, so a failed one is reported
+  # exactly once, as a kept branch.
+  if ! git update-ref -d "refs/heads/$branch" "$branch_oid"; then
     _gt_cleanup_keep "$branch" ref-delete-failed "$branch_oid" \
       "exact ref deletion failed"
     return 1
   fi
+  gt_cleanup_report delete-branch "$branch" "$code" "$branch_oid" \
+    "deleting $branch ($reason)"
 }
 
 # @brief Print `<kind> TAB <number>` for the GitHub pull request evidence about

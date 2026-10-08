@@ -586,7 +586,9 @@ worktree select it once). A
 kept the checkout) with the same detail as above, `merge-unproven` with the
 branch name, `current-worktree`, `main-worktree`, `missing` (the path or its
 directory is gone), `not-linked` (not a linked worktree of this repository, including a
-subdirectory of one), or `unreachable-head` with the detached HEAD's OID.
+subdirectory of one), `unreachable-head` with the detached HEAD's OID, or
+`pr-unknown` with the branch when a requested retirement could not confirm
+that no open pull request holds it.
 Retirement codes are `requested`, `upstream-gone`, `closed-pr`, or, for a
 detached HEAD, its merge proof.
 
@@ -595,7 +597,9 @@ arguments are matched to whole worktrees by those paths. Backslash, tab, and new
 inside a field are written as `\\`, `\t`, and `\n`. Exit status 0 means
 every decision was reported, including kept branches and failed removals; 2
 means a usage, repository, or remote error, after which printed records may be
-incomplete.
+incomplete; 3 means the remote base could not be reached or fetched, before
+any decision, so retrying with `--no-fetch` is safe. A deletion is reported
+only after it succeeded.
 
 ```sh
 git cleanup-repo --no-update-base --porcelain --worktree ../old-feature

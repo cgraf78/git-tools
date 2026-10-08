@@ -563,6 +563,7 @@ record per decision on stdout and leaves only diagnostics on stderr:
 | `in-use` | process ID | a process's working directory is in the worktree |
 | `uninspectable` | worktree path or empty | Git or the process view could not be read |
 | `branch-changed`, `reserved` | path or empty | the branch moved or was checked out during cleanup |
+| `checkout-in-flight` | lock path | a Git command holds an index or HEAD lock, so a checkout may be in progress |
 | `prune-failed`, `remove-failed` | worktree path | the worktree could not be removed safely |
 | `ref-delete-failed` | proven OID | the exact ref deletion failed |
 
@@ -612,7 +613,10 @@ current worktree or an active rebase/merge/cherry-pick/revert. Git cannot atomic
 reservation checks with ref deletion, so do not create, switch, or mutate
 worktrees concurrently with cleanup. The command rechecks observable state and
 uses expected-old-OID ref deletion to preserve a branch that advances during
-cleanup.
+cleanup. It also keeps a worktree whose own index or HEAD lock is held, and
+keeps every branch while any worktree holds one, because a `git switch` in
+progress holds those locks after it has resolved the branch it checks out. A
+lock left behind by a crashed Git keeps branches until it is removed.
 
 ### `git stash-audit`
 

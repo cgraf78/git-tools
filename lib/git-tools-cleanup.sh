@@ -42,6 +42,7 @@ unset _gt_lib_dir
   GT_CLEANUP_KEEP_CODE=""
   GT_CLEANUP_KEEP_DETAIL=""
   GT_CLEANUP_KEEP_WHY=""
+  GT_CLEANUP_LOCK=""
 }
 # What the branch pass decided for each scoped worktree it reached, so a
 # caller can give every selected worktree exactly one outcome record.
@@ -427,6 +428,45 @@ gt_branch_still_at() {
   [[ "$status" == 0 && "$GT_REF_OID" == "$expected_oid" ]]
 }
 
+# Succeed, naming the lock in GT_CLEANUP_LOCK, when any worktree of this
+# repository holds an index or HEAD lock. `git switch` holds the target
+# worktree's index.lock while it writes files and HEAD.lock while it moves
+# HEAD, so a branch deleted then could leave that checkout on a missing branch.
+# Ref deletion cannot be serialized with a checkout that has already resolved
+# the branch; refusing while one is visibly in flight closes most of that
+# window. A lock left by a crashed Git also keeps branches, which errs safe.
+_gt_cleanup_checkout_in_flight() {
+  local common lock
+
+  GT_CLEANUP_LOCK=""
+  common=$(git rev-parse --git-common-dir 2>/dev/null) || return 0
+  common=$(cd -P -- "$common" 2>/dev/null && pwd -P) || return 0
+  for lock in "$common/index.lock" "$common/HEAD.lock" \
+    "$common"/worktrees/*/index.lock "$common"/worktrees/*/HEAD.lock; do
+    if [[ -e "$lock" ]]; then
+      GT_CLEANUP_LOCK=$lock
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Succeed, naming the lock in GT_CLEANUP_LOCK, when a worktree's own index or
+# HEAD lock is held: some Git command is writing in it right now.
+_gt_cleanup_worktree_busy() {
+  local path="$1" entry
+
+  GT_CLEANUP_LOCK=""
+  for entry in index.lock HEAD.lock; do
+    _gt_find_worktree_git_path "$path" "$entry" || continue
+    if [[ -e "$GT_GIT_PATH" ]]; then
+      GT_CLEANUP_LOCK=$GT_GIT_PATH
+      return 0
+    fi
+  done
+  return 1
+}
+
 _gt_cleanup_note_uninspectable() {
   [[ -z "$GT_WORKTREE_FAILED_PATH" ]] ||
     GT_CLEANUP_UNINSPECTABLE_HINT=$(gt_uninspectable_worktree_hint)
@@ -502,6 +542,11 @@ gt_cleanup_worktree_gate() {
   if [[ -n "$operation" ]]; then
     _gt_cleanup_block operation "$operation" \
       "worktree has active $operation: $path"
+    return 1
+  fi
+  if _gt_cleanup_worktree_busy "$path"; then
+    _gt_cleanup_block checkout-in-flight "$GT_CLEANUP_LOCK" \
+      "a Git command is writing in the worktree (lock $GT_CLEANUP_LOCK)"
     return 1
   fi
   # Git removes a worktree that a shell or agent session is parked in, which
@@ -726,6 +771,11 @@ gt_cleanup_retire_branch() {
   fi
   if ! gt_branch_still_at "$branch" "$branch_oid"; then
     _gt_cleanup_keep "$branch" branch-changed "" "branch changed during cleanup"
+    return 1
+  fi
+  if _gt_cleanup_checkout_in_flight; then
+    _gt_cleanup_keep "$branch" checkout-in-flight "$GT_CLEANUP_LOCK" \
+      "a checkout may be in progress (lock $GT_CLEANUP_LOCK)"
     return 1
   fi
 

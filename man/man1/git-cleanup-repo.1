@@ -228,9 +228,11 @@ kept its branch,
 .BR main\-worktree ,
 .BR missing ,
 .BR not\-linked ,
-or
 .B unreachable\-head
-(detail the detached HEAD). Every selected worktree gets exactly one
+(detail the detached HEAD), or
+.B pr\-unknown
+(a requested retirement could not confirm that no open pull request holds the
+branch). Every selected worktree gets exactly one
 .BR remove\-worktree ,
 .BR would\-remove\-worktree ,
 or
@@ -256,6 +258,12 @@ removals.
 .B 2
 Usage, repository, or remote error. Porcelain records already printed may be
 incomplete.
+.TP
+.B 3
+The remote base could not be reached or fetched. Nothing was decided, so
+retrying with
+.B \-\-no\-fetch
+is safe.
 .SH WORKTREE PRUNING
 Before removing an otherwise eligible linked worktree, the command recognizes
 two explicit classes of disposable top-level entries. A real top-level

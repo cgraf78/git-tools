@@ -686,7 +686,7 @@ fetch_failure_output=$(cd "$fetch_failure_repo" &&
   PATH="$fetch_failure_bin:$PATH" \
     GIT_EXACT_FETCH_LOG="$fetch_failure_log" \
     "$ROOT/bin/git-cleanup-repo" --base main 2>&1) || fetch_failure_rc=$?
-_assert_eq "exact remote fetch failure aborts cleanup" "2" "$fetch_failure_rc"
+_assert_eq "exact remote fetch failure aborts cleanup" "3" "$fetch_failure_rc"
 _assert_contains "exact remote fetch failure is diagnosed" \
   "could not fetch exact remote base" "$fetch_failure_output"
 _assert_not_contains "fetch failure diagnostics omit the captured endpoint" \
@@ -774,7 +774,7 @@ option_url_rc=0
 option_url_output=$(cd "$option_url_repo" &&
   GIT_OPTION_URL_LOG="$option_url_log" \
     "$ROOT/bin/git-cleanup-repo" --base main --dry-run 2>&1) || option_url_rc=$?
-_assert_eq "option-shaped remote URL is rejected as an endpoint" "2" "$option_url_rc"
+_assert_eq "option-shaped remote URL is rejected as an endpoint" "3" "$option_url_rc"
 _assert_contains "option-shaped remote URL failure is diagnosed" \
   "could not inspect remote base branch: origin/main" "$option_url_output"
 _assert_eq "option-shaped remote URL never invokes an upload-pack program" "" \
@@ -4643,6 +4643,162 @@ _assert_contains "a worktree with its own lock held stays" \
 _assert_eq "a busy worktree keeps its branch" busy-merged \
   "$(git -C "$busy_repo" branch --list --format='%(refname:short)' busy-merged)"
 rm -f "$busy_lock"
+
+# --- Hardening for unattended callers ---
+
+# A deletion is reported only once it happened: a failed one is reported
+# exactly once, as a kept branch.
+refail_repo=$(_clone_remote)
+git -C "$refail_repo" switch --quiet -c refail
+_commit_file "$refail_repo" refail.txt refail "add refail"
+git -C "$refail_repo" switch --quiet main
+git -C "$refail_repo" merge --quiet --no-ff refail -m "merge refail"
+git -C "$refail_repo" push --quiet origin main
+chmod 555 "$refail_repo/.git/refs/heads"
+result=$(git -C "$refail_repo" cleanup-repo --porcelain 2>&1)
+chmod 755 "$refail_repo/.git/refs/heads"
+if [[ -w "$refail_repo/.git/refs" && "$(id -u)" != 0 ]]; then
+  _assert_not_contains "a failed deletion is never reported as deleted" \
+    $'delete-branch\trefail' "$result"
+  _assert_contains "a failed deletion is reported as a kept branch" \
+    $'keep-branch\trefail\tref-delete-failed\t' "$result"
+fi
+
+# A requested retirement cannot vouch that no open pull request holds the
+# branch; when that lookup was wanted but failed, the checkout stays.
+unknown_repo=$(_github_clone)
+git -C "$unknown_repo" switch --quiet -c unknown-pr
+_commit_file "$unknown_repo" u.txt u "unknown pr work"
+git -C "$unknown_repo" switch --quiet main
+unknown_dir="$(_tmpdir)/unknown"
+git -C "$unknown_repo" worktree add --quiet "$unknown_dir" unknown-pr
+result=$(cd "$unknown_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir FAKE_GH_FAIL=1 \
+  git cleanup-repo --porcelain --retire-worktree "$unknown_dir" 2>&1)
+_assert_contains "a failed pull request lookup keeps a requested worktree" \
+  $'keep-worktree\t'"$unknown_dir"$'\tpr-unknown\tunknown-pr' "$result"
+result=$(cd "$unknown_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+  git cleanup-repo --porcelain --retire-worktree "$unknown_dir" 2>&1)
+_assert_contains "a complete lookup lets the request retire it" \
+  $'remove-worktree\t'"$unknown_dir"$'\trequested\tunknown-pr' "$result"
+
+# Pull request evidence is advisory: only a complete, well-formed
+# observation of the exact commit on the pinned base counts. These cases
+# drive gt_cleanup_pr_lineage directly with a mocked gh.
+lineage_out=$(
+  repo=$(_tmpdir)
+  _git_init "$repo"
+  git -C "$repo" commit -q --allow-empty -m seed
+  target=$(git -C "$repo" rev-parse HEAD)
+  git -C "$repo" commit -q --allow-empty -m merged
+  base=$(git -C "$repo" rev-parse HEAD)
+  cd "$repo" || exit 1
+  # shellcheck source=../lib/git-tools-base.sh
+  . "$ROOT/lib/git-tools-base.sh"
+  # shellcheck source=../lib/git-tools-cleanup.sh
+  . "$ROOT/lib/git-tools-cleanup.sh"
+  # Called by gt_cleanup_pr_lineage in place of the real client.
+  # shellcheck disable=SC2329
+  gh() {
+    case "$*" in
+      *'/commits/'*'/pulls'*)
+        printf '%s\n' "$pulls"
+        return "${pull_error:-0}"
+        ;;
+      *'/pulls/'*'/commits'*)
+        printf '%s\n' "$mock_members"
+        return "${member_error:-0}"
+        ;;
+      *'repos/owner/repo/pulls '*)
+        printf '%s\n' "$mock_named"
+        return "${named_error:-0}"
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  record() {
+    pulls=$(jq -cn --arg merge "$base" \
+      '[[{number:7,state:"closed",merged_at:"2026-01-01",merge_commit_sha:$merge,
+        base:{ref:"main",repo:{full_name:"owner/repo"}}}]]')
+    mock_members=$(jq -cn --arg target "$target" '[[{sha:$target}]]')
+    mock_named='[[]]'
+    pull_error=0 member_error=0 named_error=0
+  }
+  proof() {
+    local tip=${1:-$target} pinned=${2:-$base}
+    printf '%s|' "$(gt_cleanup_pr_lineage github.com owner/repo feature "$tip" "$pinned" main)"
+  }
+  record
+  proof
+  pulls=$(jq '.[0] += [.[0][0] | .number=8 | .state="open" | .merged_at=null]' <<<"$pulls")
+  proof
+  record
+  proof "${target}a"
+  pulls=$(jq '.[0][0].base.repo.full_name="other/repo"' <<<"$pulls")
+  proof
+  record
+  pulls=$(jq '.[0][0].base.ref="develop"' <<<"$pulls")
+  proof
+  record
+  pulls=$(jq '.[0][0].merge_commit_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' <<<"$pulls")
+  proof
+  record
+  proof "$target" "$target"
+  record
+  mock_members='[[]]'
+  proof
+  record
+  proof "$base" "$base"
+  record
+  pulls=$(jq '.[0][0].merged_at=null | .[0][0].merge_commit_sha=null' <<<"$pulls")
+  proof
+  record
+  pulls='[[]]'
+  proof
+  record
+  named_error=1
+  proof
+  record
+  pulls='[{"status":"422"}]'
+  pull_error=1
+  proof
+  record
+  mock_named=$(jq '.[0][0].merged_at=null | .[0][0].merge_commit_sha=null |
+    .[0][0].head={ref:"feature",repo:{full_name:"owner/repo"}}' <<<"$pulls")
+  pulls='[[]]'
+  proof
+  mock_named=$(jq '.[0][0].state="open"' <<<"$mock_named")
+  pulls='[{"status":"422"}]'
+  pull_error=1
+  proof "$base" "$base"
+  record
+  mock_named='[[{"head":{}}]]'
+  proof
+  record
+  pull_error=1
+  proof
+  record
+  member_error=1
+  proof
+  record
+  pulls='{malformed'
+  proof
+  record
+  mock_members='{}'
+  proof
+  record
+  pulls=$(jq '.[0][0].number="7"' <<<"$pulls")
+  proof
+  record
+  pulls=$(jq '[[.[0][0]], []]' <<<"$pulls")
+  mock_members=$(jq '[[], .[0]]' <<<"$mock_members")
+  proof
+  record
+  pulls="$pulls $pulls"
+  proof
+)
+lineage_expected='merged	7|open	8||none	-|none	-|none	-|none	-|none	-|none	-|closed	7|none	-||none	-|closed	7|open	7|||||||merged	7||'
+_assert_eq "pull request evidence needs a complete exact observation on the pinned base" \
+  "$lineage_expected" "$lineage_out"
 
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2

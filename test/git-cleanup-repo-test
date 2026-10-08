@@ -4012,6 +4012,189 @@ _assert_eq "linked cleanup beside a newline-terminated main succeeds" \
 _assert_eq "newline-terminated main worktree is fast-forwarded" \
   "$nl_remote_oid" "$(git -C "$nl_repo" rev-parse HEAD)"
 
+# --- Porcelain records and composition options ---
+
+# A repository with one merged branch, one unproven local branch, and a remote
+# base that is one commit ahead of the local base.
+_porcelain_repo() {
+  local repo other remote
+
+  repo=$(_clone_remote) || return 1
+  git -C "$repo" switch --quiet -c merged
+  _commit_file "$repo" merged.txt merged "add merged"
+  git -C "$repo" switch --quiet main
+  git -C "$repo" merge --quiet --no-ff merged -m "merge merged"
+  git -C "$repo" push --quiet origin main
+  git -C "$repo" switch --quiet -c local-only
+  _commit_file "$repo" local.txt local "add local-only"
+  git -C "$repo" switch --quiet main
+  remote=$(git -C "$repo" remote get-url origin)
+  other=$(_tmpdir) || return 1
+  git clone --quiet "$remote" "$other" 2>/dev/null
+  git -C "$other" config user.email test@test.com
+  git -C "$other" config user.name Test
+  _commit_file "$other" remote.txt remote "remote-only commit"
+  git -C "$other" push --quiet origin main
+  printf '%s\n' "$repo"
+}
+
+pc_repo=$(_porcelain_repo)
+pc_merged_oid=$(git -C "$pc_repo" rev-parse refs/heads/merged)
+pc_stderr=$(_tmpdir)/stderr
+pc_out=$(git -C "$pc_repo" cleanup-repo --porcelain 2>"$pc_stderr")
+_assert_contains "porcelain records a deleted branch with proof and OID" \
+  $'delete-branch\tmerged\tmerged\t'"$pc_merged_oid" "$pc_out"
+_assert_contains "porcelain records a kept branch with its reason" \
+  $'keep-branch\tlocal-only\tmerge-unproven\tno-upstream' "$pc_out"
+_assert_not_contains "porcelain keeps decision messages off stderr" \
+  "deleting merged" "$(cat "$pc_stderr")"
+_assert_not_contains "porcelain leaves the tally to the caller" \
+  "done; deleted" "$(cat "$pc_stderr")"
+_assert_eq "porcelain still deletes the merged branch" \
+  "$(printf 'local-only\nmain')" "$(_branches "$pc_repo")"
+
+pc_repo=$(_porcelain_repo)
+pc_out=$(git -C "$pc_repo" cleanup-repo --porcelain --dry-run 2>"$pc_stderr")
+_assert_contains "porcelain dry run records would-delete-branch" \
+  $'would-delete-branch\tmerged\tmerged\t' "$pc_out"
+_assert_not_contains "porcelain dry run does not echo commands" \
+  "would run:" "$(cat "$pc_stderr")"
+_assert_eq "porcelain dry run keeps every branch" \
+  "$(printf 'local-only\nmain\nmerged')" "$(_branches "$pc_repo")"
+
+# Without a base update, the local base, the current branch, and a dirty
+# current checkout are all left alone, and merges are proven against the
+# pinned remote base.
+nub_repo=$(_porcelain_repo)
+nub_local_main=$(git -C "$nub_repo" rev-parse refs/heads/main)
+git -C "$nub_repo" switch --quiet local-only
+printf 'dirty\n' >>"$nub_repo/local.txt"
+nub_rc=0
+nub_out=$(git -C "$nub_repo" cleanup-repo --no-update-base 2>&1) || nub_rc=$?
+_assert_eq "no-update-base runs from a dirty checkout" 0 "$nub_rc"
+_assert_contains "no-update-base deletes a branch merged into the remote base" \
+  "deleting merged (merged)" "$nub_out"
+_assert_contains "no-update-base keeps the current branch" \
+  "keeping local-only" "$nub_out"
+_assert_eq "no-update-base leaves the local base where it was" \
+  "$nub_local_main" "$(git -C "$nub_repo" rev-parse refs/heads/main)"
+_assert_eq "no-update-base leaves the current checkout on its branch" \
+  refs/heads/local-only "$(git -C "$nub_repo" symbolic-ref HEAD)"
+_assert_eq "no-update-base leaves the dirty file alone" \
+  "$(printf 'local\ndirty')" "$(cat "$nub_repo/local.txt")"
+
+# A branch merged only on the remote is proven against the fetched base.
+nub_remote_repo=$(_clone_remote)
+git -C "$nub_remote_repo" switch --quiet -c remote-merged
+_commit_file "$nub_remote_repo" rm.txt rm "add remote-merged"
+git -C "$nub_remote_repo" push --quiet origin remote-merged:remote-merged
+git -C "$nub_remote_repo" switch --quiet main
+nub_other=$(_tmpdir)
+git clone --quiet "$(git -C "$nub_remote_repo" remote get-url origin)" "$nub_other" 2>/dev/null
+git -C "$nub_other" config user.email test@test.com
+git -C "$nub_other" config user.name Test
+git -C "$nub_other" merge --quiet --no-ff origin/remote-merged -m "merge remote"
+git -C "$nub_other" push --quiet origin main
+nub_out=$(git -C "$nub_remote_repo" cleanup-repo --no-update-base --no-fetch 2>&1)
+_assert_contains "no-fetch proves against the stale remote-tracking base" \
+  "keeping remote-merged; merge not proven" "$nub_out"
+nub_out=$(git -C "$nub_remote_repo" cleanup-repo --no-update-base 2>&1)
+_assert_contains "no-update-base fetches and proves against the remote base" \
+  "deleting remote-merged (merged)" "$nub_out"
+
+# Without a fetch nothing reaches the remote, so an unreachable one is fine.
+nf_repo=$(_porcelain_repo)
+git -C "$nf_repo" remote set-url origin "$(_tmpdir)/missing.git"
+nf_rc=0
+nf_out=$(git -C "$nf_repo" cleanup-repo --no-update-base --no-fetch 2>&1) || nf_rc=$?
+_assert_eq "no-fetch works with an unreachable remote" 0 "$nf_rc"
+_assert_contains "no-fetch still deletes a locally proven branch" \
+  "deleting merged (merged)" "$nf_out"
+nf_missing_repo=$(_clone_remote)
+git -C "$nf_missing_repo" update-ref -d refs/remotes/origin/main
+nf_rc=0
+nf_out=$(git -C "$nf_missing_repo" cleanup-repo --no-fetch 2>&1) || nf_rc=$?
+_assert_eq "no-fetch without a remote-tracking base fails" 2 "$nf_rc"
+_assert_contains "no-fetch names the missing remote-tracking base" \
+  "remote-tracking base does not exist: origin/main" "$nf_out"
+
+# --worktree limits removal to the listed checkouts and implies removal.
+ws_repo=$(_clone_remote)
+for ws_branch in first second; do
+  git -C "$ws_repo" switch --quiet -c "$ws_branch"
+  _commit_file "$ws_repo" "$ws_branch.txt" "$ws_branch" "add $ws_branch"
+  git -C "$ws_repo" switch --quiet main
+  git -C "$ws_repo" merge --quiet --no-ff "$ws_branch" -m "merge $ws_branch"
+done
+git -C "$ws_repo" push --quiet origin main
+ws_first=$(_tmpdir)
+ws_second=$(_tmpdir)
+rm -rf "$ws_first" "$ws_second"
+git -C "$ws_repo" worktree add --quiet "$ws_first" first
+git -C "$ws_repo" worktree add --quiet "$ws_second" second
+ws_out=$(git -C "$ws_repo" cleanup-repo --worktree "$ws_first" --porcelain 2>&1)
+_assert_contains "worktree scope removes the listed checkout" \
+  $'remove-worktree\t'"$ws_first"$'\tmerged\tfirst' "$ws_out"
+_assert_contains "worktree scope keeps an unlisted checkout's branch" \
+  $'keep-branch\tsecond\tchecked-out\t'"$ws_second" "$ws_out"
+_assert_eq "worktree scope deletes only the listed checkout's branch" \
+  "$(printf 'main\nsecond')" "$(_branches "$ws_repo")"
+_assert_eq "worktree scope leaves the unlisted checkout" present \
+  "$(if [[ -d "$ws_second" ]]; then printf present; else printf missing; fi)"
+
+# Scope arguments are matched to Git's recorded worktree paths: a relative
+# spelling with a trailing slash and a symlinked spelling both select the
+# worktree, and records name it the way Git does.
+canon_repo=$(_clone_remote)
+for canon_branch in rel linked; do
+  git -C "$canon_repo" switch --quiet -c "$canon_branch"
+  _commit_file "$canon_repo" "$canon_branch.txt" "$canon_branch" "add $canon_branch"
+  git -C "$canon_repo" switch --quiet main
+  git -C "$canon_repo" merge --quiet --no-ff "$canon_branch" -m "merge $canon_branch"
+done
+git -C "$canon_repo" push --quiet origin main
+canon_parent=$(_tmpdir)
+git -C "$canon_repo" worktree add --quiet "$canon_parent/rel" rel
+git -C "$canon_repo" worktree add --quiet "$canon_parent/linked" linked
+ln -s "$canon_parent/linked" "$canon_parent/alias"
+canon_out=$(cd "$canon_parent" && git -C "$canon_repo" cleanup-repo --porcelain \
+  --worktree "$(cd "$canon_parent" && printf '%s' "$PWD")/rel/" \
+  --worktree "$canon_parent/alias" 2>&1)
+_assert_contains "a trailing-slash scope argument selects the worktree" \
+  $'remove-worktree\t'"$canon_parent/rel"$'\tmerged\trel' "$canon_out"
+_assert_contains "a symlinked scope argument selects the worktree by its recorded path" \
+  $'remove-worktree\t'"$canon_parent/linked"$'\tmerged\tlinked' "$canon_out"
+
+# Arguments that name no linked worktree select nothing, never everything.
+none_repo=$(_clone_remote)
+git -C "$none_repo" switch --quiet -c bystander
+_commit_file "$none_repo" by.txt by "add bystander"
+git -C "$none_repo" switch --quiet main
+git -C "$none_repo" merge --quiet --no-ff bystander -m "merge bystander"
+git -C "$none_repo" push --quiet origin main
+none_dir=$(_tmpdir)
+rm -rf "$none_dir"
+git -C "$none_repo" worktree add --quiet "$none_dir" bystander
+none_out=$(git -C "$none_repo" cleanup-repo --porcelain --worktree "$(_tmpdir)" 2>&1)
+_assert_contains "an unmatched scope argument removes no worktree" \
+  $'keep-branch\tbystander\tchecked-out\t'"$none_dir" "$none_out"
+_assert_eq "an unmatched scope argument leaves the bystander checkout" present \
+  "$(if [[ -d "$none_dir" ]]; then printf present; else printf missing; fi)"
+
+# A worktree path with a tab cannot forge a field in a porcelain record.
+tab_repo=$(_clone_remote)
+git -C "$tab_repo" switch --quiet -c tabbed
+_commit_file "$tab_repo" tab.txt tab "add tabbed"
+git -C "$tab_repo" switch --quiet main
+git -C "$tab_repo" merge --quiet --no-ff tabbed -m "merge tabbed"
+git -C "$tab_repo" push --quiet origin main
+tab_dir="$(_tmpdir)/with"$'\t'"tab"
+git -C "$tab_repo" worktree add --quiet "$tab_dir" tabbed
+tab_out=$(git -C "$tab_repo" cleanup-repo --remove-worktrees --porcelain \
+  --dry-run 2>&1)
+_assert_contains "porcelain escapes a tab in a worktree path" \
+  $'would-remove-worktree\t'"${tab_dir%$'\t'tab}"$'\\ttab\tmerged\ttabbed' "$tab_out"
+
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2
   exit 1

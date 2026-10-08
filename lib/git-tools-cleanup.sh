@@ -23,6 +23,9 @@ unset _gt_lib_dir
 # Caller inputs. Reset on source so inherited values cannot widen what a run
 # removes. GT_CLEANUP_SWITCHED_TO_BASE means the invoking worktree leaves
 # GT_CLEANUP_CURRENT_BRANCH (or, in a dry run, would leave it) for the base.
+# A non-empty GT_CLEANUP_WORKTREE_SCOPE limits removal to those worktree paths;
+# GT_CLEANUP_ECHO_DRY_RUN=0 silences the dry-run command echo for callers that
+# render every decision themselves.
 {
   GT_CLEANUP_COMMAND=git-tools
   GT_CLEANUP_DRY_RUN=0
@@ -30,6 +33,8 @@ unset _gt_lib_dir
   GT_CLEANUP_SWITCHED_TO_BASE=0
   GT_CLEANUP_CURRENT_BRANCH=""
   GT_CLEANUP_CURRENT_WORKTREE=""
+  GT_CLEANUP_WORKTREE_SCOPE=()
+  GT_CLEANUP_ECHO_DRY_RUN=1
   GT_CLEANUP_PRUNE_PATHS=()
   GT_CLEANUP_ERROR=""
   GT_CLEANUP_UNINSPECTABLE_HINT=""
@@ -55,6 +60,7 @@ gt_cleanup_report() {
 # @brief Run a mutating command, or describe it in a dry run.
 gt_cleanup_run() {
   if [[ "$GT_CLEANUP_DRY_RUN" == 1 ]]; then
+    [[ "$GT_CLEANUP_ECHO_DRY_RUN" == 1 ]] || return 0
     printf '%s: would run:' "$GT_CLEANUP_COMMAND" >&2
     printf ' %q' "$@" >&2
     printf '\n' >&2
@@ -593,6 +599,17 @@ gt_cleanup_remove_worktree() {
   fi
 }
 
+# @brief Succeed when GT_CLEANUP_WORKTREE_SCOPE is empty or names this path.
+gt_cleanup_in_scope() {
+  local path="$1" scoped
+
+  ((${#GT_CLEANUP_WORKTREE_SCOPE[@]} > 0)) || return 0
+  for scoped in "${GT_CLEANUP_WORKTREE_SCOPE[@]}"; do
+    [[ "$scoped" == "$path" || "$scoped" -ef "$path" ]] && return 0
+  done
+  return 1
+}
+
 # @brief Release a branch from its worktree when cleanup may remove it.
 # Returns 0 when the branch is not checked out (or no longer will be), and 1
 # after reporting why its checkout keeps it.
@@ -630,7 +647,7 @@ _gt_cleanup_release_branch() {
     return 1
   fi
   [[ -n "$path" ]] || return 0
-  if [[ "$GT_CLEANUP_REMOVE_WORKTREES" != 1 ]]; then
+  if [[ "$GT_CLEANUP_REMOVE_WORKTREES" != 1 ]] || ! gt_cleanup_in_scope "$path"; then
     _gt_cleanup_keep "$branch" checked-out "$path" \
       "checked out in worktree $path"
     return 1

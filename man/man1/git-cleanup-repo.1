@@ -101,11 +101,102 @@ uses
 and Git's final clean check sees untracked files even in a repository that sets
 .BR status.showUntrackedFiles=no .
 .TP
+.BI \-\-worktree " path"
+Remove only this linked worktree; repeat for more. Implies
+.BR \-\-remove\-worktrees .
+A branch checked out in an unlisted worktree is kept.
+.TP
+.B \-\-no\-update\-base
+Prove merges against the pinned remote base without creating, switching to, or
+fast-forwarding the local base. The current branch is still kept, and a dirty
+or mid-operation current checkout is allowed because nothing touches it.
+.TP
+.B \-\-no\-fetch
+Prove against the existing
+.IB remote / base
+remote-tracking ref as of the last fetch instead of fetching. A ref that is
+merely behind keeps more branches, but if the remote base was rewound since,
+the ref can still contain commits the remote dropped.
+.TP
+.B \-\-porcelain
+Print one tab-separated record per decision on standard output, as described
+under
+.BR PORCELAIN ,
+and only diagnostics on standard error.
+.TP
 .BR \-n ", " \-\-dry\-run
 Print actions without changing anything.
 .TP
 .BR \-h ", " \-\-help
 Show help.
+.SH PORCELAIN
+Each record is
+.IR event ,
+.IR subject ,
+.IR code ,
+and
+.IR detail ,
+separated by tabs. Backslash, tab, and newline inside a field are written as
+.BR \e\e ,
+.BR \et ,
+and
+.BR \en .
+.TP
+.BR delete\-branch ", " would\-delete\-branch
+The subject is a branch, the code its proof
+.RB ( merged ,
+.BR content\-merged ,
+.BR tree\-landed ,
+.BR upstream\-gone ,
+or
+.BR all ),
+and the detail its proven object ID.
+.TP
+.B keep\-branch
+The subject is a branch and the code why it stays:
+.B merge\-unproven
+(detail
+.BR upstream\-gone ,
+.BR other\-upstream\-gone ,
+.BR upstream ,
+or
+.BR no\-upstream ),
+.BR current\-worktree ,
+.BR checked\-out ,
+.BR main\-worktree ,
+.BR locked ,
+.BR dirty ,
+.BR hidden ,
+.BR prune\-failed ,
+or
+.B remove\-failed
+(detail the worktree path),
+.B operation
+(detail the operation),
+.B in\-use
+(detail the process ID),
+.BR uninspectable ,
+.BR branch\-changed ,
+.BR reserved ,
+or
+.B ref\-delete\-failed
+(detail the proven object ID).
+.TP
+.BR remove\-worktree ", " would\-remove\-worktree
+The subject is a worktree path, the code why it goes (its branch's deletion
+code), and the detail its branch.
+.TP
+.BR prune\-entry ", " would\-prune\-entry
+The subject is a worktree path and the detail the disposable entry.
+.SH EXIT STATUS
+.TP
+.B 0
+Cleanup ran. Every decision was reported, including kept branches and failed
+removals.
+.TP
+.B 2
+Usage, repository, or remote error. Porcelain records already printed may be
+incomplete.
 .SH WORKTREE PRUNING
 Before removing an otherwise eligible linked worktree, the command recognizes
 two explicit classes of disposable top-level entries. A real top-level
@@ -130,8 +221,10 @@ and repeats all worktree checks afterward. Unknown local content present at
 preflight prevents every prune. Dry-run only reports entries that would be
 pruned.
 .SH SAFETY
-The command refuses to run with a dirty current worktree or active rebase,
-merge, cherry-pick, or revert state. Except for explicitly disposable entries,
+Unless
+.B \-\-no\-update\-base
+is given, the command refuses to run with a dirty current worktree or active
+rebase, merge, cherry-pick, or revert state. Except for explicitly disposable entries,
 a linked worktree is preserved when it has uncommitted, untracked, ignored, or
 index-hidden local content, is unreadable, is locked by an active operation, is
 the working directory of a visible process (read from

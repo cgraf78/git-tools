@@ -886,7 +886,16 @@ embedding contract.
   launcher or wrapper there cannot redirect their repository operations.
   Started by name, they also export `GIT_EXEC_PATH` and put that directory
   first on `PATH`, as Git does for its subcommands. If that binary is missing
-  they print a note and use `git` from `PATH`.
+  they print a note and use `git` from `PATH`. They never start Git's auto
+  maintenance in the repository they work on: they export
+  `maintenance.auto=false` and `gc.auto=0` as command-scope configuration
+  (`GIT_CONFIG_PARAMETERS`), which also reaches the hooks and editors their
+  Git commands run. A push to a remote on a local path can still start
+  maintenance in that remote repository. Since Git 2.54 that maintenance
+  prunes the registration of a worktree moved without `git worktree repair`
+  and idle longer than `gc.worktreePruneExpire` (three months by default);
+  cleanup would then no longer see the branch as checked out there and could
+  delete it. Run `git maintenance run` yourself when you want maintenance.
 - [`gh`](https://cli.github.com/), authenticated for the repository's GitHub
   host, for the `git pr-*` commands; `git repo-state`, `git branch-audit`, and
   `git worktree-audit` also use it when available to show PR details

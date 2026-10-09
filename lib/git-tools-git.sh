@@ -69,6 +69,26 @@ fi
 unset GIT_LITERAL_PATHSPECS GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS \
   GIT_ICASE_PATHSPECS
 
+# Git's auto maintenance never runs from git-tools. Fetch, merge, rebase,
+# commit, and am start `git maintenance run --auto` when they finish, and its
+# default strategy since Git 2.54 (like any `gc --auto` that decides to
+# collect) runs `git worktree prune`: a linked worktree moved without `git
+# worktree repair`, idle past gc.worktreePruneExpire, loses its registration
+# for good, and its branch then reads as checked out nowhere, free to delete.
+# maintenance.auto=false stops it, and gc.auto=0 stops the `gc --auto` that
+# Git without maintenance.auto (before 2.30) runs instead. Exported as
+# command-scope configuration, which outranks every config file, so it covers
+# every Git write here and in the git-tools commands these start without a
+# flag at each call site, and dry-run output still shows the plain command.
+# The old 'key=value' form is the one every supported Git reads; appended last
+# so it wins over an inherited value, and only once per environment.
+GT_GIT_NO_AUTO_MAINTENANCE="'maintenance.auto=false' 'gc.auto=0'"
+case "${GIT_CONFIG_PARAMETERS:-}" in
+  "$GT_GIT_NO_AUTO_MAINTENANCE" | *" $GT_GIT_NO_AUTO_MAINTENANCE") ;;
+  "") export GIT_CONFIG_PARAMETERS="$GT_GIT_NO_AUTO_MAINTENANCE" ;;
+  *) export GIT_CONFIG_PARAMETERS="$GIT_CONFIG_PARAMETERS $GT_GIT_NO_AUTO_MAINTENANCE" ;;
+esac
+
 # @brief Run Git's own binary (see above) with the given arguments.
 git() {
   command "$GT_GIT" "$@"

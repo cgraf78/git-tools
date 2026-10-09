@@ -19,7 +19,7 @@ _term_ignored=0
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
-GIT_TOOLS_TEST_REAL_GIT=$(type -a -p git | tail -n 1)
+GIT_TOOLS_TEST_REAL_GIT=${GIT_TOOLS_TEST_REAL_GIT:-$(type -a -p git | tail -n 1)}
 GIT_TOOLS_TEST_REAL_GREP=$(type -a -p grep | tail -n 1)
 export GIT_TOOLS_TEST_REAL_GIT GIT_TOOLS_TEST_REAL_GREP
 
@@ -6745,6 +6745,55 @@ EOF_SSH
     esac
   done
 fi
+
+# Git's auto maintenance never runs from git-tools: since Git 2.54 it prunes
+# the registration of a worktree moved without repair. Every Git call the
+# tools make, including one crossing into another worktree, reads it disabled
+# whatever the repository or the caller's command-scope configuration says.
+nm_repo=$(_clone_remote)
+git -C "$nm_repo" config maintenance.auto true
+git -C "$nm_repo" config gc.auto 5
+nm_config=$(cd "$nm_repo" &&
+  GIT_CONFIG_PARAMETERS="'maintenance.auto=true' 'gc.auto=9'" \
+    ROOT="$ROOT" REPO="$nm_repo" bash -c '
+      . "$ROOT/lib/git-tools-base.sh" || exit 1
+      git config --get maintenance.auto
+      git config --get gc.auto
+      gt_git_without_local_env -C "$REPO" config --get maintenance.auto
+      gt_git_without_local_env -C "$REPO" config --get gc.auto
+      # A git-tools command started by another appends nothing more.
+      before=$GIT_CONFIG_PARAMETERS
+      . "$ROOT/lib/git-tools-git.sh" || exit 1
+      [[ "$GIT_CONFIG_PARAMETERS" == "$before" ]] && echo once
+    ' 2>&1)
+_assert_eq "git-tools Git calls never start auto maintenance" \
+  "$(printf 'false\n0\nfalse\n0\nonce')" "$nm_config"
+
+# A base fast-forward with maintenance enabled (in the foreground, so a
+# prune lands before cleanup returns) keeps a moved worktree's registration
+# and its branch. Git 2.36 through 2.53 never prunes here, so passes either
+# way; before 2.36 cleanup cannot list worktrees and fails this case for
+# that reason.
+nm_repo=$(_merged_feature_repo)
+nm_parent=$(_tmpdir)
+git -C "$nm_repo" config maintenance.auto true
+git -C "$nm_repo" config maintenance.autoDetach false
+git -C "$nm_repo" config gc.autoDetach false
+git -C "$nm_repo" worktree add --quiet "$nm_parent/before" feat
+mv -- "$nm_parent/before" "$nm_parent/after"
+touch -t 202001010000 "$nm_repo/.git/worktrees/before/index"
+nm_out=$(git -C "$nm_repo" cleanup-repo --porcelain 2>&1)
+_assert_eq "cleanup fast-forwards the base" \
+  "$(git -C "$nm_repo" rev-parse refs/remotes/origin/main)" \
+  "$(git -C "$nm_repo" rev-parse refs/heads/main)"
+if [[ -d "$nm_repo/.git/worktrees/before" ]]; then
+  _pass "a base fast-forward keeps a moved worktree's registration"
+else
+  _fail "a base fast-forward keeps a moved worktree's registration"
+fi
+_assert_contains "the moved worktree's branch is kept" \
+  $'keep-branch\tfeat\tchecked-out' "$nm_out"
+_assert_contains "and still exists" feat "$(_branches "$nm_repo")"
 
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2

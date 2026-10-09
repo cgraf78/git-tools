@@ -28,9 +28,15 @@ GT_CLEANUP_COMMAND="git cleanup-repo"
 # statuses). Bump it whenever that contract gains or changes anything a
 # caller relies on, so a caller can require it instead of probing options
 # that arrived over several changes. 1: exit status 3; pr-unknown,
-# closed-pr, symref, and submodule codes; following a renamed remote
-# default; symref and ignored-file safety.
-_interface_version=1
+# closed-pr, symref, and submodule codes; the default-upstream-gone detail;
+# pr-unknown keeping a requested retirement; following a renamed remote
+# default. 2: the unpublished and unique-commits codes; pr-unknown and
+# unpublished keeping a branch --gone (and its worktree upstream-gone
+# retirement) would otherwise take; --min-age dating a branch whose reflog
+# expired (emptied, not never written) by its tip's commit, which too-new can
+# then carry; submodule covering files in an unpopulated submodule
+# directory. README and the man page list the same.
+_interface_version=2
 
 _usage() {
   cat <<'EOF'
@@ -47,27 +53,32 @@ Options:
   -b, --base <branch>       Base branch to keep and update.
   -r, --remote <name>       Remote endpoint to fetch from (default: origin).
       --gone                Select branches whose own-name upstream is gone
-                            (never a default branch's, which means a rename).
+                            (never a default branch's, which means a rename;
+                            with pull request evidence, never one whose tip
+                            GitHub has never seen or whose lookup failed).
   -a, --all                 Delete all local branches except the base branch.
-      --remove-worktrees    Remove eligible linked worktrees for deleted branches.
+      --remove-worktrees    Remove eligible linked worktrees for deleted
+                            branches.
       --worktree <path>     Remove only this linked worktree (repeatable);
                             implies --remove-worktrees. With an explicit
                             --remove-worktrees, every eligible worktree goes.
       --no-update-base      Prove against the remote base without changing the
                             local base or the current checkout.
       --no-fetch            Prove against the remote-tracking base ref instead
-                            of fetching it.
+                            of fetching it, and skip pull request evidence.
       --porcelain           Print one tab-separated record per decision on
                             stdout instead of messages on stderr.
-      --min-age <days>      Keep branches proven only by ancestry that their
-                            reflog shows created or moved less than this many
-                            days ago (or that have no reflog).
+      --min-age <days>      Keep branches proven only by ancestry that were
+                            created or moved less than this many days ago, by
+                            their reflog or, once it has expired, their tip's
+                            commit date; one never logged has an unknown age
+                            and is kept.
       --retire-worktree <path>
                             Remove this linked worktree (repeatable); the
                             caller vouches for it. Its branch is kept unless
                             cleanup proves it merged; an open-pr, too-new,
-                            pr-unknown, or unreachable-head decision keeps
-                            the worktree too.
+                            pr-unknown, unreachable-head, or unique-commits
+                            decision keeps the worktree too.
       --include-closed      Also retire a selected worktree whose branch only
                             a closed, unmerged pull request contains.
   -n, --dry-run             Print actions without changing anything.
@@ -235,6 +246,15 @@ _symref_aliases() {
 
 _local_branch_exists() {
   gt_find_ref_commit "refs/heads/$1"
+}
+
+# Print a count with the singular or plural form of its noun.
+_count() {
+  if [[ "$1" == 1 ]]; then
+    printf '1 %s' "$2"
+  else
+    printf '%s %s' "$1" "$3"
+  fi
 }
 
 _validate_native_oid() {
@@ -688,29 +708,54 @@ _update_base() {
   _base_oid=$GT_REF_OID
 }
 
-# Print the epoch second of a branch's newest reflog entry: when it was last
-# created or moved. Fails when the branch has no reflog, which happens with
-# core.logAllRefUpdates=false or after reflog expiry; its tip's committer time
-# would be no substitute, since a new branch on an old commit looks old.
+# Print the epoch second a branch was last created or moved: its newest
+# reflog entry. Reflog entries expire (gc.reflogExpire, 90 days by default),
+# and an old merged branch must not stay too-new forever for lack of one, so
+# a branch whose reflog has expired (expiry leaves the log, emptied) falls
+# back to its tip's committer time. That is safe because Git appends to a
+# branch's existing reflog on every move, even with core.logAllRefUpdates
+# false, so a new branch on an old commit still reads as new. A branch that
+# was never logged (created while core.logAllRefUpdates was false, or by a
+# bare repository's linked worktree) has no reflog at all, an unknown age,
+# and this fails.
 _branch_touched_at() {
-  local branch="$1" when
+  local branch="$1" oid="$2" when nl=$'\n'
 
   when=$(git reflog show -n 1 --date=unix --format=%gd \
     "refs/heads/$branch" -- 2>/dev/null) || return 1
-  when=${when##*@\{}
-  when=${when%\}}
+  if [[ -n "$when" ]]; then
+    when=${when##*@\{}
+    when=${when%\}}
+  else
+    git reflog exists "refs/heads/$branch" 2>/dev/null || return 1
+    [[ "$_tip_dates" == *"$nl$oid "* ]] || return 1
+    when=${_tip_dates#*"$nl$oid "}
+    when=${when%%"$nl"*}
+  fi
   [[ "$when" =~ ^[0-9]+$ ]] || return 1
   printf '%s\n' "$when"
+}
+
+# Set _tip_dates to `<oid> <committer epoch>` lines for every branch tip, so
+# the age fallback costs one Git process for the run instead of one per
+# branch. A tip it does not list keeps its branch (age unknown).
+_load_tip_dates() {
+  _tip_dates=$'\n'$(git for-each-ref \
+    --format='%(objectname) %(committerdate:unix)' refs/heads 2>/dev/null)$'\n' ||
+    _tip_dates=$'\n'
 }
 
 # Decide one branch. Prints `<code> TAB <detail>` and succeeds with a deletion
 # reason (merged, content-merged, tree-landed, merged-pr, upstream-gone, or
 # all), or fails, printing a keep code when one applies (too-new, open-pr,
-# closed-pr, or pr-unknown when pull request evidence was wanted but could not
-# be read) and nothing when the merge is simply unproven.
+# closed-pr, pr-unknown when pull request evidence was wanted but could not
+# be read, or unpublished when its upstream is gone but GitHub never saw its
+# tip). When the merge is simply unproven it prints an empty code, with a
+# human hint as the detail when pull request evidence offers one.
 _delete_reason() {
   local branch="$1" branch_oid="$2" upstream_track="$3" remote_name="$4"
   local remote_ref="$5" proof touched now lineage kind="" number=""
+  local other_number="" other_base=""
 
   if [[ "$_all" == 1 ]]; then
     printf 'all\t\n'
@@ -721,7 +766,7 @@ _delete_reason() {
     # A branch with no commits of its own is indistinguishable from one that
     # was fast-forward merged; a young one is more likely new work.
     if [[ "$proof" == merged && "$_min_age" != 0 ]]; then
-      touched=$(_branch_touched_at "$branch") || touched=""
+      touched=$(_branch_touched_at "$branch" "$branch_oid") || touched=""
       now=$(date +%s) || now=""
       if [[ -z "$touched" || -z "$now" ]] ||
         ((now - touched < _min_age * 86400)); then
@@ -735,7 +780,7 @@ _delete_reason() {
   if [[ -n "$_github_repo" ]]; then
     lineage=$(gt_cleanup_pr_lineage "$_github_host" "$_github_repo" \
       "$branch" "$branch_oid" "$_base_oid" "$_base") || lineage="unknown"
-    IFS=$'\t' read -r kind number <<<"$lineage"
+    IFS=$'\t' read -r kind number other_number other_base <<<"$lineage"
     case "$kind" in
       merged)
         printf 'merged-pr\t%s\n' "$number"
@@ -743,6 +788,20 @@ _delete_reason() {
         ;;
       open)
         printf 'open-pr\t%s\n' "$number"
+        return 1
+        ;;
+      # A gone upstream says the remote branch was retired, not that every
+      # local commit reached it: work committed after it vanished is still
+      # only here. When the lookup that could tell failed, or GitHub has
+      # never seen the tip, --gone must not drop the branch. (Without
+      # GitHub evidence at all, it still does.)
+      unknown)
+        printf 'pr-unknown\t\n'
+        return 1
+        ;;
+      unpublished)
+        ! _gone_upstream_is_evidence "$branch" "$upstream_track" \
+          "$remote_name" "$remote_ref" || printf 'unpublished\t\n'
         return 1
         ;;
     esac
@@ -753,16 +812,18 @@ _delete_reason() {
     printf 'upstream-gone\t\n'
     return 0
   fi
-  case "$kind" in
-    closed) printf 'closed-pr\t%s\n' "$number" ;;
-    unknown) printf 'pr-unknown\t\n' ;;
-  esac
+  if [[ "$kind" == closed ]]; then
+    printf 'closed-pr\t%s\n' "$number"
+  elif [[ -n "$other_number" ]]; then
+    printf '\tmerged PR #%s targeted %s, not %s\n' "$other_number" \
+      "$other_base" "$_base"
+  fi
   return 1
 }
 
 _inventory_branches() {
   local records branch_ref branch branch_oid upstream upstream_track
-  local remote_name remote_ref symref aliases status=0
+  local remote_name remote_ref symref aliases why status=0
   local symref_targets=$'\n'
 
   _branches=()
@@ -805,8 +866,13 @@ _inventory_branches() {
     [[ "$branch" != "$_base" && "$branch" != "$_inferred_base" ]] || continue
     if [[ "$symref_targets" == *$'\n'"$branch_ref"$'\n'* ]]; then
       aliases=$(_symref_aliases "$records" "$branch_ref")
+      if [[ "$aliases" == *' '* ]]; then
+        why="the symbolic refs $aliases point at it"
+      else
+        why="the symbolic ref $aliases points at it"
+      fi
       gt_cleanup_report keep-branch "$branch" symref "$aliases" \
-        "keeping $branch; the symbolic ref(s) $aliases point at it"
+        "keeping $branch; $why"
       _symref_branches+=("$branch")
       continue
     fi
@@ -827,7 +893,7 @@ _inventory_branches() {
 
 _cleanup_branches() {
   local branch branch_oid upstream upstream_track remote_name remote_ref
-  local decision code detail label index summary
+  local decision code detail label index summary why
   local candidates=0 skipped=0 unproven="merge not proven"
 
   # Merges are proven against the local base. When its update was skipped,
@@ -868,7 +934,7 @@ _cleanup_branches() {
         _decided_codes+=("too-new")
         _decided_details+=("$detail")
         gt_cleanup_report keep-branch "$branch" too-new "$detail" \
-          "keeping $branch; merged by ancestry but created or moved less than $_min_age day(s) ago, or it has no reflog"
+          "keeping $branch; merged by ancestry but created or moved less than $(_count "$_min_age" day days) ago (by its reflog, or its tip's commit date once that has expired), or its age is unknown"
         skipped=$((skipped + 1))
         continue
         ;;
@@ -899,31 +965,40 @@ _cleanup_branches() {
         skipped=$((skipped + 1))
         continue
         ;;
+      unpublished)
+        _unpublished_branches+=("$branch")
+        gt_cleanup_report keep-branch "$branch" unpublished "" \
+          "keeping $branch; $unproven; its upstream is gone, but GitHub has no record of its tip, so it holds commits that were never pushed"
+        skipped=$((skipped + 1))
+        continue
+        ;;
     esac
+    why=$unproven
+    [[ -z "$detail" ]] || why+="; $detail"
     # Upstream state comes from remote-tracking refs as of the last fetch;
     # cleanup fetches only the base, so say so rather than claim it is live.
     if _gone_upstream_is_evidence "$branch" "$upstream_track" "$remote_name" \
       "$remote_ref"; then
       gt_cleanup_report keep-branch "$branch" merge-unproven upstream-gone \
-        "keeping $branch; $unproven; upstream is gone; --gone selects it for cleanup"
+        "keeping $branch; $why; upstream is gone; --gone selects it for cleanup"
     elif gt_own_upstream_gone "$branch" "$upstream_track" "$remote_name" \
       "$remote_ref"; then
       gt_cleanup_report keep-branch "$branch" merge-unproven default-upstream-gone \
-        "keeping $branch; $unproven; its upstream, a default branch, is gone, which means a rename, so --gone never selects it"
+        "keeping $branch; $why; its upstream, a default branch, is gone, which means a rename, so --gone never selects it"
     elif [[ "$upstream_track" == "[gone]" ]]; then
       gt_cleanup_report keep-branch "$branch" merge-unproven \
         other-upstream-gone \
-        "keeping $branch; $unproven; upstream $upstream is gone, but it is not this branch's own remote branch"
+        "keeping $branch; $why; upstream $upstream is gone, but it is not this branch's own remote branch"
     elif [[ -n "$upstream" && "$remote_name" == "$_remote" &&
       "$remote_ref" == "refs/heads/$_base" ]]; then
       gt_cleanup_report keep-branch "$branch" merge-unproven upstream \
-        "keeping $branch; $unproven; it tracks the base $upstream, which says nothing about its own commits"
+        "keeping $branch; $why; it tracks the base $upstream, which says nothing about its own commits"
     elif [[ -n "$upstream" ]]; then
       gt_cleanup_report keep-branch "$branch" merge-unproven upstream \
-        "keeping $branch; $unproven; upstream $upstream still exists as of the last fetch"
+        "keeping $branch; $why; upstream $upstream still exists as of the last fetch"
     else
       gt_cleanup_report keep-branch "$branch" merge-unproven no-upstream \
-        "keeping $branch; $unproven; no upstream is configured"
+        "keeping $branch; $why; no upstream is configured"
     fi
     skipped=$((skipped + 1))
   done
@@ -931,9 +1006,9 @@ _cleanup_branches() {
   [[ -z "$GT_CLEANUP_UNINSPECTABLE_HINT" ]] ||
     _say "$GT_CLEANUP_UNINSPECTABLE_HINT"
   if [[ "$_dry_run" == 1 ]]; then
-    summary="done; would delete $candidates local branch(es), skipped $skipped"
+    summary="done; would delete $(_count "$candidates" "local branch" "local branches"), skipped $skipped"
   else
-    summary="done; deleted $candidates local branch(es), skipped $skipped"
+    summary="done; deleted $(_count "$candidates" "local branch" "local branches"), skipped $skipped"
   fi
   # Exit 0 still means cleanup did what it safely could; the summary says when
   # the local base was left behind the remote, so it is not taken as current.
@@ -1270,7 +1345,11 @@ _retire_worktrees() {
         continue
       fi
       code=requested
-    elif [[ -n "$branch" ]]; then
+    elif [[ -n "$branch" ]] &&
+      ! _listed "$branch" ${_unpublished_branches[@]+"${_unpublished_branches[@]}"} &&
+      ! _listed "$branch" ${_pr_unknown_branches[@]+"${_pr_unknown_branches[@]}"}; then
+      # The evidence that kept an unpublished or pr-unknown branch from
+      # --gone keeps its checkout from upstream-gone retirement too.
       index=0
       while ((index < ${#_branches[@]})); do
         if [[ "${_branches[$index]}" == "$branch" ]] &&
@@ -1294,6 +1373,9 @@ _retire_worktrees() {
       elif [[ -n "$branch" ]] &&
         _listed "$branch" ${_pr_unknown_branches[@]+"${_pr_unknown_branches[@]}"}; then
         code=pr-unknown
+      elif [[ -n "$branch" ]] &&
+        _listed "$branch" ${_unpublished_branches[@]+"${_unpublished_branches[@]}"}; then
+        code=unpublished
       elif [[ -n "$branch" ]] &&
         _listed "$branch" ${_symref_branches[@]+"${_symref_branches[@]}"}; then
         code=symref
@@ -1319,6 +1401,7 @@ _porcelain_field() {
 }
 
 _base_skip_reason=""
+_tip_dates=$'\n'
 _parse_args "$@"
 # shellcheck disable=SC2034 # read by lib/git-tools-cleanup.sh
 GT_CLEANUP_DRY_RUN=$_dry_run
@@ -1349,6 +1432,7 @@ _decided_codes=()
 _decided_details=()
 _closed_branches=()
 _pr_unknown_branches=()
+_unpublished_branches=()
 _github_host=""
 _github_repo=""
 if [[ "$_fetch" == 1 ]] && command -v gh >/dev/null 2>&1 &&
@@ -1378,5 +1462,9 @@ else
   _pin_remote_base
   _base_oid=$_remote_oid
 fi
+# Branch ages are judged in command substitutions, which cannot cache.
+[[ "$_min_age" == 0 ]] || _load_tip_dates
+# shellcheck disable=SC2034 # read by lib/git-tools-cleanup.sh
+GT_CLEANUP_BASE_OID=$_base_oid
 _cleanup_branches
 _retire_worktrees

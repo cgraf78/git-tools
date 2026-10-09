@@ -88,10 +88,10 @@ _derive_base() {
 
   # gt_resolve_base prints "<ref>\t<merge-base>"; the rebase only needs the
   # branch point commit, so keep the trailing field.
-  local resolved
+  local resolved tab=$'\t'
   resolved=$(gt_resolve_base) ||
     _die "could not determine branch base; pass --base <rev>"
-  printf '%s\n' "${resolved#*$'\t'}"
+  printf '%s\n' "${resolved#*"$tab"}"
 }
 
 _validate_base() {

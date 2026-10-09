@@ -59,6 +59,16 @@ if [[ "${_GT_GIT_RESOLVED:-}" != "$$" ]]; then
   _GT_GIT_RESOLVED=$$
 fi
 
+# git-tools builds its own pathspecs (`:(top,literal)<path>` for the
+# overwrite prediction, cache pruning, and squash proofs) and takes none from
+# the user. A global pathspec mode inherited from the caller (`git
+# --literal-pathspecs <tool>` exports GIT_LITERAL_PATHSPECS=1 to the tool)
+# would make Git read that magic as a literal file name, so a safety check
+# matches nothing and passes: an ignored file in a sparse checkout was then
+# overwritten. Clear every such mode so each pathspec means what it says.
+unset GIT_LITERAL_PATHSPECS GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS \
+  GIT_ICASE_PATHSPECS
+
 # @brief Run Git's own binary (see above) with the given arguments.
 git() {
   command "$GT_GIT" "$@"

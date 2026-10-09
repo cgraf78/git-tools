@@ -388,7 +388,7 @@ _assert_contains "diagnoses an existing upstream" \
 _assert_contains "diagnoses a branch without an upstream" \
   "keeping local-only; merge not proven; no upstream is configured" "$result"
 _assert_contains "reports deletion summary" \
-  "deleted 1 local branch(es), skipped 3" "$result"
+  "deleted 1 local branch, skipped 3" "$result"
 _assert_not_contains "summary of an updated base reports no skip" \
   "main not updated" "$result"
 expected="$(printf 'gone\nkeep\nlocal-only\nmain')"
@@ -2394,6 +2394,43 @@ _assert_eq "ignored content preserves branch" ignored-work \
   "$(git -C "$ignored_worktree_repo" branch --list --format='%(refname:short)' ignored-work)"
 _assert_eq "ignored content preserves worktree" present \
   "$(if [[ -e "$ignored_worktree_dir" ]]; then printf 'present'; else printf 'missing'; fi)"
+_assert_contains "a hidden-content keep under --all says the branch is not proven merged" \
+  "(untracked or ignored notes.local); it is not proven merged" "$ignored_worktree_output"
+
+# The hidden-content keep names what is in the way, says when the branch is
+# merged anyway, and points at the setting that marks generated entries
+# disposable; the porcelain detail stays the worktree path.
+hw_repo=$(_clone_remote)
+git -C "$hw_repo" switch --quiet -c hw-merged
+_commit_file "$hw_repo" hw.txt hw "add hw-merged"
+git -C "$hw_repo" switch --quiet main
+git -C "$hw_repo" merge --quiet --no-ff hw-merged -m "merge hw-merged"
+git -C "$hw_repo" push --quiet origin main
+hw_dir=$(_tmpdir)
+rm -rf "$hw_dir"
+git -C "$hw_repo" worktree add --quiet "$hw_dir" hw-merged
+printf '.env\nbuild/\n' >>"$hw_repo/.git/info/exclude"
+mkdir -p "$hw_dir/build/obj" "$hw_dir/scratch"
+printf 'x\n' >"$hw_dir/.env"
+printf 'x\n' >"$hw_dir/build/obj/a.o"
+printf 'x\n' >"$hw_dir/scratch/one"
+printf 'x\n' >"$hw_dir/scratch/two"
+printf 'x\n' >"$hw_dir/zz-notes"
+hw_out=$(git -C "$hw_repo" cleanup-repo --remove-worktrees 2>&1)
+_assert_contains "a hidden-content keep names the first entries in the way" \
+  "skipping hw-merged; worktree has hidden local content: $hw_dir (untracked or ignored scratch/, zz-notes, .env, ...); it is proven merged (merged), so only that content keeps it; for generated entries, see cleanupRepo.worktreePrunePath" \
+  "$hw_out"
+hw_out=$(git -C "$hw_repo" cleanup-repo --remove-worktrees --porcelain 2>&1)
+_assert_contains "the hidden-content porcelain record is unchanged" \
+  $'keep-branch\thw-merged\thidden\t'"$hw_dir"$'\n' "$hw_out"$'\n'
+rm -rf "$hw_dir/.env" "$hw_dir/build" "$hw_dir/scratch" "$hw_dir/zz-notes"
+git -C "$hw_dir" update-index --skip-worktree hw.txt
+hw_out=$(git -C "$hw_repo" cleanup-repo --remove-worktrees 2>&1)
+_assert_contains "an index-hidden keep names the flagged entries" \
+  "worktree has hidden local content: $hw_dir (index entries marked skip-worktree or assume-unchanged hw.txt); it is proven merged (merged), so only that content keeps it" \
+  "$hw_out"
+_assert_not_contains "an index-hidden keep does not suggest pruning" \
+  "worktreePrunePath" "$hw_out"
 
 # A top-level directory carrying the standard cache-directory signature is an
 # explicit promise that its contents are disposable. Such a cache must not
@@ -3146,7 +3183,7 @@ _assert_contains "dirty base worktree update is skipped with a message" \
   "not updating main; worktree has local changes: $lw_dirty_repo" \
   "$result"
 _assert_contains "summary says the base was not updated and why" \
-  "done; deleted 0 local branch(es), skipped 1; main not updated (worktree has local changes: $lw_dirty_repo)" \
+  "done; deleted 0 local branches, skipped 1; main not updated (worktree has local changes: $lw_dirty_repo)" \
   "$result"
 _assert_eq "dirty base worktree is not fast-forwarded" \
   "$lw_dirty_old" "$(git -C "$lw_dirty_repo" rev-parse refs/heads/main)"
@@ -3315,7 +3352,7 @@ _assert_contains "main worktree dry run reports deleting the branch it leaves" \
 _assert_not_contains "main worktree dry run does not plan to remove itself" \
   "worktree remove" "$result"
 _assert_contains "main worktree dry run summary matches the real run" \
-  "would delete 1 local branch(es), skipped 0" "$result"
+  "would delete 1 local branch, skipped 0" "$result"
 
 # A main checkout with a separate Git directory is still the main worktree.
 lw_sep_remote=$(_tmpdir)
@@ -4118,26 +4155,27 @@ _assert_eq "no-fetch without a remote-tracking base fails" 2 "$nf_rc"
 _assert_contains "no-fetch names the missing remote-tracking base" \
   "remote-tracking base does not exist: origin/main" "$nf_out"
 
-# A clone whose local origin/HEAD still names master after the remote renamed
-# its default branch to main and deleted master. Git records origin/HEAD at
-# clone time and never refreshes it. Prints the clone.
+# A clone whose local origin/HEAD still names master (or the old default
+# given as $1) after the remote renamed its default branch to main and
+# deleted the old one. Git records origin/HEAD at clone time and never
+# refreshes it. Prints the clone.
 _renamed_default_repo() {
-  local remote repo
+  local old="${1:-master}" remote repo
 
   remote=$(_tmpdir)
   repo=$(_tmpdir)
-  git init --bare --initial-branch=master "$remote" >/dev/null
+  git init --bare --initial-branch="$old" "$remote" >/dev/null
   _git_init "$repo"
-  git -C "$repo" switch --quiet -c master
+  git -C "$repo" switch --quiet -c "$old"
   _commit_file "$repo" README.md base base
   git -C "$repo" switch --quiet -c renamed-merged
   _commit_file "$repo" rn.txt rn "add renamed-merged"
-  git -C "$repo" switch --quiet master
+  git -C "$repo" switch --quiet "$old"
   git -C "$repo" merge --quiet --no-ff renamed-merged -m "merge renamed-merged"
   git -C "$repo" remote add origin "$remote"
-  git -C "$repo" push --quiet -u origin master 2>/dev/null
-  git -C "$repo" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
-  git --git-dir="$remote" branch -m master main
+  git -C "$repo" push --quiet -u origin "$old" 2>/dev/null
+  git -C "$repo" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$old"
+  git --git-dir="$remote" branch -m "$old" main
   git --git-dir="$remote" symbolic-ref HEAD refs/heads/main
   printf '%s\n' "$repo"
 }
@@ -4183,33 +4221,33 @@ _assert_eq "a dry run deletes nothing" \
   "$(printf 'master\nrenamed-merged')" "$(_branches "$rd_dry_repo")"
 
 # The old default stays protected like the base, even when it is not checked
-# out: the rename left its upstream gone without it having landed.
-rd_old_repo=$(_renamed_default_repo)
+# out and fully merged: it is not a candidate at all, so it gets no record.
+# A conventional name (master) would be kept by the default-branch rule
+# anyway, so a non-conventional one shows the protection itself.
+rd_old_repo=$(_renamed_default_repo develop)
 git -C "$rd_old_repo" switch --quiet -c work
-_commit_file "$rd_old_repo" work.txt work "add work"
-git -C "$rd_old_repo" switch --quiet master
-_commit_file "$rd_old_repo" unpushed.txt unpushed "unpushed on master"
-git -C "$rd_old_repo" switch --quiet work
 rd_rc=0
-rd_out=$(git -C "$rd_old_repo" cleanup-repo --no-update-base --porcelain --min-age 0 2>/dev/null) || rd_rc=$?
+rd_out=$(git -C "$rd_old_repo" cleanup-repo --no-update-base --porcelain 2>/dev/null) || rd_rc=$?
 _assert_eq "a followed default keeps the old default on a merge sweep" 0 "$rd_rc"
-_assert_not_contains "a merge sweep never deletes the old default" \
-  $'delete-branch\tmaster' "$rd_out"
-# Prune the stale remote-tracking master so its upstream reads as gone, but
-# keep origin/HEAD naming it: Git 2.48+ may refresh origin/HEAD on fetch
+_assert_contains "the merge sweep still decides other branches" \
+  $'delete-branch\trenamed-merged\tmerged' "$rd_out"
+_assert_not_contains "a fully merged old default gets no record on a merge sweep" \
+  $'\tdevelop\t' "$rd_out"
+# Prune the stale remote-tracking ref so its upstream reads as gone, but keep
+# origin/HEAD naming it: Git 2.48+ may refresh origin/HEAD on fetch
 # (remote.<name>.followRemoteHEAD), and then main is inferred directly and
 # nothing is followed.
 git -C "$rd_old_repo" config remote.origin.followRemoteHEAD never
 git -C "$rd_old_repo" fetch --quiet --prune origin
-git -C "$rd_old_repo" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
+git -C "$rd_old_repo" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/develop
 _assert_eq "the gone-sweep fixture still has a stale origin/HEAD" \
-  refs/remotes/origin/master "$(git -C "$rd_old_repo" symbolic-ref refs/remotes/origin/HEAD)"
+  refs/remotes/origin/develop "$(git -C "$rd_old_repo" symbolic-ref refs/remotes/origin/HEAD)"
 rd_rc=0
 rd_out=$(git -C "$rd_old_repo" cleanup-repo --no-update-base --gone --porcelain 2>/dev/null) || rd_rc=$?
 _assert_eq "a followed default keeps the old default on a gone sweep" 0 "$rd_rc"
-_assert_not_contains "a gone sweep never deletes the old default with unpushed work" \
-  $'delete-branch\tmaster' "$rd_out"
-_assert_contains "the old default survives both sweeps" "master" "$(_branches "$rd_old_repo")"
+_assert_not_contains "a fully merged old default gets no record on a gone sweep" \
+  $'\tdevelop\t' "$rd_out"
+_assert_contains "the old default survives both sweeps" develop "$(_branches "$rd_old_repo")"
 
 # Without origin/HEAD the base comes from the main/master/trunk fallback; it
 # follows too, but no origin/HEAD is blamed or refreshed.
@@ -4401,6 +4439,11 @@ case "$endpoint" in
     ;;
   *) exit 1 ;;
 esac
+# A <file>.fail stands for an HTTP error: gh prints its body and exits 1.
+if [[ -f "$file.fail" ]]; then
+  cat "$file.fail"
+  exit 1
+fi
 if [[ -f "$file" ]]; then cat "$file"; else printf '[[]]\n'; fi
 EOF
 chmod +x "$gh_bin/gh"
@@ -4464,14 +4507,14 @@ if command -v jq >/dev/null 2>&1; then
     >"$gh_dir/commits-$pr_tip.json"
   printf '[[{"sha":"%s"}]]\n' "$pr_tip" >"$gh_dir/members-7.json"
   result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir FAKE_GH_FAIL=1 \
-    git cleanup-repo 2>&1)
-  _assert_contains "a failing gh is no proof" \
-    "keeping pr-snapshot; merge not proven" "$result"
+    git cleanup-repo --porcelain 2>&1)
+  _assert_contains "a failing gh is no proof, and says the lookup failed" \
+    $'keep-branch\tpr-snapshot\tpr-unknown\t' "$result"
   : >"$gh_dir/calls"
   result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
-    git cleanup-repo --no-fetch 2>&1)
+    git cleanup-repo --no-fetch --porcelain 2>&1)
   _assert_contains "no-fetch withholds pull request evidence" \
-    "keeping pr-snapshot; merge not proven" "$result"
+    $'keep-branch\tpr-snapshot\tmerge-unproven\tno-upstream' "$result"
   _assert_eq "no-fetch never calls gh" "" "$(cat "$gh_dir/calls")"
 
   # A merge commit that is not on the pinned base proves nothing.
@@ -4492,6 +4535,33 @@ if command -v jq >/dev/null 2>&1; then
   _assert_contains "an open PR keeps the branch" \
     $'keep-branch\tpr-snapshot\topen-pr\t9' "$result"
   rm -f "$gh_dir/named-pr-snapshot.json"
+
+  # A PR that merged into another base (a stacked parent) proves nothing for
+  # this base, but the keep message says so instead of a bare merge-unproven.
+  printf '[[%s]]\n' "$(_pr_json 173 closed '"2026-01-01T00:00:00Z"' "\"$pr_merge\"" |
+    sed 's/"base":{"ref":"main"/"base":{"ref":"stack-parent"/')" \
+    >"$gh_dir/commits-$pr_tip.json"
+  result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    git cleanup-repo 2>&1)
+  _assert_contains "a PR merged into another base is named in the keep message" \
+    "keeping pr-snapshot; merge not proven; merged PR #173 targeted stack-parent, not main; no upstream is configured" \
+    "$result"
+  result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    git cleanup-repo --porcelain 2>&1)
+  _assert_contains "a PR merged into another base leaves the porcelain record alone" \
+    $'keep-branch\tpr-snapshot\tmerge-unproven\tno-upstream' "$result"
+  # Only a merged PR into another base is worth naming; an open or closed
+  # unmerged one says nothing about where the work went.
+  printf '[[%s,%s]]\n' \
+    "$(_pr_json 174 open null null | sed 's/"base":{"ref":"main"/"base":{"ref":"stack-parent"/')" \
+    "$(_pr_json 175 closed null null | sed 's/"base":{"ref":"main"/"base":{"ref":"stack-parent"/')" \
+    >"$gh_dir/commits-$pr_tip.json"
+  result=$(cd "$pr_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    git cleanup-repo 2>&1)
+  _assert_contains "unmerged PRs into another base leave a plain keep message" \
+    "keeping pr-snapshot; merge not proven; no upstream is configured" "$result"
+  _assert_not_contains "unmerged PRs into another base are not named" "targeted" "$result"
+  rm -f "$gh_dir/commits-$pr_tip.json"
 else
   printf 'skip - pull request evidence cases need jq\n'
 fi
@@ -4516,6 +4586,10 @@ _assert_contains "min-age still deletes an old ancestry-only branch" \
   $'delete-branch\told-merged\tmerged\t' "$result"
 _assert_contains "min-age does not hold back a content proof" \
   $'delete-branch\tfresh-squash\tcontent-merged\t' "$result"
+result=$(git -C "$age_repo" cleanup-repo --min-age 1 --dry-run 2>&1)
+_assert_contains "a one-day min-age reads in the singular" \
+  "keeping fresh-start; merged by ancestry but created or moved less than 1 day ago" \
+  "$result"
 result=$(git -C "$age_repo" cleanup-repo --porcelain 2>&1)
 _assert_contains "without min-age a young ancestry-only branch is deleted" \
   $'delete-branch\tfresh-start\tmerged\t' "$result"
@@ -4528,15 +4602,56 @@ for age_bad in 08 010 100000 -1; do
   _assert_eq "min-age $age_bad is a usage error" 2 "$age_rc"
 done
 
-# Without a reflog the branch's age is unknown, so min-age keeps it: a new
-# branch on an old commit would otherwise look old.
+# Where reflogs are not written, a branch without one has an unknown age, so
+# min-age keeps it even at an old commit: a new branch there would otherwise
+# look old.
 noreflog_repo=$(_clone_remote)
+GIT_COMMITTER_DATE="@$(($(date +%s) - 200 * 86400)) +0000" \
+  git -C "$noreflog_repo" commit --quiet --allow-empty -m "old mainline work"
+git -C "$noreflog_repo" push --quiet origin main
 git -C "$noreflog_repo" config core.logAllRefUpdates false
 git -C "$noreflog_repo" branch no-reflog
-rm -f "$(git -C "$noreflog_repo" rev-parse --git-path logs/refs/heads/no-reflog)"
+rm -f "$noreflog_repo/.git/logs/refs/heads/no-reflog"
 result=$(git -C "$noreflog_repo" cleanup-repo --min-age 1 --porcelain 2>&1)
 _assert_contains "min-age keeps an ancestry-only branch without a reflog" \
   $'keep-branch\tno-reflog\ttoo-new\t' "$result"
+
+# Reflog entries expire, so where reflogs are written, a branch without one
+# falls back to its tip's commit date: an old tip is old enough. A branch
+# just created at that same old commit has a fresh reflog entry and stays.
+expired_repo=$(_clone_remote)
+GIT_COMMITTER_DATE="@$(($(date +%s) - 200 * 86400)) +0000" \
+  git -C "$expired_repo" commit --quiet --allow-empty -m "old mainline work"
+git -C "$expired_repo" push --quiet origin main
+git -C "$expired_repo" branch expired-reflog
+git -C "$expired_repo" branch fresh-on-old
+git -C "$expired_repo" reflog expire --expire=all refs/heads/expired-reflog
+result=$(git -C "$expired_repo" cleanup-repo --min-age 30 --porcelain 2>&1)
+_assert_contains "min-age dates a branch with an expired reflog by its old tip" \
+  $'delete-branch\texpired-reflog\tmerged\t' "$result"
+_assert_contains "min-age keeps a branch freshly created at an old commit" \
+  $'keep-branch\tfresh-on-old\ttoo-new\t' "$result"
+# A branch that was never logged has no reflog at all, not an emptied one:
+# `git worktree add -b` in a bare repository writes none. Its age is
+# unknown, so it stays even at an old commit.
+bare_seed=$(_clone_remote)
+GIT_COMMITTER_DATE="@$(($(date +%s) - 200 * 86400)) +0000" \
+  git -C "$bare_seed" commit --quiet --allow-empty -m "old mainline work"
+git -C "$bare_seed" push --quiet origin main
+bare_parent=$(_tmpdir)
+git clone --quiet --bare "$(git -C "$bare_seed" remote get-url origin)" \
+  "$bare_parent/repo.git"
+git -C "$bare_parent/repo.git" worktree add --quiet -b bare-new \
+  "$bare_parent/bare-new" main
+_assert_eq "the bare-backed fixture's new branch has no reflog" 1 \
+  "$(
+    git -C "$bare_parent/bare-new" reflog exists refs/heads/bare-new
+    printf '%s' "$?"
+  )"
+result=$(git -C "$bare_parent/bare-new" cleanup-repo --no-update-base --min-age 30 \
+  --porcelain 2>&1)
+_assert_contains "min-age keeps a never-logged branch at an old commit" \
+  $'keep-branch\tbare-new\ttoo-new\t\n' "$result"$'\n'
 
 if command -v jq >/dev/null 2>&1; then
   # A closed, unmerged PR retires a selected worktree only with --include-closed,
@@ -4646,7 +4761,7 @@ git -C "$suffix_repo" switch --quiet -c other-feature
 git -C "$suffix_repo" switch --quiet main
 git -C "$suffix_repo" worktree add --quiet "$suffix_parent/feature" other-feature
 printf 'secret\n' >"$suffix_parent/feature/local.env"
-printf 'local.env\n' >>"$(git -C "$suffix_repo" rev-parse --git-path info/exclude)"
+printf 'local.env\n' >>"$suffix_repo/.git/info/exclude"
 result=$(cd "$suffix_repo" && git cleanup-repo --porcelain \
   --retire-worktree feature 2>&1)
 _assert_contains "a relative name inside the main checkout is not a worktree" \
@@ -4761,6 +4876,22 @@ for pick_mode in --dry-run ""; do
   _assert_contains "a requested detached HEAD proven merged is retired by its proof ${pick_mode:-applied}" \
     "remove-worktree"$'\t'"$pick_dir"$'\tcontent-merged\t' "$result"
 done
+# The same with no branch left at that commit at all: the HEAD reflog holds
+# it, but the merge proof that retires the worktree covers the HEAD.
+lone_repo=$(_clone_remote)
+git -C "$lone_repo" switch --quiet -c lone-pick
+_commit_file "$lone_repo" lone.txt lone "lone picked work"
+lone_oid=$(git -C "$lone_repo" rev-parse HEAD)
+git -C "$lone_repo" switch --quiet main
+_commit_file "$lone_repo" other.txt other "unrelated mainline work"
+git -C "$lone_repo" cherry-pick "$lone_oid" >/dev/null
+git -C "$lone_repo" push --quiet origin main
+lone_dir="$(_tmpdir)/detached"
+git -C "$lone_repo" worktree add --quiet --detach "$lone_dir" "$lone_oid"
+git -C "$lone_repo" branch --quiet -D lone-pick
+result=$(git -C "$lone_repo" cleanup-repo --porcelain --worktree "$lone_dir" 2>&1)
+_assert_contains "a detached HEAD proven merged is retired even when only its reflog holds it" \
+  "remove-worktree"$'\t'"$lone_dir"$'\tcontent-merged\t' "$result"
 
 # Records name worktrees by Git's recorded paths: a relative spelling of a
 # vanished worktree and a duplicate spelling both resolve to it, once; the
@@ -4824,6 +4955,684 @@ _assert_eq "a busy worktree keeps its branch" busy-merged \
   "$(git -C "$busy_repo" branch --list --format='%(refname:short)' busy-merged)"
 rm -f "$busy_lock"
 
+# A worktree's HEAD reflog and per-worktree refs go with it, so a commit only
+# they hold keeps the worktree (and its merged branch). Prints a clone with a
+# merged branch $1 checked out in a linked worktree $2.
+_merged_worktree_repo() {
+  local repo
+
+  repo=$(_clone_remote) || return 1
+  git -C "$repo" branch "$1"
+  git -C "$repo" worktree add --quiet "$2" "$1"
+  printf '%s\n' "$repo"
+}
+uc_parent=$(_tmpdir)
+# Work committed on a detached HEAD and left behind by switching back.
+uc_repo=$(_merged_worktree_repo uc-detached "$uc_parent/detached")
+git -C "$uc_parent/detached" switch --quiet --detach
+_commit_file "$uc_parent/detached" lost.txt lost "detached work"
+uc_oid=$(git -C "$uc_parent/detached" rev-parse HEAD)
+git -C "$uc_parent/detached" switch --quiet uc-detached
+for uc_mode in --dry-run ""; do
+  uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees \
+    ${uc_mode:+"$uc_mode"} 2>/dev/null)
+  _assert_contains "a commit only the HEAD reflog holds keeps the worktree (${uc_mode:-real})" \
+    $'keep-branch\tuc-detached\tunique-commits\t'"$uc_oid" "$uc_out"
+done
+_assert_eq "the reflog-only commit stays reachable through the worktree" commit \
+  "$(git -C "$uc_parent/detached" cat-file -t "$uc_oid")"
+_assert_contains "its merged branch stays with it" uc-detached "$(_branches "$uc_repo")"
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --worktree "$uc_parent/detached" 2>/dev/null)
+_assert_contains "a selected worktree carries unique-commits" \
+  $'keep-worktree\t'"$uc_parent/detached"$'\tunique-commits\t'"$uc_oid" "$uc_out"
+# A per-worktree ref holding a commit nothing else reaches.
+uc_repo=$(_merged_worktree_repo uc-ref "$uc_parent/ref")
+uc_oid=$(git -C "$uc_parent/ref" commit-tree -m parked \
+  "$(git -C "$uc_parent/ref" rev-parse 'HEAD^{tree}')")
+git -C "$uc_parent/ref" update-ref refs/worktree/keep "$uc_oid"
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "a commit only a refs/worktree ref holds keeps the worktree" \
+  $'keep-branch\tuc-ref\tunique-commits\t'"$uc_oid" "$uc_out"
+# A parked ref is deliberate: it protects its commit even when the commit is
+# also a reset-away entry in the branch's own reflog.
+uc_repo=$(_merged_worktree_repo uc-parked "$uc_parent/parked")
+_commit_file "$uc_parent/parked" parked.txt parked "parked work"
+uc_oid=$(git -C "$uc_parent/parked" rev-parse HEAD)
+git -C "$uc_parent/parked" update-ref refs/worktree/keep "$uc_oid"
+git -C "$uc_parent/parked" reset --quiet --hard HEAD~1
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "a parked ref keeps the worktree even for a branch-reflog commit" \
+  $'keep-branch\tuc-parked\tunique-commits\t'"$uc_oid" "$uc_out"
+# An amended or reset-away commit is in the branch's own reflog too, which
+# deleting the branch drops anyway, so it does not hold the worktree.
+uc_repo=$(_merged_worktree_repo uc-reset "$uc_parent/reset")
+_commit_file "$uc_parent/reset" scratch.txt scratch "scratch work"
+git -C "$uc_parent/reset" reset --quiet --hard HEAD~1
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "a reset-away commit in the branch reflog does not keep the worktree" \
+  $'remove-worktree\t'"$uc_parent/reset"$'\tmerged\tuc-reset' "$uc_out"
+# log.showSignature adds verification lines (here `No signature`, for SSH
+# signatures without allowed signers) to log output; the reflog walk must not
+# read them as commits, nor the age check as a date.
+if command -v ssh-keygen >/dev/null 2>&1; then
+  sig_parent=$(_tmpdir)
+  sig_repo=$(_clone_remote)
+  ssh-keygen -q -t ed25519 -N '' -f "$sig_parent/key" >/dev/null
+  git -C "$sig_repo" config log.showSignature true
+  git -C "$sig_repo" config gpg.format ssh
+  git -C "$sig_repo" config user.signingkey "$sig_parent/key.pub"
+  git -C "$sig_repo" config commit.gpgsign true
+  git -C "$sig_repo" worktree add --quiet -b sig-feat "$sig_parent/wt"
+  _commit_file "$sig_parent/wt" sig.txt sig "signed work"
+  GIT_COMMITTER_DATE="@$(($(date +%s) - 200 * 86400)) +0000" \
+    git -C "$sig_parent/wt" commit --quiet --allow-empty -m "old signed work"
+  git -C "$sig_parent/wt" push --quiet origin sig-feat:main
+  git -C "$sig_repo" branch --quiet sig-old origin/main
+  git -C "$sig_repo" reflog expire --expire=all refs/heads/sig-old
+  sig_out=$(git -C "$sig_repo" cleanup-repo --porcelain --min-age 30 2>/dev/null)
+  _assert_contains "signature lines do not hide an expired reflog's commit date" \
+    $'delete-branch\tsig-old\tmerged\t' "$sig_out"
+  sig_out=$(git -C "$sig_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+  _assert_contains "signature lines do not make a worktree uninspectable" \
+    $'remove-worktree\t'"$sig_parent/wt"$'\tmerged\tsig-feat' "$sig_out"
+else
+  printf 'skip - signature output cases need ssh-keygen\n'
+fi
+# Commits a rebase picked and then replaced (an autosquash fixup) are only in
+# the HEAD reflog, but the rebase's result supersedes them.
+uc_repo=$(_merged_worktree_repo uc-rebase "$uc_parent/rebase")
+_commit_file "$uc_parent/rebase" feature.txt one "add feature"
+_commit_file "$uc_parent/rebase" feature.txt two "fixup! add feature"
+_commit_file "$uc_repo" other.txt other "unrelated mainline work"
+GIT_SEQUENCE_EDITOR=true git -C "$uc_parent/rebase" rebase --quiet -i --autosquash main \
+  >/dev/null 2>&1
+git -C "$uc_repo" merge --quiet --ff-only uc-rebase
+git -C "$uc_repo" push --quiet origin main
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "commits a rebase replaced do not keep the worktree" \
+  $'remove-worktree\t'"$uc_parent/rebase"$'\tmerged\tuc-rebase' "$uc_out"
+# A commit a rebase made and then discarded with a reset (here a cherry-pick
+# an `exec` line ran, reset away by the next line) is held only by HEAD's
+# reflog: a reset discards rather than replaces, so it keeps the worktree.
+uc_repo=$(_merged_worktree_repo uc-exec "$uc_parent/exec")
+git -C "$uc_repo" switch --quiet -c uc-exec-side
+_commit_file "$uc_repo" side.txt side "side work"
+uc_side=$(git -C "$uc_repo" rev-parse HEAD)
+git -C "$uc_repo" switch --quiet main
+_commit_file "$uc_parent/exec" exec.txt exec "exec work"
+_commit_file "$uc_repo" other2.txt other "more mainline work"
+GIT_SEQUENCE_EDITOR="printf 'exec git cherry-pick $uc_side\nexec git reset --quiet --hard HEAD~1\n' >>" \
+  git -C "$uc_parent/exec" rebase --quiet -i main >/dev/null 2>&1
+git -C "$uc_repo" branch --quiet -D uc-exec-side
+git -C "$uc_repo" merge --quiet --ff-only uc-exec
+git -C "$uc_repo" push --quiet origin main
+_assert_contains "the exec fixture recorded a cherry-pick inside the rebase" "cherry-pick" \
+  "$(git -C "$uc_parent/exec" log -g --format=%gs HEAD)"
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "a cherry-pick a rebase ran and reset away keeps the worktree" \
+  $'keep-branch\tuc-exec\tunique-commits\t' "$uc_out"
+# The same cherry-pick made on a detached HEAD and abandoned is real work.
+uc_repo=$(_merged_worktree_repo uc-pick "$uc_parent/pick")
+git -C "$uc_repo" switch --quiet -c uc-pick-side
+_commit_file "$uc_repo" side.txt side "side work"
+uc_side=$(git -C "$uc_repo" rev-parse HEAD)
+git -C "$uc_repo" switch --quiet main
+git -C "$uc_repo" branch --quiet -D uc-pick-side
+git -C "$uc_parent/pick" switch --quiet --detach
+git -C "$uc_parent/pick" cherry-pick "$uc_side" >/dev/null
+uc_oid=$(git -C "$uc_parent/pick" rev-parse HEAD)
+git -C "$uc_parent/pick" switch --quiet uc-pick
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "a cherry-pick abandoned on a detached HEAD keeps the worktree" \
+  $'keep-branch\tuc-pick\tunique-commits\t'"$uc_oid" "$uc_out"
+# A rebase of a detached HEAD writes no finish entry, and its result (here a
+# hand-resolved conflict) is in no branch's reflog: it is detached work.
+uc_repo=$(_merged_worktree_repo uc-drebase "$uc_parent/drebase")
+git -C "$uc_repo" switch --quiet -c uc-drebase-side
+_commit_file "$uc_repo" README.md side "side edit"
+git -C "$uc_repo" switch --quiet main
+_commit_file "$uc_repo" README.md main "main edit"
+git -C "$uc_parent/drebase" switch --quiet --detach uc-drebase-side
+if ! git -C "$uc_parent/drebase" rebase --quiet main >/dev/null 2>&1; then
+  printf 'resolved\n' >"$uc_parent/drebase/README.md"
+  git -C "$uc_parent/drebase" add README.md
+  GIT_EDITOR=true git -C "$uc_parent/drebase" rebase --continue >/dev/null 2>&1
+fi
+uc_oid=$(git -C "$uc_parent/drebase" rev-parse HEAD)
+git -C "$uc_parent/drebase" switch --quiet uc-drebase
+_assert_eq "the detached rebase fixture resolved its conflict" resolved \
+  "$(git -C "$uc_repo" show "$uc_oid:README.md")"
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "a detached rebase's result keeps the worktree" \
+  $'keep-branch\tuc-drebase\tunique-commits\t'"$uc_oid" "$uc_out"
+# A detached merge of a branch named like a rebase is a merge.
+uc_repo=$(_merged_worktree_repo uc-dmerge "$uc_parent/dmerge")
+git -C "$uc_repo" switch --quiet -c rebase-fix
+_commit_file "$uc_repo" fix.txt fix "fix work"
+git -C "$uc_repo" switch --quiet main
+git -C "$uc_parent/dmerge" switch --quiet --detach
+git -C "$uc_parent/dmerge" merge --quiet --no-ff rebase-fix -m "merge the fix"
+uc_oid=$(git -C "$uc_parent/dmerge" rev-parse HEAD)
+git -C "$uc_parent/dmerge" switch --quiet uc-dmerge
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "a detached merge of a rebase-named branch keeps the worktree" \
+  $'keep-branch\tuc-dmerge\tunique-commits\t'"$uc_oid" "$uc_out"
+# An earlier branch this worktree had, squash-merged and deleted before this
+# run, is proven in the base, so its commits do not pin the worktree.
+uc_repo=$(_merged_worktree_repo uc-later "$uc_parent/later")
+git -C "$uc_parent/later" switch --quiet -c uc-gone-earlier
+_commit_file "$uc_parent/later" gone.txt gone "earlier squashed work"
+_commit_file "$uc_repo" gone.txt gone "land earlier squashed work"
+git -C "$uc_repo" push --quiet origin main
+git -C "$uc_parent/later" switch --quiet -C uc-later main
+git -C "$uc_repo" branch --quiet -D uc-gone-earlier
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "a squash-merged earlier branch does not pin a reused worktree" \
+  $'remove-worktree\t'"$uc_parent/later"$'\tmerged\tuc-later' "$uc_out"
+# The same with a two-commit earlier branch landed as one squash: the proof
+# of its tip also covers the commit it was built on.
+uc_repo=$(_merged_worktree_repo uc-later2 "$uc_parent/later2")
+git -C "$uc_parent/later2" switch --quiet -c uc-gone-earlier2
+_commit_file "$uc_parent/later2" gone1.txt one "earlier squashed work one"
+_commit_file "$uc_parent/later2" gone2.txt two "earlier squashed work two"
+printf 'one\n' >"$uc_repo/gone1.txt"
+git -C "$uc_repo" add gone1.txt
+_commit_file "$uc_repo" gone2.txt two "land earlier squashed work"
+git -C "$uc_repo" push --quiet origin main
+git -C "$uc_parent/later2" switch --quiet -C uc-later2 main
+git -C "$uc_repo" branch --quiet -D uc-gone-earlier2
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "a two-commit squash-merged earlier branch does not pin a reused worktree" \
+  $'remove-worktree\t'"$uc_parent/later2"$'\tmerged\tuc-later2' "$uc_out"
+# Stacked multi-commit branches in one worktree: uc-stk-a (two commits)
+# squash-landed and deleted, then uc-stk-b on top of it (two more)
+# squash-landed too.
+uc_repo=$(_merged_worktree_repo uc-stk-b "$uc_parent/stk")
+git -C "$uc_parent/stk" switch --quiet -c uc-stk-a
+_commit_file "$uc_parent/stk" stk-a1.txt a1 "stack a one"
+_commit_file "$uc_parent/stk" stk-a2.txt a2 "stack a two"
+git -C "$uc_parent/stk" switch --quiet -C uc-stk-b
+_commit_file "$uc_parent/stk" stk-b1.txt b1 "stack b one"
+_commit_file "$uc_parent/stk" stk-b2.txt b2 "stack b two"
+printf 'a1\n' >"$uc_repo/stk-a1.txt"
+git -C "$uc_repo" add stk-a1.txt
+_commit_file "$uc_repo" stk-a2.txt a2 "land stack a"
+printf 'b1\n' >"$uc_repo/stk-b1.txt"
+git -C "$uc_repo" add stk-b1.txt
+_commit_file "$uc_repo" stk-b2.txt b2 "land stack b"
+git -C "$uc_repo" push --quiet origin main
+git -C "$uc_repo" branch --quiet -D uc-stk-a
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "stacked multi-commit squash landings do not pin the worktree" \
+  $'remove-worktree\t'"$uc_parent/stk"$'\ttree-landed\tuc-stk-b' "$uc_out"
+# An aborted rebase's clean copies (here two picks before a conflict on the
+# third commit) leave the originals on the branch, so they do not pin a
+# worktree retired on request; a conflict the user resolved and continued
+# before a later abort is new work and does.
+uc_repo=$(_merged_worktree_repo uc-ab3 "$uc_parent/ab3")
+_commit_file "$uc_parent/ab3" ab3-1.txt one "abort one"
+_commit_file "$uc_parent/ab3" ab3-2.txt two "abort two"
+_commit_file "$uc_parent/ab3" ab3-x.txt branch "abort three"
+_commit_file "$uc_repo" ab3-x.txt main "conflicting mainline work"
+git -C "$uc_parent/ab3" rebase --quiet main >/dev/null 2>&1 ||
+  git -C "$uc_parent/ab3" rebase --abort
+_assert_contains "the abort fixture copied commits before aborting" "rebase (pick)" \
+  "$(git -C "$uc_parent/ab3" log -g --format=%gs HEAD)"
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --retire-worktree "$uc_parent/ab3" 2>/dev/null)
+_assert_contains "an aborted rebase's clean copies do not pin the worktree" \
+  $'remove-worktree\t'"$uc_parent/ab3"$'\trequested\tuc-ab3' "$uc_out"
+uc_repo=$(_merged_worktree_repo uc-abc "$uc_parent/abc")
+_commit_file "$uc_parent/abc" abc-x.txt branch "resolved later"
+_commit_file "$uc_parent/abc" abc-y.txt branch "conflicts last"
+_commit_file "$uc_repo" abc-x.txt main "mainline x"
+_commit_file "$uc_repo" abc-y.txt main "mainline y"
+if ! git -C "$uc_parent/abc" rebase --quiet main >/dev/null 2>&1; then
+  printf 'resolved\n' >"$uc_parent/abc/abc-x.txt"
+  git -C "$uc_parent/abc" add abc-x.txt
+  GIT_EDITOR=true git -C "$uc_parent/abc" rebase --continue >/dev/null 2>&1 || true
+fi
+uc_oid=$(git -C "$uc_parent/abc" log -g --format='%H %gs' HEAD |
+  awk '/rebase \(continue\)/ { print $1; exit }')
+git -C "$uc_parent/abc" rebase --abort
+_assert_contains "the continue fixture resolved a conflict before aborting" "resolved" \
+  "$(git -C "$uc_repo" show "$uc_oid:abc-x.txt" 2>/dev/null)"
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --retire-worktree "$uc_parent/abc" 2>/dev/null)
+_assert_contains "a resolved conflict before an abort keeps the worktree" \
+  $'keep-worktree\t'"$uc_parent/abc"$'\tunique-commits\t'"$uc_oid" "$uc_out"
+# A clean copy an aborted rebase made excuses only itself, never what HEAD
+# held before it: work committed or amended by hand at an `edit` stop, then
+# followed by another pick before the abort, keeps the worktree.
+uc_edit_todo=$(_tmpdir)/edit-todo
+cat >"$uc_edit_todo" <<'EOF_TODO'
+#!/usr/bin/env bash
+awk 'NR == 1 { sub(/^pick/, "edit") } { print } NR > 1 && /^pick/ { print "break" }' \
+  "$1" >"$1.new" && mv "$1.new" "$1"
+EOF_TODO
+chmod +x "$uc_edit_todo"
+for uc_stop in manual amended; do
+  uc_repo=$(_merged_worktree_repo "uc-edit-$uc_stop" "$uc_parent/edit-$uc_stop")
+  git -C "$uc_repo" switch --quiet -c "uc-edit-$uc_stop-side"
+  _commit_file "$uc_repo" "edit-$uc_stop-a.txt" a "side a"
+  _commit_file "$uc_repo" "edit-$uc_stop-b.txt" b "side b"
+  git -C "$uc_repo" switch --quiet main
+  _commit_file "$uc_repo" "edit-$uc_stop-main.txt" main "mainline moves on"
+  git -C "$uc_parent/edit-$uc_stop" switch --quiet "uc-edit-$uc_stop-side"
+  GIT_SEQUENCE_EDITOR="$uc_edit_todo" git -C "$uc_parent/edit-$uc_stop" rebase \
+    --quiet -i --force-rebase main >/dev/null 2>&1
+  if [[ "$uc_stop" == manual ]]; then
+    _commit_file "$uc_parent/edit-$uc_stop" edit-manual.txt manual "work at the edit stop"
+  else
+    printf 'amended\n' >"$uc_parent/edit-$uc_stop/edit-$uc_stop-a.txt"
+    git -C "$uc_parent/edit-$uc_stop" commit --quiet -a --amend -m "side a, amended"
+  fi
+  uc_oid=$(git -C "$uc_parent/edit-$uc_stop" rev-parse HEAD)
+  GIT_EDITOR=true git -C "$uc_parent/edit-$uc_stop" rebase --continue >/dev/null 2>&1
+  _assert_contains "the $uc_stop edit fixture picked again before the abort" \
+    "rebase (pick)" "$(git -C "$uc_parent/edit-$uc_stop" log -g -n 1 --format=%gs HEAD)"
+  git -C "$uc_parent/edit-$uc_stop" rebase --abort
+  git -C "$uc_parent/edit-$uc_stop" switch --quiet "uc-edit-$uc_stop"
+  for uc_mode in --dry-run ""; do
+    uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees \
+      ${uc_mode:+"$uc_mode"} 2>/dev/null)
+    _assert_contains "the $uc_stop commit at an edit stop survives a later clean pick and abort (${uc_mode:-real})" \
+      $'keep-branch\tuc-edit-'"$uc_stop"$'\tunique-commits\t'"$uc_oid" "$uc_out"
+  done
+done
+# A plain `edit` stop is a clean copy too: aborting right there leaves the
+# original on the branch, so a worktree retired on request goes.
+uc_repo=$(_merged_worktree_repo uc-edit-plain "$uc_parent/edit-plain")
+_commit_file "$uc_parent/edit-plain" edit-plain.txt plain "plain work"
+_commit_file "$uc_repo" edit-plain-main.txt main "mainline moves on"
+GIT_SEQUENCE_EDITOR="$uc_edit_todo" git -C "$uc_parent/edit-plain" rebase \
+  --quiet -i main >/dev/null 2>&1
+_assert_contains "the plain edit fixture stopped at an edit" "rebase (edit)" \
+  "$(git -C "$uc_parent/edit-plain" log -g -n 1 --format=%gs HEAD)"
+git -C "$uc_parent/edit-plain" rebase --abort
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --retire-worktree \
+  "$uc_parent/edit-plain" 2>/dev/null)
+_assert_contains "an aborted plain edit copy does not pin the worktree" \
+  $'remove-worktree\t'"$uc_parent/edit-plain"$'\trequested\tuc-edit-plain' "$uc_out"
+# A rebase left with `--quit` closes no span: its newest entry is its result
+# (here a hand-resolved conflict, merged nowhere), which only HEAD's reflog
+# holds once the worktree switches back.
+uc_repo=$(_merged_worktree_repo uc-quit "$uc_parent/quit")
+git -C "$uc_repo" switch --quiet -c uc-quit-onto
+_commit_file "$uc_repo" README.md onto "conflicting base"
+git -C "$uc_repo" switch --quiet main
+_commit_file "$uc_parent/quit" README.md quit "quit work"
+git -C "$uc_parent/quit" push --quiet origin uc-quit:main
+git -C "$uc_repo" pull --quiet --ff-only origin main
+if ! GIT_SEQUENCE_EDITOR="printf 'break\n' >>" git -C "$uc_parent/quit" rebase \
+  --quiet -i --onto uc-quit-onto HEAD~1 >/dev/null 2>&1; then
+  printf 'resolved\n' >"$uc_parent/quit/README.md"
+  git -C "$uc_parent/quit" add README.md
+  GIT_EDITOR=true git -C "$uc_parent/quit" rebase --continue >/dev/null 2>&1
+fi
+uc_oid=$(git -C "$uc_parent/quit" rev-parse HEAD)
+git -C "$uc_parent/quit" rebase --quit
+git -C "$uc_parent/quit" switch --quiet uc-quit
+_assert_eq "the quit fixture's result holds the resolution" resolved \
+  "$(git -C "$uc_repo" show "$uc_oid:README.md")"
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "a quit rebase's result keeps the worktree" \
+  $'keep-branch\tuc-quit\tunique-commits\t'"$uc_oid" "$uc_out"
+# `git pull` with rebasing configured records its steps as `pull -q (pick)`
+# and the like; replaced picks there are rebase intermediates too.
+uc_repo=$(_merged_worktree_repo uc-pull "$uc_parent/pull")
+git -C "$uc_parent/pull" push --quiet -u origin uc-pull
+_commit_file "$uc_parent/pull" pull.txt one "add pull work"
+_commit_file "$uc_parent/pull" pull.txt two "fixup! add pull work"
+_commit_file "$uc_repo" upstream.txt up "upstream work"
+git -C "$uc_repo" push --quiet origin main main:uc-pull
+git -C "$uc_parent/pull" config pull.rebase interactive
+git -C "$uc_parent/pull" config rebase.autoSquash true
+GIT_SEQUENCE_EDITOR=true git -C "$uc_parent/pull" pull -q >/dev/null 2>&1
+_assert_contains "the pull fixture recorded pull rebase steps" "pull -q (pick)" \
+  "$(git -C "$uc_parent/pull" log -g --format=%gs HEAD)"
+git -C "$uc_parent/pull" push --quiet origin uc-pull:main
+git -C "$uc_repo" pull --quiet --ff-only origin main
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "a pull rebase's replaced picks do not keep the worktree" \
+  $'remove-worktree\t'"$uc_parent/pull"$'\tmerged\tuc-pull' "$uc_out"
+# Commits made on another branch and amended or reset away there are in that
+# branch's reflog, which deleting it drops by design: they do not pin the
+# worktree either. Stacked branches in one worktree: `uc-stack-a` amended,
+# squash-landed, and deleted, then `uc-stack-b` rebased and landed.
+uc_repo=$(_merged_worktree_repo uc-stack-b "$uc_parent/stack")
+git -C "$uc_parent/stack" switch --quiet -c uc-stack-a main
+_commit_file "$uc_parent/stack" stack-a.txt draft "stack a"
+printf 'final\n' >"$uc_parent/stack/stack-a.txt"
+git -C "$uc_parent/stack" commit --quiet -a --amend -m "stack a"
+git -C "$uc_parent/stack" switch --quiet -C uc-stack-b
+_commit_file "$uc_parent/stack" stack-b.txt b "stack b"
+_commit_file "$uc_repo" stack-a.txt final "land stack a"
+git -C "$uc_repo" push --quiet origin main
+git -C "$uc_parent/stack" rebase --quiet --onto main uc-stack-a
+git -C "$uc_repo" branch --quiet -D uc-stack-a
+git -C "$uc_parent/stack" push --quiet origin uc-stack-b:main
+git -C "$uc_repo" pull --quiet --ff-only origin main
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "an amended commit of an earlier stacked branch does not pin the worktree" \
+  $'remove-worktree\t'"$uc_parent/stack"$'\tmerged\tuc-stack-b' "$uc_out"
+# A reviewer's scratch commit on another branch, reset away there.
+uc_repo=$(_merged_worktree_repo uc-review "$uc_parent/review")
+git -C "$uc_parent/review" switch --quiet -c uc-review-scratch
+_commit_file "$uc_parent/review" scratch.txt scratch "review scratch"
+git -C "$uc_parent/review" reset --quiet --hard HEAD~1
+git -C "$uc_parent/review" switch --quiet uc-review
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "a commit reset away on another branch does not pin the worktree" \
+  $'remove-worktree\t'"$uc_parent/review"$'\tmerged\tuc-review' "$uc_out"
+# A branch rebase leaves its old tip behind, but that tip is the branch's
+# own, by its reflog: even when no proof covers it (a resolved conflict
+# changed the landed content), the worktree goes once the result lands.
+uc_repo=$(_merged_worktree_repo uc-resolved "$uc_parent/resolved")
+_commit_file "$uc_parent/resolved" resolved.txt branch "branch side"
+_commit_file "$uc_repo" resolved.txt main "main side"
+if ! git -C "$uc_parent/resolved" rebase --quiet main >/dev/null 2>&1; then
+  printf 'merged by hand\n' >"$uc_parent/resolved/resolved.txt"
+  git -C "$uc_parent/resolved" add resolved.txt
+  GIT_EDITOR=true git -C "$uc_parent/resolved" rebase --continue >/dev/null 2>&1
+fi
+git -C "$uc_parent/resolved" push --quiet origin uc-resolved:main
+git -C "$uc_repo" pull --quiet --ff-only origin main
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "a branch rebase's own old tip does not pin the worktree" \
+  $'remove-worktree\t'"$uc_parent/resolved"$'\tmerged\tuc-resolved' "$uc_out"
+# Leaving a detached HEAD for a branch does not always write a checkout
+# entry, so detached work is protected wherever HEAD went next. Sets uc_repo
+# to a clone whose merged branch $1 is checked out in $uc_parent/$1, then
+# detaches that worktree and commits there, setting uc_oid to the commit.
+_detached_work_worktree() {
+  uc_repo=$(_merged_worktree_repo "$1" "$uc_parent/$1")
+  git -C "$uc_parent/$1" switch --quiet --detach
+  _commit_file "$uc_parent/$1" "$1-work.txt" work "detached work"
+  uc_oid=$(git -C "$uc_parent/$1" rev-parse HEAD)
+}
+# A branch behind main with its own commit, for rebasing onto main.
+_behind_branch() {
+  git -C "$uc_repo" branch "$1" main~1
+  git -C "$uc_repo" worktree add --quiet "$uc_parent/$1-seed" "$1"
+  _commit_file "$uc_parent/$1-seed" "$1.txt" "${2:-topic}" "topic work"
+  git -C "$uc_repo" worktree remove "$uc_parent/$1-seed"
+}
+_assert_detached_work_kept() {
+  uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+  _assert_contains "$2" $'keep-branch\t'"$1"$'\tunique-commits\t'"$uc_oid" "$uc_out"
+}
+_detached_work_worktree uc-hole-rebase
+_commit_file "$uc_repo" mainline.txt more "more mainline work"
+_behind_branch uc-hole-rebase-topic
+git -C "$uc_parent/uc-hole-rebase" rebase --quiet main uc-hole-rebase-topic >/dev/null 2>&1
+git -C "$uc_parent/uc-hole-rebase" switch --quiet uc-hole-rebase
+_assert_detached_work_kept uc-hole-rebase \
+  "detached work left by \`git rebase <upstream> <branch>\` keeps the worktree"
+_detached_work_worktree uc-hole-abort
+_commit_file "$uc_repo" uc-hole-abort-topic.txt main "conflicting mainline work"
+_behind_branch uc-hole-abort-topic topic
+git -C "$uc_parent/uc-hole-abort" rebase --quiet main uc-hole-abort-topic >/dev/null 2>&1 ||
+  git -C "$uc_parent/uc-hole-abort" rebase --abort
+git -C "$uc_parent/uc-hole-abort" switch --quiet uc-hole-abort
+_assert_contains "the abort fixture aborted a rebase" "(abort)" \
+  "$(git -C "$uc_parent/uc-hole-abort" log -g --format=%gs HEAD)"
+_assert_detached_work_kept uc-hole-abort \
+  "detached work left by an aborted branch rebase keeps the worktree"
+_detached_work_worktree uc-hole-uptodate
+# Main moves on first, so the branch is not an ancestor of the detached work.
+_commit_file "$uc_repo" uptodate.txt more "mainline moves on"
+git -C "$uc_repo" branch uc-hole-uptodate-topic main
+git -C "$uc_parent/uc-hole-uptodate" rebase --quiet main uc-hole-uptodate-topic >/dev/null 2>&1
+git -C "$uc_parent/uc-hole-uptodate" switch --quiet uc-hole-uptodate
+_assert_contains "the up-to-date fixture's rebase only checked out its branch" \
+  "rebase: checkout uc-hole-uptodate-topic" \
+  "$(git -C "$uc_parent/uc-hole-uptodate" log -g --format=%gs HEAD)"
+_assert_detached_work_kept uc-hole-uptodate \
+  "detached work left by an up-to-date branch rebase keeps the worktree"
+_detached_work_worktree uc-hole-orphan
+git -C "$uc_parent/uc-hole-orphan" checkout --quiet --orphan uc-hole-orphan-new
+git -C "$uc_parent/uc-hole-orphan" commit --quiet -m "orphan start"
+git -C "$uc_parent/uc-hole-orphan" switch --quiet uc-hole-orphan
+_assert_detached_work_kept uc-hole-orphan \
+  "detached work left by a new orphan branch keeps the worktree"
+_detached_work_worktree uc-hole-tool
+GIT_REFLOG_ACTION=mytool git -C "$uc_parent/uc-hole-tool" checkout --quiet uc-hole-tool
+_assert_contains "the tool fixture recorded its own action" "mytool" \
+  "$(git -C "$uc_parent/uc-hole-tool" log -g -n 1 --format=%gs HEAD)"
+_assert_detached_work_kept uc-hole-tool \
+  "detached work left by a tool's own reflog action keeps the worktree"
+# A branch this run deletes vouches for its tip in another worktree's HEAD
+# reflog, even unlanded: here --gone deletes it once its remote branch is
+# gone, and the worktree that once had it checked out still goes.
+uc_repo=$(_merged_worktree_repo uc-ret-b "$uc_parent/ret")
+# Made detached first, so the deleted branch's reflog names only its tip:
+# the earlier commit is excused by being that tip's history alone.
+git -C "$uc_parent/ret" switch --quiet --detach
+_commit_file "$uc_parent/ret" ret1.txt ret "never landed work one"
+_commit_file "$uc_parent/ret" ret2.txt ret "never landed work two"
+git -C "$uc_parent/ret" switch --quiet -c uc-ret-a
+git -C "$uc_parent/ret" push --quiet -u origin uc-ret-a
+git -C "$uc_parent/ret" push --quiet origin --delete uc-ret-a
+git -C "$uc_parent/ret" switch --quiet uc-ret-b
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --gone --remove-worktrees 2>/dev/null)
+_assert_contains "the gone branch is deleted first" \
+  $'delete-branch\tuc-ret-a\tupstream-gone' "$uc_out"
+_assert_contains "a branch deleted this run does not pin a worktree it was once in" \
+  $'remove-worktree\t'"$uc_parent/ret"$'\tmerged\tuc-ret-b' "$uc_out"
+# A detached HEAD's own history is its merge proof's concern: an ancestor it
+# moved away from and back past does not pin it.
+hh_repo=$(_clone_remote)
+hh_dir="$(_tmpdir)/detached"
+git -C "$hh_repo" worktree add --quiet --detach "$hh_dir" main
+_commit_file "$hh_dir" hh.txt one "first detached step"
+hh_a=$(git -C "$hh_dir" rev-parse HEAD)
+_commit_file "$hh_dir" hh.txt two "second detached step"
+hh_b=$(git -C "$hh_dir" rev-parse HEAD)
+git -C "$hh_dir" checkout --quiet --detach "$hh_a"
+git -C "$hh_dir" checkout --quiet --detach "$hh_b"
+_commit_file "$hh_repo" hh.txt two "land both detached steps"
+git -C "$hh_repo" push --quiet origin main
+uc_out=$(git -C "$hh_repo" cleanup-repo --porcelain --worktree "$hh_dir" 2>/dev/null)
+_assert_contains "an ancestor in a detached HEAD's own history does not pin it" \
+  $'remove-worktree\t'"$hh_dir"$'\t' "$uc_out"
+# Commits HEAD discarded while detached are held only by its reflog. Each
+# case starts from detached work in a worktree on a merged branch (see
+# _detached_work_worktree) and ends back on that branch.
+_detached_work_worktree uc-dreset
+git -C "$uc_parent/uc-dreset" reset --quiet --hard HEAD~1
+git -C "$uc_parent/uc-dreset" switch --quiet uc-dreset
+_assert_detached_work_kept uc-dreset \
+  "detached work reset away keeps the worktree"
+_detached_work_worktree uc-drefresh
+_commit_file "$uc_repo" refresh.txt refresh "mainline moves on"
+git -C "$uc_parent/uc-drefresh" reset --quiet --hard main
+git -C "$uc_parent/uc-drefresh" switch --quiet uc-drefresh
+_assert_detached_work_kept uc-drefresh \
+  "detached work dropped by a reset to a newer main keeps the worktree"
+_detached_work_worktree uc-damend
+git -C "$uc_parent/uc-damend" commit --quiet --amend -m "amended detached work"
+uc_oid=$(git -C "$uc_parent/uc-damend" rev-parse HEAD)
+git -C "$uc_parent/uc-damend" reset --quiet --hard main
+git -C "$uc_parent/uc-damend" switch --quiet uc-damend
+_assert_detached_work_kept uc-damend \
+  "detached work amended and then reset away keeps the worktree"
+_detached_work_worktree uc-dabort
+uc_detached=$uc_oid
+_commit_file "$uc_repo" abort-base.txt base "mainline moves on"
+GIT_SEQUENCE_EDITOR="printf 'break\n' >>" git -C "$uc_parent/uc-dabort" rebase \
+  --quiet -i main >/dev/null 2>&1
+_assert_not_contains "the stopped rebase made a new commit" "$uc_detached" \
+  "$(git -C "$uc_parent/uc-dabort" rev-parse HEAD)"
+_commit_file "$uc_parent/uc-dabort" manual.txt manual "work during the stop"
+uc_oid=$(git -C "$uc_parent/uc-dabort" rev-parse HEAD)
+git -C "$uc_parent/uc-dabort" rebase --abort
+git -C "$uc_repo" branch uc-dabort-keep "$(git -C "$uc_parent/uc-dabort" rev-parse HEAD)"
+git -C "$uc_parent/uc-dabort" switch --quiet uc-dabort
+_assert_detached_work_kept uc-dabort \
+  "a commit made during a stopped detached rebase, then aborted, keeps the worktree"
+# Expiry drops old unreachable reflog entries, but a surviving entry's old
+# side still names the commit, and Git keeps it alive through that entry.
+uc_day=86400
+uc_now=$(date +%s)
+uc_repo=$(_merged_worktree_repo uc-expired "$uc_parent/uc-expired")
+GIT_COMMITTER_DATE="@$((uc_now - 40 * uc_day)) +0000" \
+  git -C "$uc_parent/uc-expired" switch --quiet --detach
+GIT_COMMITTER_DATE="@$((uc_now - 40 * uc_day)) +0000" \
+  git -C "$uc_parent/uc-expired" commit --quiet --allow-empty -m "old detached work"
+uc_oid=$(git -C "$uc_parent/uc-expired" rev-parse HEAD)
+GIT_COMMITTER_DATE="@$((uc_now - 20 * uc_day)) +0000" \
+  git -C "$uc_parent/uc-expired" checkout --quiet --detach main
+git -C "$uc_parent/uc-expired" switch --quiet uc-expired
+git -C "$uc_parent/uc-expired" reflog expire --all
+_assert_not_contains "expiry dropped the entry that made the old commit" "$uc_oid" \
+  "$(git -C "$uc_parent/uc-expired" log -g --format=%H HEAD)"
+_assert_detached_work_kept uc-expired \
+  "a commit only an expired entry's survivor names keeps the worktree"
+# The same with a gap: newer detached work after it, kept alive by a branch,
+# and gc in between.
+uc_repo=$(_merged_worktree_repo uc-gap "$uc_parent/uc-gap")
+GIT_COMMITTER_DATE="@$((uc_now - 40 * uc_day)) +0000" \
+  git -C "$uc_parent/uc-gap" switch --quiet --detach
+GIT_COMMITTER_DATE="@$((uc_now - 40 * uc_day)) +0000" \
+  git -C "$uc_parent/uc-gap" commit --quiet --allow-empty -m "old detached work"
+uc_oid=$(git -C "$uc_parent/uc-gap" rev-parse HEAD)
+GIT_COMMITTER_DATE="@$((uc_now - 20 * uc_day)) +0000" \
+  git -C "$uc_parent/uc-gap" checkout --quiet --detach main
+GIT_COMMITTER_DATE="@$((uc_now - 10 * uc_day)) +0000" \
+  git -C "$uc_parent/uc-gap" commit --quiet --allow-empty -m "newer detached work"
+git -C "$uc_repo" branch uc-gap-newer "$(git -C "$uc_parent/uc-gap" rev-parse HEAD)"
+git -C "$uc_parent/uc-gap" switch --quiet uc-gap
+git -C "$uc_repo" gc --quiet
+_assert_not_contains "gc dropped the entry that made the old commit" "$uc_oid" \
+  "$(git -C "$uc_parent/uc-gap" log -g --format=%H HEAD)"
+_assert_detached_work_kept uc-gap \
+  "a commit only an entry's old side names after gc keeps the worktree"
+# Reftable reflogs keep no file to read old sides from, so a worktree whose
+# HEAD reflog has entries is kept rather than judged from new sides alone.
+if git init --quiet --ref-format=reftable "$(_tmpdir)/probe" >/dev/null 2>&1; then
+  rt_remote=$(_tmpdir)
+  rt_repo="$(_tmpdir)/repo"
+  git init --quiet --bare --initial-branch=main "$rt_remote"
+  git clone --quiet --ref-format=reftable "$rt_remote" "$rt_repo" 2>/dev/null
+  git -C "$rt_repo" config user.email test@test.com
+  git -C "$rt_repo" config user.name Test
+  _commit_file "$rt_repo" README.md base base
+  git -C "$rt_repo" push --quiet origin main
+  git -C "$rt_repo" worktree add --quiet -b rt-feat "$(_tmpdir)/wt"
+  uc_out=$(git -C "$rt_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+  _assert_contains "a reftable worktree with a HEAD reflog is kept" \
+    $'keep-branch\trt-feat\tuninspectable\t' "$uc_out"
+else
+  printf 'skip - reftable cases need Git with --ref-format\n'
+fi
+# A worktree that once had another branch checked out still lists that
+# branch's commits in its HEAD reflog. When this run deletes that branch as
+# merged, its commits do not keep the worktree, in a dry run or a real one.
+uc_repo=$(_merged_worktree_repo uc-reused "$uc_parent/reused")
+git -C "$uc_parent/reused" switch --quiet -c uc-earlier
+_commit_file "$uc_parent/reused" earlier.txt earlier "earlier work"
+git -C "$uc_parent/reused" switch --quiet uc-reused
+_commit_file "$uc_repo" earlier.txt earlier "land earlier work"
+git -C "$uc_repo" push --quiet origin main
+for uc_mode in --dry-run ""; do
+  uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees \
+    ${uc_mode:+"$uc_mode"} 2>/dev/null)
+  _assert_contains "a branch deleted this run does not pin a reused worktree (${uc_mode:-real})" \
+    "remove-worktree"$'\t'"$uc_parent/reused"$'\tmerged\tuc-reused' "$uc_out"
+done
+
+# A branch this run deletes drops the commits its reflog names (here one
+# reset away there), so they do not pin a worktree it was once in, whichever
+# of the two the run reaches first, in a dry run or a real one.
+for uc_order in "uc-zz-order uc-aa-order" "uc-aa-order2 uc-zz-order2"; do
+  read -r uc_wt_branch uc_gone_branch <<<"$uc_order"
+  uc_repo=$(_merged_worktree_repo "$uc_wt_branch" "$uc_parent/$uc_wt_branch")
+  git -C "$uc_parent/$uc_wt_branch" switch --quiet -c "$uc_gone_branch"
+  _commit_file "$uc_parent/$uc_wt_branch" order-scratch.txt scratch "scratch work"
+  git -C "$uc_parent/$uc_wt_branch" reset --quiet --hard HEAD~1
+  _commit_file "$uc_parent/$uc_wt_branch" order.txt order "order work"
+  git -C "$uc_parent/$uc_wt_branch" switch --quiet "$uc_wt_branch"
+  git -C "$uc_repo" merge --quiet --ff-only "$uc_gone_branch"
+  git -C "$uc_repo" push --quiet origin main
+  for uc_mode in --dry-run ""; do
+    uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees \
+      ${uc_mode:+"$uc_mode"} 2>/dev/null)
+    _assert_contains "a deleted branch's reflog does not pin a worktree it was once in ($uc_order, ${uc_mode:-real})" \
+      "remove-worktree"$'\t'"$uc_parent/$uc_wt_branch"$'\tmerged\t'"$uc_wt_branch" "$uc_out"
+  done
+done
+# Detached work saved under a remote branch, a local branch, or a tag after
+# two amends: the save reaches the work, and the amends replaced what came
+# before, so nothing pins the worktree.
+for uc_save in remote branch tag; do
+  uc_repo=$(_merged_worktree_repo "uc-save-$uc_save" "$uc_parent/save-$uc_save")
+  git -C "$uc_parent/save-$uc_save" switch --quiet --detach
+  _commit_file "$uc_parent/save-$uc_save" save1.txt one "saved work one"
+  _commit_file "$uc_parent/save-$uc_save" save2.txt two "saved work two"
+  git -C "$uc_parent/save-$uc_save" commit --quiet --amend -m "saved work two, amended"
+  git -C "$uc_parent/save-$uc_save" commit --quiet --amend -m "saved work two, final"
+  case "$uc_save" in
+    remote)
+      git -C "$uc_parent/save-$uc_save" push --quiet origin HEAD:refs/heads/uc-saved
+      git -C "$uc_repo" fetch --quiet origin
+      ;;
+    branch) git -C "$uc_repo" branch uc-saved "$(git -C "$uc_parent/save-$uc_save" rev-parse HEAD)" ;;
+    tag) git -C "$uc_repo" tag uc-saved "$(git -C "$uc_parent/save-$uc_save" rev-parse HEAD)" ;;
+  esac
+  git -C "$uc_parent/save-$uc_save" switch --quiet "uc-save-$uc_save"
+  uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+  _assert_contains "detached work saved under a $uc_save does not pin the worktree" \
+    $'remove-worktree\t'"$uc_parent/save-$uc_save"$'\tmerged\tuc-save-'"$uc_save" "$uc_out"
+done
+# The stash is shared, and a stash made on detached work reaches that work.
+uc_repo=$(_merged_worktree_repo uc-stash "$uc_parent/stash")
+git -C "$uc_parent/stash" switch --quiet --detach
+_commit_file "$uc_parent/stash" stash-work.txt work "detached work"
+printf 'pending\n' >>"$uc_parent/stash/stash-work.txt"
+git -C "$uc_parent/stash" stash --quiet
+git -C "$uc_parent/stash" switch --quiet uc-stash
+uc_out=$(git -C "$uc_repo" cleanup-repo --porcelain --remove-worktrees 2>/dev/null)
+_assert_contains "detached work the stash reaches does not pin the worktree" \
+  $'remove-worktree\t'"$uc_parent/stash"$'\tmerged\tuc-stash' "$uc_out"
+# The gate's Git processes do not grow with the HEAD reflog: a worktree with
+# 400 amends of its branch costs as many as one with 4. Nor with the
+# candidates that need a proof: after eight failed proofs the rest pin, so 20
+# unprovable detached commits cost as many as 9.
+_count_gate_git() {
+  local entries="$1" mode="${2:-amend}" repo dir bin count_file i
+
+  dir="$uc_parent/count-$mode-$entries"
+  repo=$(_merged_worktree_repo "uc-count-$mode-$entries" "$dir")
+  if [[ "$mode" == amend ]]; then
+    for ((i = 0; i < entries; i++)); do
+      git -C "$dir" commit --quiet --allow-empty --amend -m "amend $i"
+    done
+    git -C "$dir" reset --quiet --hard main
+  else
+    git -C "$dir" switch --quiet --detach
+    for ((i = 0; i < entries; i++)); do
+      _commit_file "$dir" "lost-$i.txt" "lost $i" "unprovable work $i"
+      git -C "$dir" reset --quiet --hard HEAD~1
+    done
+    git -C "$dir" switch --quiet "uc-count-$mode-$entries"
+  fi
+  bin=$(_tmpdir)
+  count_file="$bin/count"
+  cat >"$bin/git" <<'EOF_GIT'
+#!/usr/bin/env bash
+printf x >>"$UC_COUNT_FILE"
+exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
+EOF_GIT
+  chmod +x "$bin/git"
+  (cd "$repo" && UC_COUNT_FILE="$count_file" PATH="$bin:$PATH" \
+    "$ROOT/bin/git-cleanup-repo" --no-update-base \
+    --no-fetch --worktree "$dir" --porcelain >/dev/null 2>&1)
+  wc -c <"$count_file" | tr -d ' '
+}
+_assert_eq "the worktree gate runs as many Git processes for 400 reflog entries as for 4" \
+  "$(_count_gate_git 4)" "$(_count_gate_git 400)"
+_assert_eq "the worktree gate runs as many Git processes for 20 unprovable commits as for 9" \
+  "$(_count_gate_git 9 lost)" "$(_count_gate_git 20 lost)"
+
 # --- Hardening for unattended callers ---
 
 # A deletion is reported only once it happened: a failed one is reported
@@ -4863,6 +5672,87 @@ if command -v jq >/dev/null 2>&1; then
     git cleanup-repo --porcelain --retire-worktree "$unknown_dir" 2>&1)
   _assert_contains "a complete lookup lets the request retire it" \
     $'remove-worktree\t'"$unknown_dir"$'\trequested\tunknown-pr' "$result"
+
+  # A gone upstream says the remote branch was retired, not that every local
+  # commit reached it. When GitHub has never seen the tip (its 422 for the
+  # commit) or the lookup failed, --gone keeps the branch; a published tip
+  # whose remote branch is gone still goes.
+  _gone_followup_repo() {
+    local repo
+
+    repo=$(_github_clone) || return 1
+    git -C "$repo" switch --quiet -c "$1"
+    _commit_file "$repo" "$1.txt" one "published work"
+    git -C "$repo" push --quiet -u origin "$1"
+    git -C "$repo" push --quiet origin --delete "$1"
+    if [[ "${2:-}" == followup ]]; then
+      _commit_file "$repo" "$1.txt" two "follow-up after the remote branch went"
+    fi
+    git -C "$repo" switch --quiet main
+    printf '%s\n' "$repo"
+  }
+  unp_repo=$(_gone_followup_repo unpushed-followup followup)
+  unp_tip=$(git -C "$unp_repo" rev-parse refs/heads/unpushed-followup)
+  printf '[{"message":"No commit found for SHA","status":"422"}]\n' \
+    >"$gh_dir/commits-$unp_tip.json.fail"
+  for unp_gone in --gone ""; do
+    unp_rc=0
+    result=$(cd "$unp_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+      git cleanup-repo --porcelain $unp_gone 2>&1) || unp_rc=$?
+    _assert_eq "an unpublished tip behind a gone upstream exits 0 (${unp_gone:-no --gone})" 0 "$unp_rc"
+    _assert_contains "an unpublished tip behind a gone upstream is kept (${unp_gone:-no --gone})" \
+      $'keep-branch\tunpushed-followup\tunpublished\t\n' "$result"$'\n'
+  done
+  _assert_eq "the unpublished follow-up commit survives --gone" "$unp_tip" \
+    "$(git -C "$unp_repo" rev-parse -q --verify refs/heads/unpushed-followup)"
+  # Its selected worktree is not retired on the gone upstream either.
+  unp_wt="$(_tmpdir)/unp"
+  git -C "$unp_repo" worktree add --quiet "$unp_wt" unpushed-followup
+  result=$(cd "$unp_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    git cleanup-repo --porcelain --worktree "$unp_wt" 2>&1)
+  _assert_contains "an unpublished branch's selected worktree carries unpublished" \
+    $'keep-worktree\t'"$unp_wt"$'\tunpublished\tunpushed-followup' "$result"
+  result=$(cd "$unp_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    git cleanup-repo --gone 2>&1)
+  _assert_contains "the unpublished keep says the commits were never pushed" \
+    "keeping unpushed-followup; merge not proven; its upstream is gone, but GitHub has no record of its tip" \
+    "$result"
+  rm -f "$gh_dir/commits-$unp_tip.json.fail"
+
+  pu_gone_repo=$(_gone_followup_repo lookup-failed followup)
+  result=$(cd "$pu_gone_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    FAKE_GH_FAIL=1 git cleanup-repo --porcelain --gone 2>&1)
+  _assert_contains "a failed lookup keeps a gone-upstream branch from --gone" \
+    $'keep-branch\tlookup-failed\tpr-unknown\t' "$result"
+  _assert_contains "the failed-lookup branch survives --gone" lookup-failed \
+    "$(_branches "$pu_gone_repo")"
+  pu_gone_wt="$(_tmpdir)/pu-gone"
+  git -C "$pu_gone_repo" worktree add --quiet "$pu_gone_wt" lookup-failed
+  result=$(cd "$pu_gone_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    FAKE_GH_FAIL=1 git cleanup-repo --porcelain --gone --worktree "$pu_gone_wt" 2>&1)
+  _assert_contains "a failed lookup keeps a gone-upstream branch's selected worktree" \
+    $'keep-worktree\t'"$pu_gone_wt"$'\tpr-unknown\tlookup-failed' "$result"
+
+  # GitHub not knowing a tip proves nothing about --gone for a branch whose
+  # upstream is not gone: it stays an ordinary unproven branch.
+  np_repo=$(_github_clone)
+  git -C "$np_repo" switch --quiet -c never-pushed
+  _commit_file "$np_repo" np.txt np "never pushed"
+  np_tip=$(git -C "$np_repo" rev-parse HEAD)
+  git -C "$np_repo" switch --quiet main
+  printf '[{"message":"No commit found for SHA","status":"422"}]\n' \
+    >"$gh_dir/commits-$np_tip.json.fail"
+  result=$(cd "$np_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    git cleanup-repo --porcelain --gone 2>&1)
+  _assert_contains "an unknown tip without a gone upstream is merge-unproven" \
+    $'keep-branch\tnever-pushed\tmerge-unproven\tno-upstream' "$result"
+  rm -f "$gh_dir/commits-$np_tip.json.fail"
+
+  pub_gone_repo=$(_gone_followup_repo published-gone)
+  result=$(cd "$pub_gone_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
+    git cleanup-repo --porcelain --gone 2>&1)
+  _assert_contains "a published tip behind a gone upstream still goes with --gone" \
+    $'delete-branch\tpublished-gone\tupstream-gone\t' "$result"
 
   # Pull request evidence is advisory: only a complete, well-formed
   # observation of the exact commit on the pinned base counts. These cases
@@ -4979,7 +5869,7 @@ if command -v jq >/dev/null 2>&1; then
     pulls="$pulls $pulls"
     proof
   )
-  lineage_expected='merged	7|open	8||none	-|none	-|none	-|none	-|none	-|none	-|closed	7|none	-||none	-|closed	7|open	7|||||||merged	7||'
+  lineage_expected='merged	7|open	8||none	-|none	-	7	develop|none	-|none	-|none	-|none	-|closed	7|none	-||unpublished	-|closed	7|open	7|||||||merged	7||'
   _assert_eq "pull request evidence needs a complete exact observation on the pinned base" \
     "$lineage_expected" "$lineage_out"
 else
@@ -4998,9 +5888,17 @@ rm -rf "$sy_wt"
 git -C "$sy_repo" worktree add --quiet "$sy_wt" feat
 git -C "$sy_repo" symbolic-ref refs/heads/alias refs/heads/feat
 sy_feat=$(git -C "$sy_repo" rev-parse refs/heads/feat)
-sy_out=$(git -C "$sy_repo" cleanup-repo --no-update-base --all --porcelain 2>/dev/null)
+sy_rc=0
+sy_out=$(git -C "$sy_repo" cleanup-repo --no-update-base --all --porcelain 2>/dev/null) ||
+  sy_rc=$?
+_assert_eq "an --all sweep beside an alias exits 0" 0 "$sy_rc"
 _assert_not_contains "a symbolic branch alias is never deleted" \
   $'delete-branch\talias' "$sy_out"
+# feat is also checked out elsewhere, which alone would keep it; the symref
+# record shows the alias is what keeps it.
+_assert_contains "an alias's target is kept as symref, not merely checked out" \
+  $'keep-branch\tfeat\tsymref\talias' "$sy_out"
+_assert_not_contains "an alias gets no record of its own" $'\talias\t' "$sy_out"
 _assert_eq "a symbolic alias's target survives --all" \
   "$sy_feat" "$(git -C "$sy_repo" rev-parse -q --verify refs/heads/feat)"
 _assert_eq "the alias itself survives" refs/heads/feat \
@@ -5011,9 +5909,17 @@ sy_base_repo=$(_clone_remote)
 git -C "$sy_base_repo" symbolic-ref refs/heads/master refs/heads/main
 _commit_file "$sy_base_repo" unpushed.txt unpushed "unpushed on main"
 sy_main=$(git -C "$sy_base_repo" rev-parse refs/heads/main)
-git -C "$sy_base_repo" cleanup-repo --all >/dev/null 2>&1
+sy_rc=0
+sy_out=$(git -C "$sy_base_repo" cleanup-repo --all --porcelain 2>/dev/null) || sy_rc=$?
+_assert_eq "an --all sweep beside an alias of the base exits 0" 0 "$sy_rc"
 _assert_eq "an alias of the base never deletes the base" \
   "$sy_main" "$(git -C "$sy_base_repo" rev-parse -q --verify refs/heads/main)"
+# --no-deref would delete only the alias, so the base surviving does not show
+# the alias was skipped; the alias surviving, unreported, does.
+_assert_eq "an alias of the base survives --all" refs/heads/main \
+  "$(git -C "$sy_base_repo" symbolic-ref -q refs/heads/master)"
+_assert_not_contains "an alias of the base is not a deletion candidate" \
+  $'\tmaster\t' "$sy_out"
 
 # A committed CACHEDIR.TAG marks a source directory, not a cache, so a
 # worktree's untracked work there is never pruned.
@@ -5169,6 +6075,9 @@ git -C "$st_repo" symbolic-ref refs/heads/alias refs/heads/st-landed
 st_out=$(git -C "$st_repo" cleanup-repo --no-update-base --porcelain 2>/dev/null)
 _assert_contains "a merged branch behind an alias is kept as symref" \
   $'keep-branch\tst-landed\tsymref\talias' "$st_out"
+st_out=$(git -C "$st_repo" cleanup-repo --no-update-base 2>&1)
+_assert_contains "one alias reads in the singular" \
+  "keeping st-landed; the symbolic ref alias points at it" "$st_out"
 _assert_contains "the aliased branch survives" st-landed "$(_branches "$st_repo")"
 
 # A base checked out in another worktree is left not updated, not overwritten,
@@ -5239,10 +6148,17 @@ git -C "$rdw_repo" worktree add --quiet "$rdw_wt" master
 _commit_file "$rdw_wt" unpushed.txt unpushed "unpushed on master"
 git -C "$rdw_repo" push --quiet origin --delete master
 git -C "$rdw_repo" fetch --quiet --prune origin
+rdw_rc=0
+rdw_err=$(_tmpdir)/stderr
 rdw_out=$(git -C "$rdw_repo" cleanup-repo --no-update-base --worktree "$rdw_wt" \
-  --porcelain 2>/dev/null)
+  --porcelain 2>"$rdw_err") || rdw_rc=$?
+_assert_eq "a gone default upstream worktree selection exits 0" 0 "$rdw_rc"
+_assert_eq "a gone default upstream worktree selection prints no diagnostics" "" \
+  "$(cat "$rdw_err")"
 _assert_not_contains "a gone default upstream never retires its worktree" \
   $'remove-worktree\t'"$rdw_wt" "$rdw_out"
+_assert_contains "a gone default upstream keeps its worktree as unproven" \
+  $'keep-worktree\t'"$rdw_wt"$'\tmerge-unproven\tmaster' "$rdw_out"
 rdw_out=$(git -C "$rdw_repo" cleanup-repo --no-update-base --gone 2>&1)
 _assert_contains "the keep message says --gone never selects a renamed default" \
   "so --gone never selects it" "$rdw_out"
@@ -5264,10 +6180,17 @@ git -C "$dv_repo" config remote.origin.followRemoteHEAD never
 git -C "$dv_repo" push --quiet origin --delete develop
 git -C "$dv_repo" fetch --quiet --prune origin
 git -C "$dv_repo" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/develop
+dv_rc=0
+dv_err=$(_tmpdir)/stderr
 dv_out=$(git -C "$dv_repo" cleanup-repo --no-update-base --base main --gone \
-  --porcelain 2>/dev/null)
+  --porcelain 2>"$dv_err") || dv_rc=$?
+_assert_eq "a --gone sweep beside a renamed develop exits 0" 0 "$dv_rc"
+_assert_eq "a --gone sweep beside a renamed develop prints no diagnostics" "" \
+  "$(cat "$dv_err")"
 _assert_not_contains "--gone keeps the branch the remote's HEAD named" \
   $'delete-branch\tdevelop' "$dv_out"
+_assert_contains "the branch the remote's HEAD named reads as a renamed default" \
+  $'keep-branch\tdevelop\tmerge-unproven\tdefault-upstream-gone' "$dv_out"
 
 # A branch tracking the base itself gets a message that says so.
 tb_repo=$(_clone_remote)
@@ -5319,11 +6242,18 @@ _assert_contains "the aliased branch's worktree carries symref" \
   $'keep-worktree\t'"$sw_wt"$'\tsymref\tsw-feat' "$sw_out"
 sw_out=$(git -C "$sw_repo" cleanup-repo --no-update-base 2>&1)
 _assert_contains "the summary counts the aliased branch as kept" "skipped 1" "$sw_out"
+_assert_contains "two aliases read in the plural" \
+  "keeping sw-feat; the symbolic refs alias1 alias2 point at it" "$sw_out"
+_assert_contains "a summary of no deletions reads in the plural" \
+  "deleted 0 local branches" "$sw_out"
 
-# The base behind an alias gets no record of its own.
-sb_out=$(git -C "$sy_base_repo" cleanup-repo --no-update-base --porcelain 2>/dev/null)
-_assert_not_contains "the base behind an alias is not reported" \
-  $'keep-branch\tmain' "$sb_out"
+# The base behind an alias gets no record of its own, and neither does the
+# alias.
+sb_rc=0
+sb_out=$(git -C "$sy_base_repo" cleanup-repo --no-update-base --porcelain 2>/dev/null) ||
+  sb_rc=$?
+_assert_eq "a sweep with the base behind an alias exits 0" 0 "$sb_rc"
+_assert_eq "neither the base nor its alias is reported" "" "$sb_out"
 
 # A worktree whose submodule was deinitialized keeps only modules/, which
 # Git still refuses to remove.
@@ -5344,6 +6274,42 @@ md_out=$(git -C "$md_repo" cleanup-repo --no-update-base --worktree "$md_wt" \
   --porcelain 2>/dev/null)
 _assert_contains "a modules directory alone keeps the worktree" \
   $'keep-worktree\t'"$md_wt"$'\tsubmodule' "$md_out"
+
+# An unpopulated submodule's directory is invisible to status, and Git
+# removes it with the worktree, so a file a user left there keeps the
+# worktree; an empty one, as `git worktree add` leaves it, does not.
+up_sub=$(_clone_remote)
+up_repo=$(_clone_remote)
+git -C "$up_repo" -c protocol.file.allow=always submodule --quiet add \
+  "$(git -C "$up_sub" remote get-url origin)" sub >/dev/null 2>&1
+git -C "$up_repo" commit --quiet -m "add submodule"
+git -C "$up_repo" push --quiet origin main
+up_wt=$(_tmpdir)
+up_empty=$(_tmpdir)
+up_dot=$(_tmpdir)
+rm -rf "$up_wt" "$up_empty" "$up_dot"
+git -C "$up_repo" worktree add --quiet "$up_wt" -b up-feat
+git -C "$up_repo" worktree add --quiet "$up_empty" -b up-empty
+git -C "$up_repo" worktree add --quiet "$up_dot" -b up-dot
+printf 'notes\n' >"$up_wt/sub/notes.txt"
+printf 'notes\n' >"$up_dot/sub/.notes"
+_assert_eq "the unpopulated submodule fixture looks clean to status" "" \
+  "$(git -C "$up_wt" status --porcelain --ignored)"
+for up_mode in --dry-run ""; do
+  up_out=$(git -C "$up_repo" cleanup-repo --no-update-base --worktree "$up_wt" \
+    --worktree "$up_empty" --worktree "$up_dot" --porcelain ${up_mode:+"$up_mode"} \
+    2>/dev/null)
+  _assert_contains "a file in an unpopulated submodule directory keeps the worktree (${up_mode:-real})" \
+    $'keep-worktree\t'"$up_wt"$'\tsubmodule' "$up_out"
+  _assert_contains "a hidden file in an unpopulated submodule directory keeps the worktree (${up_mode:-real})" \
+    $'keep-worktree\t'"$up_dot"$'\tsubmodule' "$up_out"
+done
+_assert_eq "the hidden file in the unpopulated submodule directory survives" notes \
+  "$(cat "$up_dot/sub/.notes" 2>/dev/null)"
+_assert_eq "the file in the unpopulated submodule directory survives" notes \
+  "$(cat "$up_wt/sub/notes.txt" 2>/dev/null)"
+_assert_contains "an empty unpopulated submodule directory does not keep the worktree" \
+  $'remove-worktree\t'"$up_empty"$'\tmerged\tup-empty' "$up_out"
 
 # Creating a missing local base never overwrites an ignored file either.
 nc_repo=$(_clone_remote)
@@ -5578,6 +6544,91 @@ dp_out=$(git -C "$dp_repo" cleanup-repo 2>&1)
 _assert_contains "a sparse base worktree is left not updated" "main not updated" "$dp_out"
 _assert_eq "the sparse base worktree's ignored file survives" local "$(cat "$dp_wt/.env")"
 
+# A sparse checkout with an ignored a/.env inside its patterns, behind a
+# remote that starts tracking a/.env. Prints the checkout.
+sparse_env_repo() {
+  local repo other
+
+  IFS=$'\t' read -r repo other < <(dp_new)
+  _commit_file "$repo" a/keep.txt k "add a"
+  _commit_file "$repo" b/keep.txt k "add b"
+  git -C "$repo" push --quiet origin main
+  git -C "$other" pull --quiet --ff-only origin main
+  _commit_file "$other" a/.env remote "track a/.env"
+  git -C "$other" push --quiet origin main
+  git -C "$repo" sparse-checkout set --cone a >/dev/null 2>&1
+  printf '.env\n' >>"$repo/.git/info/exclude"
+  printf 'local\n' >"$repo/a/.env"
+  git -C "$repo" switch --quiet -c sp-feat
+  printf '%s\n' "$repo"
+}
+
+# `git --literal-pathspecs` exports GIT_LITERAL_PATHSPECS=1, which would turn
+# the predictor's :(top,literal) pathspecs into literal names that match
+# nothing; the tools clear it, so the sparse checkout still refuses.
+for lp_mode in --dry-run ""; do
+  lp_repo=$(sparse_env_repo)
+  lp_rc=0
+  lp_out=$(git --literal-pathspecs -C "$lp_repo" cleanup-repo ${lp_mode:+"$lp_mode"} 2>&1) ||
+    lp_rc=$?
+  _assert_eq "literal pathspecs do not blind the sparse predictor (${lp_mode:-real})" 2 "$lp_rc"
+  _assert_contains "the literal-pathspec refusal names the file in the way (${lp_mode:-real})" \
+    "an untracked or ignored file is in the way" "$lp_out"
+  _assert_eq "literal pathspecs leave the sparse ignored file intact (${lp_mode:-real})" \
+    local "$(cat "$lp_repo/a/.env")"
+done
+
+# In a sparse checkout nothing but the prediction stops Git from overwriting,
+# so a prediction that cannot be made counts as a block there.
+fd_repo=$(sparse_env_repo)
+fd_bin=$(_tmpdir)
+cat >"$fd_bin/git" <<'EOF_GIT'
+#!/usr/bin/env bash
+if [[ "${1:-}" == diff-tree && " $* " == *" --diff-filter=A "* ]]; then
+  exit 128
+fi
+exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
+EOF_GIT
+chmod +x "$fd_bin/git"
+fd_rc=0
+# shellcheck disable=SC2031 # PATH is only prefixed for this command
+fd_out=$(cd "$fd_repo" && env PATH="$fd_bin:$PATH" "$ROOT/bin/git-cleanup-repo" 2>&1) ||
+  fd_rc=$?
+_assert_eq "a failed prediction in a sparse checkout refuses" 2 "$fd_rc"
+_assert_contains "a failed prediction in a sparse checkout says why" \
+  "an untracked or ignored file is in the way" "$fd_out"
+_assert_eq "a failed prediction leaves the sparse ignored file intact" \
+  local "$(cat "$fd_repo/a/.env")"
+# The same when the untracked-file lookup itself fails.
+fl_repo=$(sparse_env_repo)
+fl_bin=$(_tmpdir)
+cat >"$fl_bin/git" <<'EOF_GIT'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -C && "${3:-}" == ls-files && " $* " == *" -o "* ]]; then
+  exit 128
+fi
+exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
+EOF_GIT
+chmod +x "$fl_bin/git"
+fl_rc=0
+# shellcheck disable=SC2031 # PATH is only prefixed for this command
+fl_out=$(cd "$fl_repo" && env PATH="$fl_bin:$PATH" "$ROOT/bin/git-cleanup-repo" 2>&1) ||
+  fl_rc=$?
+_assert_eq "a failed untracked-file lookup in a sparse checkout refuses" 2 "$fl_rc"
+_assert_contains "a failed untracked-file lookup in a sparse checkout says why" \
+  "an untracked or ignored file is in the way" "$fl_out"
+_assert_eq "a failed untracked-file lookup leaves the sparse ignored file intact" \
+  local "$(cat "$fl_repo/a/.env")"
+# Outside a sparse checkout Git itself still refuses, so a failed prediction
+# leaves the decision to it and a dry run goes ahead.
+fd_dense_repo=$(_clone_remote)
+git -C "$fd_dense_repo" switch --quiet -c fd-feat
+fd_rc=0
+# shellcheck disable=SC2031 # PATH is only prefixed for this command
+fd_out=$(cd "$fd_dense_repo" && env PATH="$fd_bin:$PATH" "$ROOT/bin/git-cleanup-repo" \
+  --dry-run 2>&1) || fd_rc=$?
+_assert_eq "a failed prediction outside a sparse checkout leaves it to Git" 0 "$fd_rc"
+
 # The predictor batches its untracked-file lookups: 600 occupied paths that
 # are all tracked predict success, and one untracked file past the first batch
 # still blocks.
@@ -5633,7 +6684,7 @@ amb_out=$(
 _assert_eq "origin/HEAD resolves despite an ambiguous local branch" develop "$amb_out"
 
 # The interface version is pinned, so an unintended change fails here.
-_assert_eq "--interface-version is 1" 1 "$(git-cleanup-repo --interface-version)"
+_assert_eq "--interface-version is 2" 2 "$(git-cleanup-repo --interface-version)"
 
 if command -v jq >/dev/null 2>&1; then
   # A plain --worktree selection whose pull request lookup failed carries

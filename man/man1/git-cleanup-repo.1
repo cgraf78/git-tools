@@ -6,9 +6,11 @@ git-cleanup-repo \- delete safely merged local branches
 .RI [ options ]
 .SH DESCRIPTION
 .B git cleanup-repo
-resolves the remote fetch endpoint, fetches the exact repository default branch
-without updating remote-tracking refs or FETCH_HEAD, then deletes stale local
-branches whose exact object IDs are proven merged.
+resolves the remote fetch endpoint, fetches the exact base (the remote's default
+branch unless
+.B \-\-base
+names another) without updating remote-tracking refs or FETCH_HEAD, then
+deletes stale local branches whose exact object IDs are proven merged.
 .PP
 By default it deletes local branches that are already merged into the base
 branch. This includes squash-, rebase-, and cherry-pick-merged branches: patch
@@ -107,7 +109,14 @@ branch's own commits. Neither is one whose upstream was a default branch
 .BR master ,
 .BR trunk ,
 or the branch the remote's recorded HEAD names): a default branch disappears
-when it is renamed, not after landing.
+when it is renamed, not after landing. A gone upstream says the remote branch
+was retired, not that every local commit reached it, so with pull request
+evidence a branch whose tip GitHub has never seen
+.RB ( unpublished )
+or whose lookup failed
+.RB ( pr\-unknown )
+is kept too. Without that evidence such a branch is still selected, and its
+commits made after the remote branch went are lost.
 .TP
 .BR \-a ", " \-\-all
 Delete all local branches except the base branch.
@@ -166,9 +175,16 @@ under
 and only diagnostics on standard error.
 .TP
 .BI \-\-min\-age " days"
-Keep a branch proven only by ancestry whose reflog shows it created or moved
-less than this many days ago, or that has no reflog; such a branch looks
-exactly like a fast-forward-merged one. At most 99999.
+Keep a branch proven only by ancestry that was created or moved less than this
+many days ago; such a branch looks exactly like a fast-forward-merged one. Its
+reflog says when. Reflog entries expire, leaving an empty reflog, so a branch
+whose reflog is empty is dated by its tip's commit, which is safe because
+creating or moving a logged branch writes an entry. A branch with no reflog at
+all was never logged (with
+.BR core.logAllRefUpdates=false ,
+or created by
+.B git worktree add \-b
+in a bare repository); its age is unknown and it is kept. At most 99999.
 .TP
 .BI \-\-retire\-worktree " path"
 Remove this linked worktree; repeat for more. The caller vouches for the
@@ -182,6 +198,9 @@ branch, or tag reaches
 .RB ( unreachable\-head ),
 and a branch whose pull request lookup failed
 .RB ( pr\-unknown ).
+A gate code such as
+.B unique\-commits
+keeps it like any other worktree.
 .TP
 .B \-\-include\-closed
 Also retire a selected worktree whose branch only a closed, unmerged pull
@@ -193,7 +212,34 @@ Print actions without changing anything.
 .B \-\-interface\-version
 Print the porcelain interface version, an integer that grows whenever the
 options, records, codes, or exit statuses gain or change anything a caller
-relies on, and exit.
+relies on, and exit. Version 1 added exit status 3, the
+.BR pr\-unknown ,
+.BR closed\-pr ,
+.BR symref ,
+and
+.B submodule
+codes, the
+.B default\-upstream\-gone
+detail,
+.B pr\-unknown
+keeping a requested retirement, and following a renamed remote default
+branch. Version 2 added the
+.B unpublished
+and
+.B unique\-commits
+codes,
+.B pr\-unknown
+and
+.B unpublished
+keeping a branch from
+.B \-\-gone
+and its worktree from upstream-gone retirement,
+.B \-\-min\-age
+dating a branch whose reflog expired by its tip's commit (so
+.B too\-new
+can carry a commit time), and
+.B submodule
+also covering files in an unpopulated submodule directory.
 .TP
 .BR \-h ", " \-\-help
 Show help.
@@ -240,13 +286,21 @@ or
 (no proof, and a pull request containing the tip was closed unmerged; detail
 its number),
 .B pr\-unknown
-(no proof, and its pull requests could not be looked up),
+(no proof, and its pull requests could not be looked up;
+.B \-\-gone
+keeps it too),
+.B unpublished
+(no proof, and its own upstream is gone, but GitHub has never seen its tip, so
+it holds commits that were never pushed;
+.B \-\-gone
+keeps it),
 .B symref
 (a symbolic ref under
 .B refs/heads
 points at it; detail the aliases' branch names, space-separated),
 .B too\-new
-(detail the reflog time),
+(detail the reflog time, the tip's commit time once the reflog expired, or
+empty when the age is unknown),
 .BR current\-worktree ,
 .BR submodule ,
 .BR checked\-out ,
@@ -262,6 +316,10 @@ or
 (detail the operation),
 .B in\-use
 (detail the process ID),
+.B unique\-commits
+(detail a commit that the worktree's own refs or HEAD reflog hold, that no
+branch, tag, or remote branch reaches, and that no exception excuses; see
+.BR SAFETY ),
 .BR uninspectable ,
 .BR branch\-changed ,
 .BR reserved ,
@@ -287,6 +345,7 @@ checkout
 .BR operation ,
 .BR submodule ,
 .BR in\-use ,
+.BR unique\-commits ,
 .BR checkout\-in\-flight ,
 .BR branch\-changed ,
 .BR prune\-failed ,
@@ -298,6 +357,7 @@ or
 .BR merge\-unproven ,
 .BR closed\-pr ,
 .BR pr\-unknown ,
+.BR unpublished ,
 and
 .B symref
 carry the branch as detail;
@@ -369,13 +429,44 @@ a linked worktree is preserved when it has uncommitted, untracked, ignored, or
 index-hidden local content, is unreadable, is locked with
 .BR "git worktree lock" ,
 has an active rebase, merge, cherry-pick, revert, or bisect, contains a
-populated submodule (which Git cannot remove), is the working
+populated submodule (which Git cannot remove) or files in an unpopulated
+submodule's directory (which status does not show), is the working
 directory of a visible process (read from
 .B /proc
 or
 .BR lsof ;
 worktrees are kept when neither can list working directories; open files held
 from another directory are not detected), or cannot be removed without force.
+It is also preserved when its HEAD reflog or its own refs
+.RB ( refs/worktree ,
+.BR refs/bisect ,
+.BR refs/rewritten ),
+which go with it, hold a commit that no branch, tag, or remote branch reaches
+.RB ( unique\-commits ).
+A commit those refs hold is protected unless a branch, tag, remote branch, or
+the stash reaches it. So is every commit the HEAD
+reflog names, on either side of any entry (a checkout, reset, amend, rebase, or
+a tool's own GIT_REFLOG_ACTION), on a branch or detached; old sides are read
+from the reflog file itself, since after gc expires old entries a surviving
+entry's old side can be the only record of a commit. With reftable reflogs
+there is no such file, so a worktree whose HEAD reflog has entries is kept
+.RB ( uninspectable ).
+These do not count: commits a branch, tag, remote branch, or the stash
+reaches; commits named by the reflog of a branch that still exists or that the
+same run deletes (an amended, reset, or rebased branch tip), which deleting
+that branch drops; the current HEAD's history, which the removal reason
+covers; the tips of branches the same run deletes; commits whose work is
+proven in the base by the same proofs that delete branches, and the commits
+they were built on (proofs run after the cheaper checks; once eight have
+failed, the rest stay protected); commits replaced rather than discarded,
+where an amend or a rebase step that makes a new commit (pick, reword, edit,
+fixup, squash, merge, or continue) moved HEAD to a commit that is safe; and
+clean copies an aborted rebase made (pick, reword, edit, fixup, squash), whose
+originals are still on the branch or the tip it returned to; a copy excuses
+only itself. A reset, a
+rebase's reset or abort, or a checkout discards or leaves, so detached work
+reset away (even to a newer origin/main), a conflict resolved before an abort,
+and commits made or amended by hand during an aborted rebase keep the worktree.
 A worktree whose own index or HEAD lock is held is kept, and while any
 worktree holds one every branch is kept
 .RB ( checkout\-in\-flight ),
@@ -385,10 +476,11 @@ in progress holds those locks after resolving the branch it checks out; a lock
 left by a crashed Git keeps branches until it is removed.
 Updating the base never overwrites an ignored file with a newly tracked one:
 in the invoking checkout the command stops with status 2, back where it
-started (the message says so if switching back failed), and a base checked out in another worktree is left not
-updated. In a sparse checkout Git would overwrite such a file with only a
-warning, so the command checks first there and holds back, possibly also for a
-path outside the sparse patterns that Git would have left alone. It also
+started (the message says so if switching back failed), and a base checked
+out in another worktree is left not updated. In a sparse checkout Git would
+overwrite such a file with only a warning, so the command checks first there
+and holds back, possibly also for a path outside the sparse patterns that Git
+would have left alone. It also
 refuses to switch away from a branch with no commits yet.
 Symbolic refs under
 .B refs/heads

@@ -709,6 +709,9 @@ gt_git_without_local_env() {
     [[ -n "$name" ]] || continue
     env_args+=("-u" "$name")
   done <<<"$local_vars"
+  # GIT_CONFIG_PARAMETERS is among them, but a write in the other worktree must
+  # still never start auto maintenance (see lib/git-tools-git.sh).
+  env_args+=("GIT_CONFIG_PARAMETERS=$GT_GIT_NO_AUTO_MAINTENANCE")
 
   env "${env_args[@]}" "$GT_GIT" "$@"
 }

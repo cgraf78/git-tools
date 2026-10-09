@@ -221,16 +221,18 @@ EOF
   cat >"$dir/git" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+# The suite's selected Git (hermetic-git.sh), so a case can test a build.
+real=${GIT_TOOLS_TEST_REAL_GIT:-/usr/bin/git}
 if [[ "${1:-} ${2:-} ${3:-} ${4:-}" == "remote get-url --push --all" &&
   "${GIT_TEST_REAL_EFFECTIVE_PUSH_URL:-0}" != 1 ]]; then
   remote=${5:-}
-  url=$(/usr/bin/git config --get-all "remote.$remote.pushurl" 2>/dev/null || true)
-  [[ -n "$url" ]] || url=$(/usr/bin/git config --get-all "remote.$remote.url")
+  url=$("$real" config --get-all "remote.$remote.pushurl" 2>/dev/null || true)
+  [[ -n "$url" ]] || url=$("$real" config --get-all "remote.$remote.url")
   printf '%s\n' "$url"
   exit 0
 fi
 if [[ "${1:-} ${2:-} ${3:-}" == "remote get-url --all" ]]; then
-  /usr/bin/git config --get-all "remote.${4:-}.url"
+  "$real" config --get-all "remote.${4:-}.url"
   exit $?
 fi
 if [[ "${GIT_TEST_LS_REMOTE_FAIL:-0}" == 1 && "$*" == *" ls-remote "* ]]; then
@@ -253,11 +255,11 @@ fi
 if [[ "${GIT_TEST_ADVANCE_BEFORE_PUSH:-0}" == 1 && "${1:-}" == push &&
   ! -e "${GIT_TEST_ADVANCE_MARKER:?}" ]]; then
   : >"$GIT_TEST_ADVANCE_MARKER"
-  /usr/bin/git -C "${GIT_TEST_ADVANCE_REPO:?}" push --quiet \
+  "$real" -C "${GIT_TEST_ADVANCE_REPO:?}" push --quiet \
     "${GIT_TEST_ADVANCE_REMOTE:?}" \
     "${GIT_TEST_ADVANCE_OID:?}:refs/heads/child"
 fi
-exec /usr/bin/git "$@"
+exec "$real" "$@"
 EOF
   chmod +x "$dir/git"
 }
@@ -277,6 +279,31 @@ _assert_contains "pushes with lease" "pushing child to origin with --force-with-
 _assert_eq "leaves child checked out" "child" "$(git -C "$repo" branch --show-current)"
 _assert_eq "updates PR base" \
   "pr edit 2 --base main --repo github.test/example/repo" "$(cat "$log")"
+
+# The base fetch and the rebase never start Git's auto maintenance, which
+# since Git 2.54 prunes the registration of a worktree moved without repair.
+# Maintenance runs in the foreground here, so a prune would land before the
+# restack returns. Git before 2.54 starts only `gc --auto`, which this small
+# repository never triggers, so the case passes either way there.
+repo_moved=$(_tmpdir)
+remote_moved=$(_tmpdir)
+moved_parent=$(_tmpdir)
+_init_stack_repo "$repo_moved" "$remote_moved"
+git -C "$repo_moved" config maintenance.auto true
+git -C "$repo_moved" config maintenance.autoDetach false
+git -C "$repo_moved" config gc.autoDetach false
+git -C "$repo_moved" worktree add --quiet -b moved "$moved_parent/before" main
+mv -- "$moved_parent/before" "$moved_parent/after"
+touch -t 202001010000 "$repo_moved/.git/worktrees/before/index"
+result=$(GH_LOG="$(_tmpdir)/gh.log" PATH="$bin_dir:$PATH" \
+  _pr_restack "$repo_moved" 2 --base main 2>&1)
+_assert_contains "restack with maintenance enabled still rebases" \
+  "rebasing child onto origin/main" "$result"
+if [[ -d "$repo_moved/.git/worktrees/before" ]]; then
+  _pass "restack keeps a moved worktree's registration"
+else
+  _fail "restack keeps a moved worktree's registration"
+fi
 
 repo_stale_pr_oid=$(_tmpdir)
 remote_stale_pr_oid=$(_tmpdir)

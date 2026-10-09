@@ -257,7 +257,7 @@ gt_cleanup_load_prune_paths() {
 }
 
 _gt_cleanup_entry_has_cache_tag() {
-  local path="$1" entry="$2" signature=""
+  local path="$1" entry="$2" signature="" tracked
 
   # Restrict automatic recognition to real, top-level directories and real
   # tags. A symlink must never turn cache pruning into traversal outside the
@@ -269,7 +269,15 @@ _gt_cleanup_entry_has_cache_tag() {
   [[ -f "$path/$entry/CACHEDIR.TAG" &&
     ! -L "$path/$entry/CACHEDIR.TAG" ]] || return 1
   IFS= read -r signature <"$path/$entry/CACHEDIR.TAG" || return 1
-  [[ "$signature" == "Signature: 8a477f597d28d172789f06886806bc55" ]]
+  [[ "$signature" == "Signature: 8a477f597d28d172789f06886806bc55" ]] ||
+    return 1
+  # A cache directory holds only generated files. One with tracked content
+  # (or a committed tag) is a source directory, and pruning it would delete
+  # the user's untracked work there, so it never counts; neither does one
+  # whose tracked content cannot be listed.
+  tracked=$(gt_git_without_local_env -C "$path" ls-files -- \
+    ":(top,literal)$entry" 2>/dev/null) || return 1
+  [[ -z "$tracked" ]]
 }
 
 _gt_cleanup_entry_is_disposable() {
@@ -285,6 +293,10 @@ _gt_cleanup_entry_is_disposable() {
 _gt_cleanup_classify_status() {
   local path="$1" entry record="" top
   local has_dirty=0 has_disposable=0 has_hidden=0 malformed=0
+  # Status lists every untracked file under a cache, and the disposable check
+  # can run Git; status output is sorted, so remembering the last top-level
+  # entry's answer asks once per entry instead of once per file.
+  local last_top="" last_disposable=0
 
   while :; do
     record=""
@@ -301,7 +313,13 @@ _gt_cleanup_classify_status() {
             continue
           fi
           top=${entry%%/*}
-          if _gt_cleanup_entry_is_disposable "$path" "$top"; then
+          if [[ -z "$last_top" || "$top" != "$last_top" ]]; then
+            last_top=$top
+            last_disposable=0
+            ! _gt_cleanup_entry_is_disposable "$path" "$top" ||
+              last_disposable=1
+          fi
+          if [[ "$last_disposable" == 1 ]]; then
             has_disposable=1
           else
             has_hidden=1
@@ -505,6 +523,106 @@ _gt_cleanup_locked() {
   return 1
 }
 
+# Succeed when the worktree at $1 (empty: the current one) is a sparse
+# checkout. There Git does not refuse to overwrite an untracked or ignored
+# file at a path inside the sparse patterns: it replaces the file with only a
+# warning, even with --no-overwrite-ignore, so callers must check first.
+gt_worktree_is_sparse() {
+  local path="$1" value
+  local -a wt_git=(git)
+
+  [[ -z "$path" ]] || wt_git=(gt_git_without_local_env -C "$path")
+  value=$("${wt_git[@]}" config --bool core.sparseCheckout 2>/dev/null) ||
+    return 1
+  [[ "$value" == true ]]
+}
+
+# @brief Predict whether moving a worktree's files between two commits would
+# hit an untracked or ignored file. Succeeds (0) unless moving the worktree
+# at $1 (empty: the current one) from commit $2 (empty: an unborn HEAD) to
+# commit $3 would make Git refuse for an untracked or ignored file in the way,
+# as --no-overwrite-ignore does (or, in a sparse checkout, silently overwrite
+# it). Git has no dry run for that check (`read-tree -n` skips it), so
+# predict it, and only when certain: a path the target adds is blocked when an
+# untracked or ignored file occupies it or any directory above it. A tracked
+# path that merely changes type is Git's to replace and never blocks, nor
+# does a directory under a newly added gitlink, which Git leaves in place. In
+# a sparse checkout this may also block a path outside the patterns that Git
+# would leave alone, which errs toward keeping. The diff runs in this
+# process's environment, where a dry run's fetched objects are visible; only
+# the untracked-file listing runs in the target worktree. A lookup failure
+# predicts success, leaving any refusal to Git.
+gt_checkout_would_succeed() {
+  local path="$1" from="$2" to="$3" top meta added parent blocker listed i
+  local -a wt_git=(git) candidates=()
+
+  [[ -z "$path" ]] || wt_git=(gt_git_without_local_env -C "$path")
+  top=$("${wt_git[@]}" rev-parse --show-toplevel 2>/dev/null) || return 0
+  [[ -n "$from" ]] || from=$(git hash-object -t tree --stdin </dev/null) || return 0
+  # Raw records: ":<old mode> <new mode> <old oid> <new oid> A" NUL <path> NUL.
+  # Collect the occupied paths first, then ask Git about them in batches: a
+  # landing after a long gap can add thousands of paths that already exist as
+  # tracked files, and one Git process per path would take tens of seconds.
+  while IFS= read -r -d '' meta && IFS= read -r -d '' added; do
+    if [[ "$meta" == *" 160000 "* && -d "$top/$added" && ! -L "$top/$added" ]]; then
+      continue
+    fi
+    # Something other than a directory above the path blocks it; only that
+    # one is asked about, since Git rejects a pathspec beyond a symlink.
+    blocker=""
+    parent=$added
+    while [[ "$parent" == */* ]]; do
+      parent=${parent%/*}
+      if [[ -e "$top/$parent" || -L "$top/$parent" ]] &&
+        [[ ! -d "$top/$parent" || -L "$top/$parent" ]]; then
+        blocker=$parent
+      fi
+    done
+    if [[ -n "$blocker" ]]; then
+      candidates+=(":(top,literal)$blocker")
+    elif [[ -e "$top/$added" || -L "$top/$added" ]]; then
+      candidates+=(":(top,literal)$added")
+    fi
+  done < <(git diff-tree -r -z --no-renames --diff-filter=A "$from" "$to" \
+    2>/dev/null)
+  # `ls-files -o` lists untracked and ignored files alike (no exclude rules
+  # given) and nothing tracked. An empty candidate list must not reach it,
+  # since no pathspec would list the whole worktree.
+  for ((i = 0; i < ${#candidates[@]}; i += 500)); do
+    listed=$(gt_git_without_local_env -C "$top" ls-files -o -- \
+      "${candidates[@]:i:500}" 2>/dev/null) || return 0
+    [[ -z "$listed" ]] || return 1
+  done
+  return 0
+}
+
+# Succeed (0) when `git worktree remove` would refuse the worktree for its
+# submodules, 1 when it would not, 2 when that cannot be determined. Mirrors
+# Git's own rule: a `modules` directory in the worktree's Git directory, or a
+# gitlink whose submodule is populated (has a .git). Checking up front keeps a
+# dry run from promising a removal every real run then fails.
+_gt_cleanup_has_submodules() {
+  local path="$1" gitdir index record
+
+  gitdir=$(gt_git_without_local_env -C "$path" rev-parse --absolute-git-dir \
+    2>/dev/null) || return 2
+  [[ ! -d "$gitdir/modules" ]] || return 0
+  # Capture first so an unreadable index reads as "cannot tell", not as
+  # "no submodules". NUL-separated records cannot live in a variable, so
+  # turn the separators into newlines; a gitlink path never holds one that
+  # matters here (Git refuses newlines in submodule paths).
+  index=$(
+    gt_git_without_local_env -C "$path" ls-files -s -z 2>/dev/null |
+      LC_ALL=C tr '\0' '\n'
+    exit "${PIPESTATUS[0]}"
+  ) || return 2
+  while IFS= read -r record; do
+    [[ "$record" == 160000\ * ]] || continue
+    [[ ! -e "$path/${record#*$'\t'}/.git" ]] || return 0
+  done <<<"$index"
+  return 1
+}
+
 # @brief Check that a linked worktree may be removed, pruning disposable
 # entries when that is all that stands in the way. Reports nothing: when
 # removal must not happen it sets GT_CLEANUP_KEEP_CODE, GT_CLEANUP_KEEP_DETAIL,
@@ -513,6 +631,7 @@ _gt_cleanup_locked() {
 # @param $3 Branch tip OID that must not move before pruning, or "".
 gt_cleanup_worktree_gate() {
   local path="$1" branch="$2" branch_oid="$3" operation state in_use_status
+  local submodule_status
 
   GT_CLEANUP_KEEP_CODE=""
   GT_CLEANUP_KEEP_DETAIL=""
@@ -544,6 +663,21 @@ gt_cleanup_worktree_gate() {
       "worktree has active $operation: $path"
     return 1
   fi
+  submodule_status=0
+  _gt_cleanup_has_submodules "$path" || submodule_status=$?
+  case "$submodule_status" in
+    0)
+      _gt_cleanup_block submodule "$path" \
+        "worktree contains populated submodules, which Git cannot remove: $path"
+      return 1
+      ;;
+    1) ;;
+    *)
+      _gt_cleanup_block uninspectable "$path" \
+        "could not inspect worktree submodules: $path"
+      return 1
+      ;;
+  esac
   if _gt_cleanup_worktree_busy "$path"; then
     _gt_cleanup_block checkout-in-flight "$GT_CLEANUP_LOCK" \
       "a Git command is writing in the worktree (lock $GT_CLEANUP_LOCK)"
@@ -786,12 +920,14 @@ gt_cleanup_retire_branch() {
   if [[ "$GT_CLEANUP_DRY_RUN" == 1 ]]; then
     gt_cleanup_report would-delete-branch "$branch" "$code" "$branch_oid" \
       "would delete $branch at $branch_oid ($reason)"
-    gt_cleanup_run git update-ref -d "refs/heads/$branch" "$branch_oid"
+    gt_cleanup_run git update-ref --no-deref -d "refs/heads/$branch" "$branch_oid"
     return 0
   fi
   # Report a deletion only once it happened, so a failed one is reported
-  # exactly once, as a kept branch.
-  if ! git update-ref -d "refs/heads/$branch" "$branch_oid"; then
+  # exactly once, as a kept branch. --no-deref: should the name have become
+  # a symbolic ref since the inventory, delete only that alias, never the
+  # branch it points at.
+  if ! git update-ref --no-deref -d "refs/heads/$branch" "$branch_oid"; then
     _gt_cleanup_keep "$branch" ref-delete-failed "$branch_oid" \
       "exact ref deletion failed"
     return 1

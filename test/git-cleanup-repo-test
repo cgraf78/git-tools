@@ -557,7 +557,7 @@ readonly_remote_main_oid=$(git -C "$readonly_repo" ls-remote origin \
 _assert_contains "cleanup dry-run reports squash candidate" \
   "would delete readonly-squash at " "$result"
 _assert_contains "ahead dry run pins exact remote OID" \
-  "git merge --quiet --ff-only $readonly_remote_main_oid" "$result"
+  "git merge --quiet --ff-only --no-overwrite-ignore $readonly_remote_main_oid" "$result"
 _assert_eq "cleanup dry-run creates no Git objects" "$objects_before" "$objects_after"
 readonly_main_oid=$(git -C "$readonly_repo" rev-parse refs/heads/main)
 readonly_squash_oid=$(git -C "$readonly_repo" rev-parse refs/heads/readonly-squash)
@@ -728,7 +728,7 @@ remote_dry_result=$(git -C "$remote_collision_repo" cleanup-repo \
 _assert_contains "remote-only dry run uses exact remote base" \
   "would delete remote-merged at " "$remote_dry_result"
 _assert_contains "remote-only dry run pins the exact remote branch OID" \
-  "git merge --quiet --ff-only $remote_main_oid" "$remote_dry_result"
+  "git merge --quiet --ff-only --no-overwrite-ignore $remote_main_oid" "$remote_dry_result"
 _assert_eq "remote-only dry run does not create a local base" "" \
   "$(git -C "$remote_collision_repo" branch --list main)"
 git -C "$remote_collision_repo" cleanup-repo --base main >/dev/null 2>&1
@@ -816,7 +816,7 @@ rewrite_output=$(git -C "$rewrite_repo" cleanup-repo \
   --base main --dry-run 2>&1) || rewrite_rc=$?
 _assert_eq "chained rewrite dry run succeeds through first endpoint" "0" "$rewrite_rc"
 _assert_contains "chained rewrite lookup and fetch pin the first endpoint" \
-  "git merge --quiet --ff-only $rewrite_first_oid" "$rewrite_output"
+  "git merge --quiet --ff-only --no-overwrite-ignore $rewrite_first_oid" "$rewrite_output"
 _assert_not_contains "chained rewrite never reaches the second endpoint" \
   "$rewrite_second_oid" "$rewrite_output"
 
@@ -901,7 +901,7 @@ behind_dry_result=$(git -C "$behind_base_repo" cleanup-repo \
 _assert_contains "behind dry run classifies against pinned remote base" \
   "would delete behind-merged at " "$behind_dry_result"
 _assert_contains "behind dry run prints pinned ff-only merge" \
-  "git merge --quiet --ff-only $behind_remote_oid" "$behind_dry_result"
+  "git merge --quiet --ff-only --no-overwrite-ignore $behind_remote_oid" "$behind_dry_result"
 git -C "$behind_base_repo" cleanup-repo --base main >/dev/null 2>&1
 _assert_eq "behind real run merges the dry-run OID" "$behind_remote_oid" \
   "$(git -C "$behind_base_repo" rev-parse refs/heads/main)"
@@ -928,7 +928,7 @@ isolated_dry_output=$(TMPDIR="$isolated_tmp" \
   git -C "$isolated_dry_repo" cleanup-repo --base main --dry-run 2>&1)
 isolated_objects_after=$(_object_ids "$isolated_dry_repo")
 _assert_contains "isolated dry run pins unseen remote OID" \
-  "git merge --quiet --ff-only $isolated_remote_oid" "$isolated_dry_output"
+  "git merge --quiet --ff-only --no-overwrite-ignore $isolated_remote_oid" "$isolated_dry_output"
 _assert_eq "isolated dry run does not import objects" \
   "$isolated_objects_before" "$isolated_objects_after"
 _assert_eq "isolated dry run removes object-store artifacts" "" \
@@ -964,7 +964,7 @@ shallow_output=$(git -C "$shallow_client" cleanup-repo \
   --base main --dry-run 2>&1) || shallow_rc=$?
 _assert_eq "shallow unseen-base dry run succeeds" "0" "$shallow_rc"
 _assert_contains "shallow dry run pins unseen remote OID" \
-  "git merge --quiet --ff-only $shallow_remote_oid" "$shallow_output"
+  "git merge --quiet --ff-only --no-overwrite-ignore $shallow_remote_oid" "$shallow_output"
 _assert_eq "shallow dry run preserves index" \
   "$shallow_index_before" "$(_file_fingerprint "$shallow_git_dir/index")"
 _assert_eq "shallow dry run preserves refs and worktree metadata" \
@@ -1002,7 +1002,7 @@ legacy_git_output=$(cd "$isolated_dry_repo" &&
 _assert_eq "Git 2.29-compatible dry run avoids rev-parse path-format" \
   "0" "$legacy_git_rc"
 _assert_contains "Git 2.29-compatible dry run still pins unseen remote OID" \
-  "git merge --quiet --ff-only $isolated_remote_oid" "$legacy_git_output"
+  "git merge --quiet --ff-only --no-overwrite-ignore $isolated_remote_oid" "$legacy_git_output"
 
 # Fetch can run configured automatic maintenance even when its object writes are
 # isolated. A dry run must suppress that secondary mutation path so maintenance
@@ -2217,13 +2217,13 @@ ref_race_bin=$(_tmpdir)
 cat >"$ref_race_bin/git" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${1:-}" == update-ref && "${2:-}" == -d &&
-  "${3:-}" == refs/heads/ref-race ]]; then
-  old=$4
+if [[ "${1:-}" == update-ref && "${2:-}" == --no-deref && "${3:-}" == -d &&
+  "${4:-}" == refs/heads/ref-race ]]; then
+  old=$5
   tree=$("$GIT_REF_RACE_REAL" rev-parse "$old^{tree}")
   new=$(printf 'advance raced branch\n' |
     "$GIT_REF_RACE_REAL" commit-tree "$tree" -p "$old")
-  "$GIT_REF_RACE_REAL" update-ref "$3" "$new" "$old"
+  "$GIT_REF_RACE_REAL" update-ref "$4" "$new" "$old"
 fi
 exec "$GIT_REF_RACE_REAL" "$@"
 EOF
@@ -2925,7 +2925,7 @@ git -C "$lw_other_repo" worktree add --quiet "$lw_other_linked" feat
 lw_other_old=$(git -C "$lw_other_repo" rev-parse refs/heads/main)
 result=$(git -C "$lw_other_linked" cleanup-repo --dry-run 2>&1)
 _assert_contains "linked dry run reports the base worktree fast-forward" \
-  "would run: git -C $(printf %q "$lw_other_base") merge --quiet --ff-only $lw_other_remote" \
+  "would run: git -C $(printf %q "$lw_other_base") merge --quiet --ff-only --no-overwrite-ignore $lw_other_remote" \
   "$result"
 _assert_eq "linked dry run leaves the base worktree unchanged" \
   "$lw_other_old" "$(git -C "$lw_other_base" rev-parse HEAD)"
@@ -3085,9 +3085,9 @@ git -C "$lw_primary_repo" worktree add --quiet "$lw_primary_side" side
 _commit_file "$lw_primary_side" side.txt side "add side work"
 result=$(git -C "$lw_primary_repo" cleanup-repo --dry-run 2>&1)
 _assert_contains "main worktree dry run still switches to base" \
-  "git switch --quiet --no-guess main" "$result"
+  "git switch --quiet --no-guess --no-overwrite-ignore main" "$result"
 _assert_contains "main worktree dry run still merges the pinned OID" \
-  "git merge --quiet --ff-only $lw_primary_remote" "$result"
+  "git merge --quiet --ff-only --no-overwrite-ignore $lw_primary_remote" "$result"
 result=$(git -C "$lw_primary_repo" cleanup-repo 2>&1)
 _assert_eq "main worktree switches to base" \
   refs/heads/main "$(_head_ref "$lw_primary_repo")"
@@ -4374,6 +4374,13 @@ gh_bin=$(_tmpdir)
 cat >"$gh_bin/gh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$FAKE_GH_DIR/calls"
+# `auth token` answers locally whether gh has a credential for a host; only
+# ghe.test (besides github.com, which cleanup never asks about) has one.
+if [[ "${1:-} ${2:-}" == "auth token" ]]; then
+  [[ " $* " == *" --hostname ghe.test "* ]] || exit 1
+  printf 'token\n'
+  exit 0
+fi
 [[ -z "${FAKE_GH_FAIL:-}" ]] || exit 1
 endpoint="" head=""
 for arg; do
@@ -4548,7 +4555,9 @@ if command -v jq >/dev/null 2>&1; then
   result=$(cd "$closed_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
     git cleanup-repo --porcelain --worktree "$closed_dir" 2>&1)
   _assert_contains "a closed PR alone does not retire a selected worktree" \
-    $'keep-worktree\t'"$closed_dir"$'\tmerge-unproven\tabandoned' "$result"
+    $'keep-worktree\t'"$closed_dir"$'\tclosed-pr\tabandoned' "$result"
+  _assert_contains "a closed PR's kept branch names the pull request" \
+    $'keep-branch\tabandoned\tclosed-pr\t11' "$result"
   result=$(cd "$closed_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
     git cleanup-repo --porcelain --worktree "$closed_dir" --include-closed 2>&1)
   _assert_contains "include-closed retires a closed PR's selected worktree" \
@@ -4848,6 +4857,8 @@ if command -v jq >/dev/null 2>&1; then
     git cleanup-repo --porcelain --retire-worktree "$unknown_dir" 2>&1)
   _assert_contains "a failed pull request lookup keeps a requested worktree" \
     $'keep-worktree\t'"$unknown_dir"$'\tpr-unknown\tunknown-pr' "$result"
+  _assert_contains "a failed pull request lookup is reported on the branch" \
+    $'keep-branch\tunknown-pr\tpr-unknown\t' "$result"
   result=$(cd "$unknown_repo" && PATH="$gh_bin:$PATH" FAKE_GH_DIR=$gh_dir \
     git cleanup-repo --porcelain --retire-worktree "$unknown_dir" 2>&1)
   _assert_contains "a complete lookup lets the request retire it" \
@@ -4973,6 +4984,715 @@ if command -v jq >/dev/null 2>&1; then
     "$lineage_expected" "$lineage_out"
 else
   printf 'skip - pull request evidence cases need jq\n'
+fi
+
+# A symbolic ref under refs/heads is an alias, not a branch: deleting it by
+# name would delete its target. Neither the alias nor its target goes, even
+# with --all and even when the target is checked out elsewhere.
+sy_repo=$(_clone_remote)
+git -C "$sy_repo" switch --quiet -c feat
+_commit_file "$sy_repo" feat.txt feat "unpushed feat"
+git -C "$sy_repo" switch --quiet main
+sy_wt=$(_tmpdir)
+rm -rf "$sy_wt"
+git -C "$sy_repo" worktree add --quiet "$sy_wt" feat
+git -C "$sy_repo" symbolic-ref refs/heads/alias refs/heads/feat
+sy_feat=$(git -C "$sy_repo" rev-parse refs/heads/feat)
+sy_out=$(git -C "$sy_repo" cleanup-repo --no-update-base --all --porcelain 2>/dev/null)
+_assert_not_contains "a symbolic branch alias is never deleted" \
+  $'delete-branch\talias' "$sy_out"
+_assert_eq "a symbolic alias's target survives --all" \
+  "$sy_feat" "$(git -C "$sy_repo" rev-parse -q --verify refs/heads/feat)"
+_assert_eq "the alias itself survives" refs/heads/feat \
+  "$(git -C "$sy_repo" symbolic-ref refs/heads/alias)"
+
+# The base itself behind an alias (master -> main) stays too.
+sy_base_repo=$(_clone_remote)
+git -C "$sy_base_repo" symbolic-ref refs/heads/master refs/heads/main
+_commit_file "$sy_base_repo" unpushed.txt unpushed "unpushed on main"
+sy_main=$(git -C "$sy_base_repo" rev-parse refs/heads/main)
+git -C "$sy_base_repo" cleanup-repo --all >/dev/null 2>&1
+_assert_eq "an alias of the base never deletes the base" \
+  "$sy_main" "$(git -C "$sy_base_repo" rev-parse -q --verify refs/heads/main)"
+
+# A committed CACHEDIR.TAG marks a source directory, not a cache, so a
+# worktree's untracked work there is never pruned.
+ct_repo=$(_clone_remote)
+mkdir -p "$ct_repo/src"
+printf 'int main;\n' >"$ct_repo/src/main.c"
+printf 'Signature: 8a477f597d28d172789f06886806bc55\n' >"$ct_repo/src/CACHEDIR.TAG"
+git -C "$ct_repo" add src
+git -C "$ct_repo" commit --quiet -m "add src with a committed tag"
+git -C "$ct_repo" push --quiet origin main
+ct_wt=$(_tmpdir)
+rm -rf "$ct_wt"
+git -C "$ct_repo" worktree add --quiet "$ct_wt" -b ct-feat
+printf 'work\n' >"$ct_wt/src/new_feature.c"
+ct_out=$(git -C "$ct_repo" cleanup-repo --no-update-base --worktree "$ct_wt" --porcelain 2>/dev/null)
+_assert_contains "a tracked directory with a tag keeps the worktree" \
+  $'keep-worktree\t'"$ct_wt"$'\thidden' "$ct_out"
+_assert_eq "untracked work beside a committed tag survives" work \
+  "$(cat "$ct_wt/src/new_feature.c" 2>/dev/null)"
+
+# Updating the base never overwrites an ignored file with a newly tracked one.
+ig_repo=$(_clone_remote)
+mkdir -p "$ig_repo/.git/info"
+printf '.env\n' >>"$ig_repo/.git/info/exclude"
+printf 'SECRET=local\n' >"$ig_repo/.env"
+ig_other=$(_tmpdir)
+git clone --quiet "$(git -C "$ig_repo" remote get-url origin)" "$ig_other" 2>/dev/null
+git -C "$ig_other" config user.email test@test.com
+git -C "$ig_other" config user.name Test
+_commit_file "$ig_other" .env "REMOTE=1" "track .env"
+git -C "$ig_other" push --quiet origin main
+git -C "$ig_repo" switch --quiet -c ig-feat
+ig_rc=0
+ig_out=$(git -C "$ig_repo" cleanup-repo 2>&1) || ig_rc=$?
+_assert_eq "a base update that would overwrite an ignored file stops" 2 "$ig_rc"
+_assert_contains "the stop names the base and the cause" \
+  "could not fast-forward main; Git refused" "$ig_out"
+_assert_eq "the ignored file is untouched" "SECRET=local" "$(cat "$ig_repo/.env")"
+_assert_eq "the checkout is back on its branch" refs/heads/ig-feat \
+  "$(git -C "$ig_repo" symbolic-ref HEAD)"
+# The same refusal when the switch itself would overwrite: a local base that
+# already tracks the file.
+ig2_repo=$(_clone_remote)
+ig2_other=$(_tmpdir)
+git clone --quiet "$(git -C "$ig2_repo" remote get-url origin)" "$ig2_other" 2>/dev/null
+git -C "$ig2_other" config user.email test@test.com
+git -C "$ig2_other" config user.name Test
+_commit_file "$ig2_other" .env "REMOTE=1" "track .env"
+git -C "$ig2_other" push --quiet origin main
+git -C "$ig2_repo" pull --quiet --ff-only origin main
+git -C "$ig2_repo" switch --quiet -c ig2-feat HEAD~1
+mkdir -p "$ig2_repo/.git/info"
+printf '.env\n' >>"$ig2_repo/.git/info/exclude"
+printf 'SECRET=local\n' >"$ig2_repo/.env"
+ig_rc=0
+ig_out=$(git -C "$ig2_repo" cleanup-repo 2>&1) || ig_rc=$?
+_assert_eq "a switch that would overwrite an ignored file stops" 2 "$ig_rc"
+_assert_contains "the switch refusal names the base" \
+  "could not switch to main; Git refused" "$ig_out"
+_assert_eq "the ignored file survives a refused switch" "SECRET=local" "$(cat "$ig2_repo/.env")"
+_assert_eq "a refused switch leaves the checkout on its branch" refs/heads/ig2-feat \
+  "$(git -C "$ig2_repo" symbolic-ref HEAD)"
+
+# --gone never selects a branch whose upstream was a remote default: the
+# default was renamed, and the local branch may hold unpushed work.
+gd_repo=$(_clone_remote)
+git -C "$gd_repo" push --quiet origin main:master
+git -C "$gd_repo" switch --quiet -c master --track origin/master 2>/dev/null ||
+  git -C "$gd_repo" switch --quiet -c master origin/master
+git -C "$gd_repo" branch --quiet --set-upstream-to=origin/master master
+_commit_file "$gd_repo" unpushed.txt unpushed "unpushed on master"
+git -C "$gd_repo" switch --quiet main
+git -C "$gd_repo" push --quiet origin --delete master
+git -C "$gd_repo" fetch --quiet --prune origin
+gd_out=$(git -C "$gd_repo" cleanup-repo --no-update-base --gone --porcelain 2>/dev/null)
+_assert_not_contains "--gone keeps a branch whose remote default upstream is gone" \
+  $'delete-branch\tmaster' "$gd_out"
+_assert_contains "the old default with unpushed work survives --gone" master \
+  "$(_branches "$gd_repo")"
+
+# --remote names the remote to prove against; an empty one is rejected.
+rm_repo=$(_porcelain_repo)
+git -C "$rm_repo" remote rename origin upstream
+rm_rc=0
+rm_out=$(git -C "$rm_repo" cleanup-repo --no-update-base --remote upstream --base main \
+  --porcelain 2>&1) || rm_rc=$?
+_assert_eq "--remote proves against the named remote" 0 "$rm_rc"
+_assert_contains "--remote deletes a branch merged on that remote" \
+  $'delete-branch\tmerged\tmerged' "$rm_out"
+rm_rc=0
+rm_out=$(git -C "$rm_repo" cleanup-repo --no-update-base -r "" 2>&1) || rm_rc=$?
+_assert_eq "an empty separate --remote is rejected" 2 "$rm_rc"
+_assert_contains "an empty separate --remote names the option" "-r requires a value" "$rm_out"
+
+# --interface-version answers outside a repository and before anything else.
+iv_rc=0
+iv_out=$(cd "$(_tmpdir)" && git-cleanup-repo --interface-version 2>&1) || iv_rc=$?
+_assert_eq "--interface-version exits 0 outside a repository" 0 "$iv_rc"
+case "$iv_out" in
+  '' | *[!0-9]*) _assert_eq "--interface-version prints an integer" integer "$iv_out" ;;
+  *) _assert_eq "--interface-version prints an integer" integer integer ;;
+esac
+
+# Git refuses to remove a worktree with a populated submodule, so the gate
+# keeps it up front: a dry run must not promise what every real run fails.
+sm_sub=$(_clone_remote)
+sm_repo=$(_clone_remote)
+git -C "$sm_repo" -c protocol.file.allow=always submodule --quiet add \
+  "$(git -C "$sm_sub" remote get-url origin)" sub >/dev/null 2>&1
+git -C "$sm_repo" commit --quiet -m "add submodule"
+git -C "$sm_repo" push --quiet origin main
+sm_wt=$(_tmpdir)
+rm -rf "$sm_wt"
+git -C "$sm_repo" worktree add --quiet "$sm_wt" -b sm-feat
+git -C "$sm_wt" -c protocol.file.allow=always submodule --quiet update --init >/dev/null 2>&1
+for sm_mode in --dry-run ""; do
+  sm_out=$(git -C "$sm_repo" cleanup-repo --no-update-base --worktree "$sm_wt" \
+    --porcelain ${sm_mode:+"$sm_mode"} 2>/dev/null)
+  _assert_contains "a worktree with a populated submodule is kept (${sm_mode:-real})" \
+    $'keep-worktree\t'"$sm_wt"$'\tsubmodule' "$sm_out"
+done
+_assert_eq "the submodule worktree survives" true \
+  "$([[ -e "$sm_wt/sub/.git" ]] && echo true || echo false)"
+
+# An explicit --remove-worktrees alongside --worktree removes every eligible
+# worktree, not only the listed one.
+rw_repo=$(_clone_remote)
+for rw_branch in rw-one rw-two; do
+  git -C "$rw_repo" switch --quiet -c "$rw_branch"
+  _commit_file "$rw_repo" "$rw_branch.txt" "$rw_branch" "add $rw_branch"
+  git -C "$rw_repo" switch --quiet main
+  git -C "$rw_repo" merge --quiet --no-ff "$rw_branch" -m "merge $rw_branch"
+done
+git -C "$rw_repo" push --quiet origin main
+rw_one=$(_tmpdir)
+rw_two=$(_tmpdir)
+rm -rf "$rw_one" "$rw_two"
+git -C "$rw_repo" worktree add --quiet "$rw_one" rw-one
+git -C "$rw_repo" worktree add --quiet "$rw_two" rw-two
+rw_out=$(git -C "$rw_repo" cleanup-repo --no-update-base --remove-worktrees \
+  --worktree "$rw_one" --porcelain 2>/dev/null)
+_assert_contains "an explicit --remove-worktrees still removes unlisted worktrees" \
+  $'remove-worktree\t'"$rw_two" "$rw_out"
+
+# A branch a symbolic ref points at is kept, and says so.
+st_repo=$(_clone_remote)
+git -C "$st_repo" switch --quiet -c st-landed
+_commit_file "$st_repo" landed.txt landed "add st-landed"
+git -C "$st_repo" switch --quiet main
+git -C "$st_repo" merge --quiet --no-ff st-landed -m "merge st-landed"
+git -C "$st_repo" push --quiet origin main
+git -C "$st_repo" symbolic-ref refs/heads/alias refs/heads/st-landed
+st_out=$(git -C "$st_repo" cleanup-repo --no-update-base --porcelain 2>/dev/null)
+_assert_contains "a merged branch behind an alias is kept as symref" \
+  $'keep-branch\tst-landed\tsymref\talias' "$st_out"
+_assert_contains "the aliased branch survives" st-landed "$(_branches "$st_repo")"
+
+# A base checked out in another worktree is left not updated, not overwritten,
+# when its fast-forward would overwrite an ignored file.
+igw_repo=$(_clone_remote)
+git -C "$igw_repo" switch --quiet -c igw-feat
+igw_wt=$(_tmpdir)
+rm -rf "$igw_wt"
+git -C "$igw_repo" worktree add --quiet "$igw_wt" main
+mkdir -p "$igw_repo/.git/info"
+printf '.env\n' >>"$igw_repo/.git/info/exclude"
+printf 'SECRET=local\n' >"$igw_wt/.env"
+igw_other=$(_tmpdir)
+git clone --quiet "$(git -C "$igw_repo" remote get-url origin)" "$igw_other" 2>/dev/null
+git -C "$igw_other" config user.email test@test.com
+git -C "$igw_other" config user.name Test
+_commit_file "$igw_other" .env "REMOTE=1" "track .env"
+git -C "$igw_other" push --quiet origin main
+igw_rc=0
+igw_out=$(git -C "$igw_repo" cleanup-repo 2>&1) || igw_rc=$?
+_assert_eq "a refused base fast-forward in another worktree still exits 0" 0 "$igw_rc"
+_assert_contains "the summary says the base was not updated" "main not updated" "$igw_out"
+_assert_eq "the other worktree's ignored file survives" "SECRET=local" "$(cat "$igw_wt/.env")"
+
+# A dry run predicts Git refusing the base update for an ignored file, so it
+# stops for the same reason as the real run.
+igd_repo=$(_clone_remote)
+mkdir -p "$igd_repo/.git/info"
+printf '.env\n' >>"$igd_repo/.git/info/exclude"
+printf 'SECRET=local\n' >"$igd_repo/.env"
+igd_other=$(_tmpdir)
+git clone --quiet "$(git -C "$igd_repo" remote get-url origin)" "$igd_other" 2>/dev/null
+git -C "$igd_other" config user.email test@test.com
+git -C "$igd_other" config user.name Test
+_commit_file "$igd_other" .env "REMOTE=1" "track .env"
+git -C "$igd_other" push --quiet origin main
+git -C "$igd_repo" switch --quiet -c igd-feat
+igd_rc=0
+git -C "$igd_repo" cleanup-repo --dry-run >/dev/null 2>&1 || igd_rc=$?
+_assert_eq "a dry run predicts an ignored-file refusal" 2 "$igd_rc"
+igd_rc=0
+git -C "$igd_repo" cleanup-repo >/dev/null 2>&1 || igd_rc=$?
+_assert_eq "the real run refuses it" 2 "$igd_rc"
+_assert_eq "the dry and real runs leave the ignored file alone" "SECRET=local" \
+  "$(cat "$igd_repo/.env")"
+
+# An unborn current branch has nothing to switch back to: refuse up front.
+ub_repo=$(_clone_remote)
+git -C "$ub_repo" switch --quiet --orphan newwork
+ub_rc=0
+ub_out=$(git -C "$ub_repo" cleanup-repo 2>&1) || ub_rc=$?
+_assert_eq "an unborn current branch stops the base update" 2 "$ub_rc"
+_assert_contains "the stop names the unborn branch" \
+  "current branch newwork has no commits yet" "$ub_out"
+_assert_eq "the checkout stays on the unborn branch" refs/heads/newwork \
+  "$(git -C "$ub_repo" symbolic-ref HEAD)"
+
+# A gone default-branch upstream is no evidence for retiring a selected
+# worktree either, and the message says why --gone skips it.
+rdw_repo=$(_clone_remote)
+git -C "$rdw_repo" push --quiet origin main:master
+git -C "$rdw_repo" fetch --quiet origin
+git -C "$rdw_repo" branch --quiet master origin/master
+git -C "$rdw_repo" branch --quiet --set-upstream-to=origin/master master
+rdw_wt=$(_tmpdir)
+rm -rf "$rdw_wt"
+git -C "$rdw_repo" worktree add --quiet "$rdw_wt" master
+_commit_file "$rdw_wt" unpushed.txt unpushed "unpushed on master"
+git -C "$rdw_repo" push --quiet origin --delete master
+git -C "$rdw_repo" fetch --quiet --prune origin
+rdw_out=$(git -C "$rdw_repo" cleanup-repo --no-update-base --worktree "$rdw_wt" \
+  --porcelain 2>/dev/null)
+_assert_not_contains "a gone default upstream never retires its worktree" \
+  $'remove-worktree\t'"$rdw_wt" "$rdw_out"
+rdw_out=$(git -C "$rdw_repo" cleanup-repo --no-update-base --gone 2>&1)
+_assert_contains "the keep message says --gone never selects a renamed default" \
+  "so --gone never selects it" "$rdw_out"
+rdw_out=$(git -C "$rdw_repo" cleanup-repo --no-update-base --porcelain 2>/dev/null)
+_assert_contains "a renamed default's gone upstream has its own detail" \
+  $'keep-branch\tmaster\tmerge-unproven\tdefault-upstream-gone' "$rdw_out"
+
+# --gone also protects whatever the remote's recorded HEAD named, such as a
+# renamed `develop`.
+dv_repo=$(_clone_remote)
+git -C "$dv_repo" push --quiet origin main:develop
+git -C "$dv_repo" fetch --quiet origin
+git -C "$dv_repo" branch --quiet develop origin/develop
+git -C "$dv_repo" branch --quiet --set-upstream-to=origin/develop develop
+git -C "$dv_repo" switch --quiet develop
+_commit_file "$dv_repo" unpushed.txt unpushed "unpushed on develop"
+git -C "$dv_repo" switch --quiet main
+git -C "$dv_repo" config remote.origin.followRemoteHEAD never
+git -C "$dv_repo" push --quiet origin --delete develop
+git -C "$dv_repo" fetch --quiet --prune origin
+git -C "$dv_repo" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/develop
+dv_out=$(git -C "$dv_repo" cleanup-repo --no-update-base --base main --gone \
+  --porcelain 2>/dev/null)
+_assert_not_contains "--gone keeps the branch the remote's HEAD named" \
+  $'delete-branch\tdevelop' "$dv_out"
+
+# A branch tracking the base itself gets a message that says so.
+tb_repo=$(_clone_remote)
+git -C "$tb_repo" switch --quiet -c tb-feat --track origin/main
+_commit_file "$tb_repo" tb.txt tb "tb work"
+git -C "$tb_repo" switch --quiet main
+tb_out=$(git -C "$tb_repo" cleanup-repo --no-update-base 2>&1)
+_assert_contains "a branch tracking the base says so" \
+  "keeping tb-feat; merge not proven; it tracks the base origin/main" "$tb_out"
+
+# Git refuses to remove a worktree with a populated submodule even without
+# a modules directory (a submodule cloned by hand at its gitlink path).
+gl_sub=$(_clone_remote)
+gl_repo=$(_clone_remote)
+git -C "$gl_repo" -c protocol.file.allow=always submodule --quiet add \
+  "$(git -C "$gl_sub" remote get-url origin)" sub >/dev/null 2>&1
+git -C "$gl_repo" commit --quiet -m "add submodule"
+git -C "$gl_repo" push --quiet origin main
+gl_wt=$(_tmpdir)
+rm -rf "$gl_wt"
+git -C "$gl_repo" worktree add --quiet "$gl_wt" -b gl-feat
+rmdir "$gl_wt/sub" 2>/dev/null || true
+git clone --quiet "$(git -C "$gl_sub" remote get-url origin)" "$gl_wt/sub" 2>/dev/null
+_assert_eq "the gitlink fixture has no modules directory" false \
+  "$([[ -d "$(git -C "$gl_wt" rev-parse --absolute-git-dir)/modules" ]] && echo true || echo false)"
+gl_out=$(git -C "$gl_repo" cleanup-repo --no-update-base --worktree "$gl_wt" \
+  --porcelain 2>/dev/null)
+_assert_contains "a populated gitlink alone keeps the worktree" \
+  $'keep-worktree\t'"$gl_wt"$'\tsubmodule' "$gl_out"
+
+# A selected worktree on a branch an alias points at carries symref, and the
+# human summary counts that kept branch.
+sw_repo=$(_clone_remote)
+git -C "$sw_repo" switch --quiet -c sw-feat
+_commit_file "$sw_repo" sw.txt sw "add sw-feat"
+git -C "$sw_repo" switch --quiet main
+git -C "$sw_repo" merge --quiet --no-ff sw-feat -m "merge sw-feat"
+git -C "$sw_repo" push --quiet origin main
+git -C "$sw_repo" symbolic-ref refs/heads/alias1 refs/heads/sw-feat
+git -C "$sw_repo" symbolic-ref refs/heads/alias2 refs/heads/sw-feat
+sw_wt=$(_tmpdir)
+rm -rf "$sw_wt"
+git -C "$sw_repo" worktree add --quiet "$sw_wt" sw-feat
+sw_out=$(git -C "$sw_repo" cleanup-repo --no-update-base --worktree "$sw_wt" \
+  --porcelain 2>/dev/null)
+_assert_contains "two aliases are listed space-separated" \
+  $'keep-branch\tsw-feat\tsymref\talias1 alias2' "$sw_out"
+_assert_contains "the aliased branch's worktree carries symref" \
+  $'keep-worktree\t'"$sw_wt"$'\tsymref\tsw-feat' "$sw_out"
+sw_out=$(git -C "$sw_repo" cleanup-repo --no-update-base 2>&1)
+_assert_contains "the summary counts the aliased branch as kept" "skipped 1" "$sw_out"
+
+# The base behind an alias gets no record of its own.
+sb_out=$(git -C "$sy_base_repo" cleanup-repo --no-update-base --porcelain 2>/dev/null)
+_assert_not_contains "the base behind an alias is not reported" \
+  $'keep-branch\tmain' "$sb_out"
+
+# A worktree whose submodule was deinitialized keeps only modules/, which
+# Git still refuses to remove.
+md_sub=$(_clone_remote)
+md_repo=$(_clone_remote)
+git -C "$md_repo" -c protocol.file.allow=always submodule --quiet add \
+  "$(git -C "$md_sub" remote get-url origin)" sub >/dev/null 2>&1
+git -C "$md_repo" commit --quiet -m "add submodule"
+git -C "$md_repo" push --quiet origin main
+md_wt=$(_tmpdir)
+rm -rf "$md_wt"
+git -C "$md_repo" worktree add --quiet "$md_wt" -b md-feat
+git -C "$md_wt" -c protocol.file.allow=always submodule --quiet update --init >/dev/null 2>&1
+git -C "$md_wt" submodule --quiet deinit -f sub >/dev/null 2>&1
+_assert_eq "the deinit fixture has no populated submodule" false \
+  "$([[ -e "$md_wt/sub/.git" ]] && echo true || echo false)"
+md_out=$(git -C "$md_repo" cleanup-repo --no-update-base --worktree "$md_wt" \
+  --porcelain 2>/dev/null)
+_assert_contains "a modules directory alone keeps the worktree" \
+  $'keep-worktree\t'"$md_wt"$'\tsubmodule' "$md_out"
+
+# Creating a missing local base never overwrites an ignored file either.
+nc_repo=$(_clone_remote)
+nc_other=$(_tmpdir)
+git clone --quiet "$(git -C "$nc_repo" remote get-url origin)" "$nc_other" 2>/dev/null
+git -C "$nc_other" config user.email test@test.com
+git -C "$nc_other" config user.name Test
+_commit_file "$nc_other" .env "REMOTE=1" "track .env"
+git -C "$nc_other" push --quiet origin main
+git -C "$nc_repo" switch --quiet -c nc-feat
+git -C "$nc_repo" branch --quiet -D main
+mkdir -p "$nc_repo/.git/info"
+printf '.env\n' >>"$nc_repo/.git/info/exclude"
+printf 'SECRET=local\n' >"$nc_repo/.env"
+nc_rc=0
+git -C "$nc_repo" cleanup-repo >/dev/null 2>&1 || nc_rc=$?
+_assert_eq "creating the base over an ignored file stops" 2 "$nc_rc"
+_assert_eq "no base branch is left behind" "" \
+  "$(git -C "$nc_repo" branch --list main)"
+_assert_eq "the ignored file survives a refused base creation" "SECRET=local" \
+  "$(cat "$nc_repo/.env")"
+
+# A refused fast-forward from a detached HEAD returns to that commit.
+dh_repo=$(_clone_remote)
+dh_other=$(_tmpdir)
+git clone --quiet "$(git -C "$dh_repo" remote get-url origin)" "$dh_other" 2>/dev/null
+git -C "$dh_other" config user.email test@test.com
+git -C "$dh_other" config user.name Test
+_commit_file "$dh_other" .env "REMOTE=1" "track .env"
+git -C "$dh_other" push --quiet origin main
+dh_head=$(git -C "$dh_repo" rev-parse HEAD)
+git -C "$dh_repo" switch --quiet --detach
+mkdir -p "$dh_repo/.git/info"
+printf '.env\n' >>"$dh_repo/.git/info/exclude"
+printf 'SECRET=local\n' >"$dh_repo/.env"
+dh_rc=0
+git -C "$dh_repo" cleanup-repo >/dev/null 2>&1 || dh_rc=$?
+_assert_eq "a refused fast-forward from a detached HEAD stops" 2 "$dh_rc"
+_assert_eq "the checkout is back on the detached commit" "$dh_head" \
+  "$(git -C "$dh_repo" rev-parse HEAD)"
+_assert_eq "it is still detached" "" "$(git -C "$dh_repo" symbolic-ref -q HEAD || true)"
+
+# The dry-run update predictor refuses only for an untracked or ignored file
+# in the way, and agrees with the real run otherwise.
+dp_new() {
+  local repo other
+  repo=$(_clone_remote)
+  other=$(_tmpdir)
+  git clone --quiet "$(git -C "$repo" remote get-url origin)" "$other" 2>/dev/null
+  git -C "$other" config user.email test@test.com
+  git -C "$other" config user.name Test
+  printf '%s\t%s\n' "$repo" "$other"
+}
+# A harmless remote commit with the base checked out in another worktree: the
+# dry run still predicts the fast-forward.
+IFS=$'\t' read -r dp_repo dp_other < <(dp_new)
+git -C "$dp_repo" switch --quiet -c dp-feat
+dp_wt=$(_tmpdir)
+rm -rf "$dp_wt"
+git -C "$dp_repo" worktree add --quiet "$dp_wt" main
+_commit_file "$dp_other" harmless.txt h "harmless remote commit"
+git -C "$dp_other" push --quiet origin main
+dp_out=$(git -C "$dp_repo" cleanup-repo --dry-run 2>&1)
+_assert_not_contains "a dry run predicts the other worktree's fast-forward" \
+  "main not updated" "$dp_out"
+# An ignored file where the base adds a directory below it blocks.
+IFS=$'\t' read -r dp_repo dp_other < <(dp_new)
+_commit_file "$dp_other" foo/bar.txt b "add foo/bar"
+git -C "$dp_other" push --quiet origin main
+mkdir -p "$dp_repo/.git/info"
+printf 'foo\n' >>"$dp_repo/.git/info/exclude"
+printf 'local\n' >"$dp_repo/foo"
+git -C "$dp_repo" switch --quiet -c dp-feat
+dp_rc=0
+git -C "$dp_repo" cleanup-repo --dry-run >/dev/null 2>&1 || dp_rc=$?
+_assert_eq "an ignored file above an added path makes the dry run refuse" 2 "$dp_rc"
+# A tracked file that becomes a directory is Git's to replace.
+IFS=$'\t' read -r dp_repo dp_other < <(dp_new)
+_commit_file "$dp_repo" config c "add config file"
+git -C "$dp_repo" push --quiet origin main
+git -C "$dp_other" pull --quiet --ff-only origin main
+git -C "$dp_other" rm --quiet config
+_commit_file "$dp_other" config/a a "config becomes a directory"
+git -C "$dp_other" push --quiet origin main
+git -C "$dp_repo" switch --quiet -c dp-feat
+dp_rc=0
+git -C "$dp_repo" cleanup-repo --dry-run >/dev/null 2>&1 || dp_rc=$?
+_assert_eq "a type change does not make the dry run refuse" 0 "$dp_rc"
+dp_rc=0
+git -C "$dp_repo" cleanup-repo >/dev/null 2>&1 || dp_rc=$?
+_assert_eq "the real run agrees on the type change" 0 "$dp_rc"
+# An unborn base branch: the dry run agrees with the real run creating it.
+ub2_remote=$(_tmpdir)
+git init --quiet --bare --initial-branch=main "$ub2_remote"
+ub2_seed=$(_tmpdir)
+_git_init "$ub2_seed"
+_commit_file "$ub2_seed" README.md base base
+git -C "$ub2_seed" push --quiet "$ub2_remote" main 2>/dev/null
+ub2_repo=$(_tmpdir)
+_git_init "$ub2_repo"
+git -C "$ub2_repo" remote add origin "$ub2_remote"
+ub2_rc=0
+git -C "$ub2_repo" cleanup-repo --base main --dry-run >/dev/null 2>&1 || ub2_rc=$?
+_assert_eq "a dry run on an unborn base branch does not refuse" 0 "$ub2_rc"
+
+# dry_vs_real <label> <expected-status> <repo> [args...]: the dry run and the
+# real run end with the same status.
+dry_vs_real() {
+  local label="$1" want="$2" repo="$3" rc
+  shift 3
+  rc=0
+  git -C "$repo" cleanup-repo --dry-run "$@" >/dev/null 2>&1 || rc=$?
+  _assert_eq "$label (dry run)" "$want" "$rc"
+  rc=0
+  git -C "$repo" cleanup-repo "$@" >/dev/null 2>&1 || rc=$?
+  _assert_eq "$label (real run)" "$want" "$rc"
+}
+# An ignored file at a path the remote adds, in the other worktree that has
+# the base checked out: both runs leave the base not updated.
+IFS=$'\t' read -r dp_repo dp_other < <(dp_new)
+git -C "$dp_repo" switch --quiet -c dp-feat
+dp_wt=$(_tmpdir)
+rm -rf "$dp_wt"
+git -C "$dp_repo" worktree add --quiet "$dp_wt" main
+mkdir -p "$dp_repo/.git/info"
+printf '.env\n' >>"$dp_repo/.git/info/exclude"
+printf 'local\n' >"$dp_wt/.env"
+_commit_file "$dp_other" .env remote "track .env"
+git -C "$dp_other" push --quiet origin main
+dp_out=$(git -C "$dp_repo" cleanup-repo --dry-run 2>&1)
+_assert_contains "a dry run predicts the other worktree's refused fast-forward" \
+  "main not updated" "$dp_out"
+dp_out=$(git -C "$dp_repo" cleanup-repo 2>&1)
+_assert_contains "the real run leaves it not updated too" "main not updated" "$dp_out"
+# An ignored file inside a directory the base adds files to does not block.
+IFS=$'\t' read -r dp_repo dp_other < <(dp_new)
+mkdir -p "$dp_repo/.git/info" "$dp_repo/build"
+printf 'build/*.o\n' >>"$dp_repo/.git/info/exclude"
+printf 'obj\n' >"$dp_repo/build/x.o"
+_commit_file "$dp_other" build/README r "add build/README"
+git -C "$dp_other" push --quiet origin main
+git -C "$dp_repo" switch --quiet -c dp-feat
+dry_vs_real "an ignored file inside an added directory does not block" 0 "$dp_repo"
+# An unborn current branch that is the base, with an ignored file at a path
+# the remote adds: both runs refuse to create the base over it.
+ub3_remote=$(_tmpdir)
+git init --quiet --bare --initial-branch=main "$ub3_remote"
+ub3_seed=$(_tmpdir)
+_git_init "$ub3_seed"
+_commit_file "$ub3_seed" .env remote "track .env"
+git -C "$ub3_seed" push --quiet "$ub3_remote" main 2>/dev/null
+ub3_repo=$(_tmpdir)
+_git_init "$ub3_repo"
+git -C "$ub3_repo" remote add origin "$ub3_remote"
+printf '.env\n' >>"$ub3_repo/.git/info/exclude"
+printf 'local\n' >"$ub3_repo/.env"
+dry_vs_real "an unborn base over an ignored file refuses" 2 "$ub3_repo" --base main
+# The switch to an existing local base that tracks an ignored file: both runs
+# refuse.
+IFS=$'\t' read -r dp_repo dp_other < <(dp_new)
+_commit_file "$dp_other" .env remote "track .env"
+git -C "$dp_other" push --quiet origin main
+git -C "$dp_repo" pull --quiet --ff-only origin main
+git -C "$dp_repo" switch --quiet -c dp-feat HEAD~1
+mkdir -p "$dp_repo/.git/info"
+printf '.env\n' >>"$dp_repo/.git/info/exclude"
+printf 'local\n' >"$dp_repo/.env"
+dry_vs_real "switching to a local base that tracks an ignored file refuses" 2 "$dp_repo"
+# A local base ahead of the remote that stopped tracking .env: the
+# fast-forward is a no-op, so neither run refuses.
+IFS=$'\t' read -r dp_repo dp_other < <(dp_new)
+_commit_file "$dp_repo" .env tracked "track .env"
+git -C "$dp_repo" push --quiet origin main
+git -C "$dp_repo" rm --quiet --cached .env
+printf '.env\n' >"$dp_repo/.gitignore"
+git -C "$dp_repo" add .gitignore
+git -C "$dp_repo" commit --quiet -m "untrack .env"
+git -C "$dp_repo" switch --quiet -c dp-feat
+dry_vs_real "a local base ahead of the remote does not refuse" 0 "$dp_repo"
+# A newline in an added path is read whole.
+IFS=$'\t' read -r dp_repo dp_other < <(dp_new)
+dp_nl=$'odd\nname'
+printf 'remote\n' >"$dp_other/$dp_nl"
+git -C "$dp_other" add -- "$dp_nl"
+git -C "$dp_other" commit --quiet -m "add a newline path"
+git -C "$dp_other" push --quiet origin main
+printf 'local\n' >"$dp_repo/$dp_nl"
+git -C "$dp_repo" switch --quiet -c dp-feat
+dry_vs_real "an untracked file at an added newline path refuses" 2 "$dp_repo"
+# A gitlink added over an untracked directory: Git leaves the directory, so
+# neither run refuses.
+IFS=$'\t' read -r dp_repo dp_other < <(dp_new)
+dp_link=$(git -C "$dp_other" rev-parse HEAD)
+git -C "$dp_other" update-index --add --cacheinfo "160000,$dp_link,vendor/x"
+git -C "$dp_other" commit --quiet -m "add a gitlink"
+git -C "$dp_other" push --quiet origin main
+mkdir -p "$dp_repo/vendor/x" "$dp_repo/.git/info"
+printf 'vendor/\n' >>"$dp_repo/.git/info/exclude"
+printf 'local\n' >"$dp_repo/vendor/x/file"
+dry_vs_real "a gitlink over an ignored directory does not refuse" 0 "$dp_repo"
+
+# A sparse checkout makes Git overwrite an ignored file inside the patterns
+# instead of refusing, so cleanup checks first and both runs refuse.
+IFS=$'\t' read -r dp_repo dp_other < <(dp_new)
+_commit_file "$dp_repo" sub2/keep.txt k "add sub2"
+git -C "$dp_repo" push --quiet origin main
+git -C "$dp_other" pull --quiet --ff-only origin main
+_commit_file "$dp_other" .env remote "track .env"
+git -C "$dp_other" push --quiet origin main
+git -C "$dp_repo" sparse-checkout set --cone sub2 >/dev/null 2>&1
+mkdir -p "$dp_repo/.git/info"
+printf '.env\n' >>"$dp_repo/.git/info/exclude"
+printf 'local\n' >"$dp_repo/.env"
+git -C "$dp_repo" switch --quiet -c dp-feat
+dry_vs_real "a sparse checkout with an ignored file at an added path refuses" 2 "$dp_repo"
+_assert_eq "the sparse checkout's ignored file survives" local "$(cat "$dp_repo/.env")"
+
+# A sparse base worktree: Git would overwrite its ignored file, so cleanup
+# leaves the base not updated and the file intact.
+IFS=$'\t' read -r dp_repo dp_other < <(dp_new)
+git -C "$dp_repo" switch --quiet -c dp-feat
+dp_wt=$(_tmpdir)
+rm -rf "$dp_wt"
+git -C "$dp_repo" worktree add --quiet "$dp_wt" main
+git -C "$dp_wt" sparse-checkout set --cone sub >/dev/null 2>&1
+_commit_file "$dp_other" .env remote "track .env"
+git -C "$dp_other" push --quiet origin main
+mkdir -p "$dp_repo/.git/info"
+printf '.env\n' >>"$dp_repo/.git/info/exclude"
+printf 'local\n' >"$dp_wt/.env"
+dp_out=$(git -C "$dp_repo" cleanup-repo 2>&1)
+_assert_contains "a sparse base worktree is left not updated" "main not updated" "$dp_out"
+_assert_eq "the sparse base worktree's ignored file survives" local "$(cat "$dp_wt/.env")"
+
+# The predictor batches its untracked-file lookups: 600 occupied paths that
+# are all tracked predict success, and one untracked file past the first batch
+# still blocks.
+bp_out=$(
+  bp_repo=$(_tmpdir)
+  _git_init "$bp_repo"
+  git -C "$bp_repo" commit -q --allow-empty -m seed
+  from=$(git -C "$bp_repo" rev-parse HEAD)
+  for i in $(seq 1 600); do printf '%s\n' "$i" >"$bp_repo/f$i"; done
+  git -C "$bp_repo" add .
+  git -C "$bp_repo" commit -q -m many
+  to=$(git -C "$bp_repo" rev-parse HEAD)
+  cd "$bp_repo" || exit 1
+  # shellcheck source=../lib/git-tools-base.sh
+  . "$ROOT/lib/git-tools-base.sh"
+  # shellcheck source=../lib/git-tools-cleanup.sh
+  . "$ROOT/lib/git-tools-cleanup.sh"
+  gt_checkout_would_succeed "" "$from" "$to" && printf 'clear\n' || printf 'blocked\n'
+  printf 'x\n' >"$bp_repo/zz-late"
+  git -C "$bp_repo" rm -q --cached f600
+  git -C "$bp_repo" commit -q -m drop
+  late_from=$(git -C "$bp_repo" rev-parse HEAD)
+  printf '600\n' >"$bp_repo/f600"
+  gt_checkout_would_succeed "" "$late_from" "$to" && printf 'clear\n' || printf 'blocked\n'
+)
+_assert_eq "tracked occupied paths in many batches predict success; a late untracked one blocks" \
+  "$(printf 'clear\nblocked')" "$bp_out"
+
+# A tag sharing a branch's name must not hide the branch's keep reason from
+# its selected worktree.
+tc_repo=$(_clone_remote)
+tc_wt=$(_tmpdir)
+rm -rf "$tc_wt"
+git -C "$tc_repo" worktree add --quiet "$tc_wt" -b tc-feat
+git -C "$tc_repo" tag tc-feat
+tc_out=$(git -C "$tc_repo" cleanup-repo --no-update-base --min-age 1 --worktree "$tc_wt" \
+  --porcelain 2>/dev/null)
+_assert_contains "a branch named like a tag keeps its worktree as too-new" \
+  $'keep-worktree\t'"$tc_wt"$'\ttoo-new' "$tc_out"
+
+# A local branch literally named origin/main does not hide origin/HEAD.
+amb_out=$(
+  amb_repo=$(_clone_remote)
+  git -C "$amb_repo" push --quiet origin main:develop
+  git -C "$amb_repo" fetch --quiet origin
+  git -C "$amb_repo" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/develop
+  git -C "$amb_repo" branch --quiet origin/develop main
+  cd "$amb_repo" || exit 1
+  # shellcheck source=../lib/git-tools-base.sh
+  . "$ROOT/lib/git-tools-base.sh"
+  gt_default_branch origin
+)
+_assert_eq "origin/HEAD resolves despite an ambiguous local branch" develop "$amb_out"
+
+# The interface version is pinned, so an unintended change fails here.
+_assert_eq "--interface-version is 1" 1 "$(git-cleanup-repo --interface-version)"
+
+if command -v jq >/dev/null 2>&1; then
+  # A plain --worktree selection whose pull request lookup failed carries
+  # pr-unknown, like its branch.
+  pu_repo=$(_github_clone)
+  git -C "$pu_repo" switch --quiet -c pu-feat
+  _commit_file "$pu_repo" pu.txt pu "pu work"
+  git -C "$pu_repo" switch --quiet main
+  pu_dir="$(_tmpdir)/pu"
+  git -C "$pu_repo" worktree add --quiet "$pu_dir" pu-feat
+  # shellcheck disable=SC2031 # PATH is only prefixed for this command
+  pu_out=$(env PATH="$gh_bin:$PATH" FAKE_GH_DIR="$gh_dir" FAKE_GH_FAIL=1 \
+    git -C "$pu_repo" cleanup-repo --porcelain --no-update-base --worktree "$pu_dir" 2>&1)
+  _assert_contains "a selected worktree carries its branch's pr-unknown" \
+    $'keep-worktree\t'"$pu_dir"$'\tpr-unknown\tpu-feat' "$pu_out"
+
+  # A user-less scp remote (an SSH Host alias) gets pull request evidence
+  # when it resolves to github.com, and none for a host gh is not logged in
+  # to, which reads as no evidence rather than pr-unknown.
+  ua_bin=$(_tmpdir)
+  cat >"$ua_bin/ssh" <<'EOF_SSH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-} ${3:-}" in
+  "-G -- acme-alias") printf 'hostname github.com\n' ;;
+  "-G -- nas-alias") printf 'hostname nas.test\n' ;;
+  "-G -- ghe-alias") printf 'hostname ghe.test\n' ;;
+  *) exit 1 ;;
+esac
+EOF_SSH
+  chmod +x "$ua_bin/ssh"
+  for ua_alias in acme-alias nas-alias ghe-alias; do
+    ua_repo=$(_clone_remote)
+    ua_remote=$(git -C "$ua_repo" remote get-url origin)
+    git -C "$ua_repo" config "url.$ua_remote.insteadOf" "$ua_alias:acme/widgets.git"
+    git -C "$ua_repo" remote set-url origin "$ua_alias:acme/widgets.git"
+    git -C "$ua_repo" switch --quiet -c ua-feat
+    _commit_file "$ua_repo" ua.txt ua "ua work"
+    git -C "$ua_repo" switch --quiet main
+    : >"$gh_dir/calls"
+    # shellcheck disable=SC2031 # PATH is only prefixed for this command
+    ua_out=$(env PATH="$ua_bin:$gh_bin:$PATH" FAKE_GH_DIR="$gh_dir" \
+      git -C "$ua_repo" cleanup-repo --porcelain --no-update-base 2>&1)
+    case "$ua_alias" in
+      acme-alias)
+        _assert_contains "a user-less alias to github.com gets pull request lookups" \
+          "repos/acme/widgets" "$(cat "$gh_dir/calls")"
+        ;;
+      ghe-alias)
+        _assert_contains "a host gh has a credential for gets pull request lookups" \
+          "repos/acme/widgets" "$(cat "$gh_dir/calls")"
+        ;;
+      nas-alias)
+        _assert_not_contains "a host gh is not logged in to gets no pull request lookups" \
+          "repos/acme/widgets" "$(cat "$gh_dir/calls")"
+        _assert_contains "no evidence reads as merge-unproven, not pr-unknown" \
+          $'keep-branch\tua-feat\tmerge-unproven' "$ua_out"
+        ;;
+    esac
+  done
 fi
 
 if ((_failures > 0)); then

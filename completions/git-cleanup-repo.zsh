@@ -3,8 +3,8 @@
 
 _git_cleanup_repo_refs() {
   local -a refs
-  refs=(${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null)"})
-  _describe -t refs 'git ref' refs
+  refs=(${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)"})
+  _describe -t refs 'branch' refs
 }
 
 _git_cleanup_repo_remotes() {
@@ -28,6 +28,7 @@ _git_cleanup_repo() {
     '*--retire-worktree[Remove this linked worktree but keep its branch]:worktree:_files -/' \
     '--include-closed[Retire selected worktrees of closed, unmerged PRs]' \
     '(-n --dry-run)'{-n,--dry-run}'[Print deletion actions without changing anything]' \
+    '--interface-version[Print the porcelain interface version]' \
     '(-h --help)'{-h,--help}'[Show help]'
 }
 

@@ -613,6 +613,22 @@ scp_identity=$(ROOT="$ROOT" /bin/bash -c '
 ')
 _assert_eq "scp SSH username remains supported" \
   "github.test/example/repo" "$scp_identity"
+# A remote without an owner/repository path is not a GitHub repository, and
+# a user-less scp remote (often a non-GitHub mirror) is not parsed here, so
+# neither can make remote resolution ambiguous.
+for not_github_url in 'https://github.test/repo.git' 'git@github.test:repo.git' \
+  'mirror:example/repo.git'; do
+  not_github_rc=0
+  (ROOT="$ROOT" NOT_GITHUB_URL="$not_github_url" /bin/bash -c '
+    . "$ROOT/lib/git-tools-pr.sh"
+    gt_github_repo_identity_from_url "$NOT_GITHUB_URL"
+  ') >/dev/null 2>&1 || not_github_rc=$?
+  if [[ "$not_github_rc" != 0 ]]; then
+    _pass "not read as a GitHub repository: $not_github_url"
+  else
+    _fail "not read as a GitHub repository: $not_github_url"
+  fi
+done
 
 secret_repo=$(_tmpdir)/repo
 secret_ps_log=$(_tmpdir)/ps.log

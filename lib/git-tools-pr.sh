@@ -191,6 +191,9 @@ gt_github_repo_identity_from_url() {
   path=${path#/}
   path=${path%/}
   path=${path%.git}
+  # owner/repository: a single path segment names no owner, and splitting it
+  # would invent one (host/repo/repo).
+  [[ "$path" == */* ]] || return 1
   owner=${path%%/*}
   repo=${path#*/}
   [[ -n "$host" && -n "$owner" && -n "$repo" && "$repo" != */* ]] || return 1

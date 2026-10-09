@@ -24,6 +24,13 @@ _root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
 . "$_root/lib/git-tools-cleanup.sh"
 # shellcheck disable=SC2034 # read by lib/git-tools-cleanup.sh
 GT_CLEANUP_COMMAND="git cleanup-repo"
+# The porcelain contract other tools drive (options, records, codes, exit
+# statuses). Bump it whenever that contract gains or changes anything a
+# caller relies on, so a caller can require it instead of probing options
+# that arrived over several changes. 1: exit status 3; pr-unknown,
+# closed-pr, symref, and submodule codes; following a renamed remote
+# default; symref and ignored-file safety.
+_interface_version=1
 
 _usage() {
   cat <<'EOF'
@@ -39,11 +46,13 @@ Incomplete branch inventories abort before deletion.
 Options:
   -b, --base <branch>       Base branch to keep and update.
   -r, --remote <name>       Remote endpoint to fetch from (default: origin).
-      --gone                Select branches whose own-name upstream is gone.
+      --gone                Select branches whose own-name upstream is gone
+                            (never a default branch's, which means a rename).
   -a, --all                 Delete all local branches except the base branch.
       --remove-worktrees    Remove eligible linked worktrees for deleted branches.
       --worktree <path>     Remove only this linked worktree (repeatable);
-                            implies --remove-worktrees.
+                            implies --remove-worktrees. With an explicit
+                            --remove-worktrees, every eligible worktree goes.
       --no-update-base      Prove against the remote base without changing the
                             local base or the current checkout.
       --no-fetch            Prove against the remote-tracking base ref instead
@@ -56,18 +65,21 @@ Options:
       --retire-worktree <path>
                             Remove this linked worktree (repeatable); the
                             caller vouches for it. Its branch is kept unless
-                            cleanup proves it merged, and an open-pr or
-                            too-new branch keeps the worktree too.
+                            cleanup proves it merged; an open-pr, too-new,
+                            pr-unknown, or unreachable-head decision keeps
+                            the worktree too.
       --include-closed      Also retire a selected worktree whose branch only
                             a closed, unmerged pull request contains.
   -n, --dry-run             Print actions without changing anything.
+      --interface-version   Print the porcelain interface version and exit.
   -h, --help                Show this help.
 
 Porcelain records are <event> TAB <subject> TAB <code> TAB <detail>. Events:
 delete-branch, keep-branch, remove-worktree, keep-worktree, and prune-entry,
 with would-delete-branch, would-remove-worktree, and would-prune-entry in a
 dry run. Every selected worktree gets exactly one remove-worktree,
-would-remove-worktree, or keep-worktree record. Backslash, tab, and newline in a field are written as \\, \t, and \n.
+would-remove-worktree, or keep-worktree record. Backslash, tab, and newline
+in a field are written as \\, \t, and \n.
 Worktree subjects are the paths Git's worktree list records.
 
 Exit status:
@@ -152,6 +164,73 @@ _resolve_remote() {
     _die "could not resolve one fetch endpoint for remote: $_remote"
   # Reuse the raw URL so Git applies insteadOf exactly once per operation.
   _remote_url=$configured
+}
+
+# Print the GitHub repository a cleanup remote reaches, or fail when pull
+# request evidence should not be used for it. Beyond the shared parser, this
+# accepts a user-less scp remote (an SSH Host alias such as
+# `work:owner/repo`, whose config supplies the user) by resolving it as the
+# equivalent ssh:// URL; the shared parser rejects that form so it cannot make
+# the PR commands' remote resolution ambiguous. A host other than github.com
+# must be one gh has a credential for (`gh auth token`, which checks locally
+# and makes no network call; GH_ENTERPRISE_TOKEN counts for every such
+# host): any other host (a NAS mirror, say) is not a GitHub server, and
+# querying it would only turn every unproven branch into pr-unknown. Whether
+# the token currently works does not matter here, so an expired GitHub
+# Enterprise login, like broken auth on github.com (which always
+# qualifies), shows up as pr-unknown instead of silently dropping the
+# evidence.
+_cleanup_github_identity() {
+  local url="$1" identity host
+
+  case "$url" in
+    *://* | *@*) ;;
+    *:*)
+      host=${url%%:*}
+      [[ "$host" != */* && ${#host} -gt 1 ]] || return 1
+      url="ssh://$host/${url#*:}"
+      ;;
+  esac
+  identity=$(gt_github_repo_transport_identity_from_url "$url") || return 1
+  host=${identity%%/*}
+  [[ "$host" == github.com ]] ||
+    gh auth token --hostname "$host" >/dev/null 2>&1 </dev/null || return 1
+  printf '%s\n' "$identity"
+}
+
+# Succeed when a branch's gone upstream is evidence that it landed: its own
+# remote branch is gone (gt_own_upstream_gone) and that remote branch was not
+# a default branch. A default branch is renamed, not deleted after landing
+# (master to main), so its upstream vanishing says nothing about the local
+# branch, which can still hold unpushed work. Defaults are the remote's
+# recorded HEAD target (usually the old name after a rename) and the
+# conventional main, master, and trunk; the base and an inferred base never
+# reach here, since the inventory leaves them out. Both --gone selection and
+# worktree retirement use this one rule.
+_gone_upstream_is_evidence() {
+  local branch="$1" track="$2" remote_name="$3" remote_ref="$4" head_ref
+
+  case "$remote_ref" in
+    refs/heads/main | refs/heads/master | refs/heads/trunk) return 1 ;;
+  esac
+  head_ref=$(git symbolic-ref -q "refs/remotes/$remote_name/HEAD" 2>/dev/null) ||
+    head_ref=""
+  [[ -z "$head_ref" || "$remote_ref" != "refs/heads/${head_ref#refs/remotes/"$remote_name"/}" ]] ||
+    return 1
+  gt_own_upstream_gone "$branch" "$track" "$remote_name" "$remote_ref"
+}
+
+# Print the branch names of the refs/heads symbolic refs (from the inventory
+# records) that point at a branch ref, space-separated (a ref name cannot hold
+# a space), for its keep-branch detail.
+_symref_aliases() {
+  local records="$1" target="$2" ref oid rest aliases=""
+
+  while IFS=$'\t' read -r ref oid rest; do
+    [[ "$rest" == *$'\t's="$target" ]] || continue
+    aliases+="${aliases:+ }${ref#refs/heads/}"
+  done <<<"$records"
+  printf '%s' "$aliases"
 }
 
 _local_branch_exists() {
@@ -417,16 +496,121 @@ _keep_local_base() {
 # historical behavior and stays reserved for the main worktree or a worktree
 # that already has the base checked out, where it cannot steal the base from
 # another worktree or orphan a linked worktree's own branch.
+# Ignored files are local state too (a .env, build settings), so neither the
+# switch nor the fast-forward may overwrite one with a newly tracked file;
+# Git refuses before changing anything (an untracked file in the way is
+# refused the same way) and cleanup stops with status 2. A fast-forward
+# refused after the switch first returns the checkout to where it was. An
+# unborn current branch has nothing to switch back to, so cleanup refuses
+# before switching away from it.
 _switch_to_base() {
-  if [[ "$_base_local_exists" == 1 ]]; then
-    gt_cleanup_run git switch --quiet --no-guess "$_base"
+  local origin back=""
+
+  if origin=$(git symbolic-ref -q HEAD 2>/dev/null); then
+    if [[ "$origin" != "refs/heads/$_base" ]] &&
+      ! git rev-parse --verify -q HEAD >/dev/null 2>&1; then
+      _refuse "current branch ${origin#refs/heads/} has no commits yet; commit, switch to $_base, or pass --no-update-base"
+    fi
   else
-    gt_cleanup_run git switch --quiet -c "$_base" "$_remote_oid"
+    origin=$(git rev-parse --verify -q HEAD 2>/dev/null) || origin=""
+  fi
+  # A dry run cannot let Git refuse, so check up front whether moving the
+  # files from HEAD to the local base or the remote base would overwrite an
+  # untracked or ignored file.
+  # The switch moves HEAD to the local base (when one exists); the
+  # fast-forward then moves it to the remote base only when the plan takes
+  # the remote's commit (a local base ahead of the remote stays put).
+  if [[ "$_dry_run" == 1 ]]; then
+    local head_oid ff_from
+    head_oid=$(git rev-parse --verify -q HEAD 2>/dev/null) || head_oid=""
+    ff_from=${_local_base_oid:-$head_oid}
+    if { [[ -n "$_local_base_oid" ]] &&
+      ! _checkout_would_succeed "" "$head_oid" "$_local_base_oid"; } ||
+      { [[ "$_planned_base_oid" == "$_remote_oid" ]] &&
+        ! _checkout_would_succeed "" "$ff_from" "$_remote_oid"; }; then
+      _refuse "could not update $_base; Git would refuse because an untracked or ignored file is in the way"
+    fi
+  fi
+  if [[ "$_base_local_exists" == 1 ]]; then
+    gt_cleanup_run git switch --quiet --no-guess --no-overwrite-ignore "$_base" ||
+      _refuse "could not switch to $_base; Git refused (see above), for example because an untracked or ignored file is in the way"
+  else
+    gt_cleanup_run git switch --quiet --no-overwrite-ignore -c "$_base" \
+      "$_remote_oid" ||
+      _refuse "could not switch to $_base; Git refused (see above), for example because an untracked or ignored file is in the way"
     _record_base_config
   fi
-  gt_cleanup_run git merge --quiet --ff-only "$_remote_oid"
+  if ! gt_cleanup_run git merge --quiet --ff-only --no-overwrite-ignore \
+    "$_remote_oid"; then
+    case "$origin" in
+      refs/heads/"$_base" | "") ;;
+      refs/heads/*)
+        git switch --quiet --no-guess "${origin#refs/heads/}" ||
+          back="; the checkout is still on $_base, since switching back to ${origin#refs/heads/} failed"
+        ;;
+      *)
+        git switch --quiet --detach "$origin" ||
+          back="; the checkout is still on $_base, since switching back to $origin failed"
+        ;;
+    esac
+    _refuse "could not fast-forward $_base; Git refused (see above), for example because an untracked or ignored file is in the way$back"
+  fi
   # shellcheck disable=SC2034 # read by lib/git-tools-cleanup.sh
   GT_CLEANUP_SWITCHED_TO_BASE=1
+}
+
+# Succeed (0) unless moving the worktree at $1 (empty: the current one) from
+# commit $2 (empty: an unborn HEAD) to commit $3 would make Git refuse for an
+# untracked or ignored file in the way, as --no-overwrite-ignore does. Git
+# has no dry run for that check (`read-tree -n` skips it), so predict it, and
+# only when certain: a path the target adds is blocked when an untracked or
+# ignored file occupies it or any directory above it. A tracked path that
+# merely changes type is Git's to replace and never blocks, nor does a
+# directory under a newly added gitlink, which Git leaves in place. A sparse
+# checkout is not predicted, since Git skips paths outside its patterns. The
+# diff runs in this process's environment, where a dry run's fetched objects
+# are visible; only the untracked-file listing runs in the target worktree.
+# Any lookup failure predicts success, leaving the refusal to the real run.
+_checkout_would_succeed() {
+  local path="$1" from="$2" to="$3" top meta added parent sparse
+  local -a wt_git=(git)
+
+  [[ -z "$path" ]] || wt_git=(gt_git_without_local_env -C "$path")
+  top=$("${wt_git[@]}" rev-parse --show-toplevel 2>/dev/null) || return 0
+  sparse=$("${wt_git[@]}" config --bool core.sparseCheckout 2>/dev/null) || sparse=""
+  [[ "$sparse" != true ]] || return 0
+  [[ -n "$from" ]] || from=$(git hash-object -t tree --stdin </dev/null) || return 0
+  # Raw records: ":<old mode> <new mode> <old oid> <new oid> A" NUL <path> NUL.
+  while IFS= read -r -d '' meta && IFS= read -r -d '' added; do
+    if [[ "$meta" == *" 160000 "* && -d "$top/$added" && ! -L "$top/$added" ]]; then
+      continue
+    fi
+    _untracked_in_way "$top" "$added" && return 1
+    parent=$added
+    while [[ "$parent" == */* ]]; do
+      parent=${parent%/*}
+      if [[ -e "$top/$parent" || -L "$top/$parent" ]] &&
+        [[ ! -d "$top/$parent" || -L "$top/$parent" ]]; then
+        _untracked_in_way "$top" "$parent" && return 1
+      fi
+    done
+  done < <(git diff-tree -r -z --no-renames --diff-filter=A "$from" "$to" \
+    2>/dev/null)
+  return 0
+}
+
+# Succeed when an untracked or ignored file occupies path $2 (relative to the
+# worktree top $1). Cheap disk test first; only an existing path pays for the
+# Git lookup, which lists untracked and ignored files alike (no exclude rules
+# given) and nothing tracked. Only emptiness matters, so no -z (Bash would
+# warn about the NULs).
+_untracked_in_way() {
+  local top="$1" rel="$2" listed
+
+  [[ -e "$top/$rel" || -L "$top/$rel" ]] || return 1
+  listed=$(gt_git_without_local_env -C "$top" ls-files -o -- \
+    ":(top,literal)$rel" 2>/dev/null) || return 1
+  [[ -n "$listed" ]]
 }
 
 # Another worktree owns the base, so only that worktree can advance it without
@@ -454,16 +638,24 @@ _fast_forward_base_worktree() {
     return 0
   fi
   # Report the user-visible command; the real run clears this worktree's
-  # inherited Git environment so the merge happens in the base worktree.
+  # inherited Git environment so the merge happens in the base worktree. A
+  # dry run predicts the real run's refusal for an untracked or ignored file.
+  if [[ "$_dry_run" == 1 ]] &&
+    ! _checkout_would_succeed "$path" "$_local_base_oid" "$_remote_oid"; then
+    _skip_base_update "could not fast-forward it in worktree $path"
+    return 0
+  fi
   if [[ "$_dry_run" == 1 ]]; then
-    gt_cleanup_run git -C "$path" merge --quiet --ff-only "$_remote_oid"
+    gt_cleanup_run git -C "$path" merge --quiet --ff-only \
+      --no-overwrite-ignore "$_remote_oid"
     return 0
   fi
   if ! gt_git_without_local_env -C "$path" merge --quiet --ff-only \
-    "$_remote_oid"; then
+    --no-overwrite-ignore "$_remote_oid"; then
     # A fast-forward refuses before changing anything when, for example, an
-    # untracked file hidden by status.showUntrackedFiles is in the way. That
-    # is the same kind of local state as the changes skipped above.
+    # untracked file hidden by status.showUntrackedFiles or an ignored file
+    # is in the way. That is the same kind of local state as the changes
+    # skipped above.
     if ! _local_branch_exists "$_base" ||
       [[ "$GT_REF_OID" != "$_local_base_oid" ]]; then
       _die "could not fast-forward $_base in worktree $path"
@@ -610,7 +802,8 @@ _delete_reason() {
     esac
   fi
   if [[ "$_gone" == 1 ]] &&
-    gt_own_upstream_gone "$branch" "$upstream_track" "$remote_name" "$remote_ref"; then
+    _gone_upstream_is_evidence "$branch" "$upstream_track" "$remote_name" \
+      "$remote_ref"; then
     printf 'upstream-gone\t\n'
     return 0
   fi
@@ -623,9 +816,11 @@ _delete_reason() {
 
 _inventory_branches() {
   local records branch_ref branch branch_oid upstream upstream_track
-  local remote_name remote_ref status=0
+  local remote_name remote_ref symref aliases status=0
+  local symref_targets=$'\n'
 
   _branches=()
+  _symref_branches=()
   _branch_oids=()
   _upstreams=()
   _upstream_tracks=()
@@ -634,28 +829,47 @@ _inventory_branches() {
   # Optional fields carry a tag: TAB is IFS whitespace, so `read` would
   # collapse an empty field and shift every later one into the wrong slot.
   records=$(git for-each-ref \
-    --format='%(refname)%09%(objectname)%09u=%(upstream:short)%09t=%(upstream:track)%09r=%(upstream:remotename)%09f=%(upstream:remoteref)' \
+    --format='%(refname)%09%(objectname)%09u=%(upstream:short)%09t=%(upstream:track)%09r=%(upstream:remotename)%09f=%(upstream:remoteref)%09s=%(symref)' \
     refs/heads) ||
     _die "could not enumerate branches"
 
+  # A symbolic ref under refs/heads (an alias such as master -> main) is not
+  # a branch of its own: deleting it by name would delete its target, which
+  # may be the base or a checked-out branch. Neither the alias nor anything
+  # an alias points at is ever a candidate.
   while IFS=$'\t' read -r branch_ref branch_oid upstream upstream_track \
-    remote_name remote_ref; do
+    remote_name remote_ref symref; do
+    symref=${symref#s=}
+    [[ -z "$symref" ]] || symref_targets+="$symref"$'\n'
+  done <<<"$records"
+
+  while IFS=$'\t' read -r branch_ref branch_oid upstream upstream_track \
+    remote_name remote_ref symref; do
     [[ -n "$branch_ref" ]] || continue
     upstream=${upstream#u=}
     upstream_track=${upstream_track#t=}
     remote_name=${remote_name#r=}
     remote_ref=${remote_ref#f=}
+    symref=${symref#s=}
+    [[ -z "$symref" ]] || continue
     case "$branch_ref" in
       refs/heads/*) branch=${branch_ref#refs/heads/} ;;
       *) _die "invalid branch inventory record: $branch_ref" ;;
     esac
+    [[ "$branch" != "$_base" && "$branch" != "$_inferred_base" ]] || continue
+    if [[ "$symref_targets" == *$'\n'"$branch_ref"$'\n'* ]]; then
+      aliases=$(_symref_aliases "$records" "$branch_ref")
+      gt_cleanup_report keep-branch "$branch" symref "$aliases" \
+        "keeping $branch; the symbolic ref(s) $aliases point at it"
+      _symref_branches+=("$branch")
+      continue
+    fi
     _validate_native_oid "$branch_oid" ||
       _die "invalid branch object ID in inventory: $branch_ref"
     status=0
     gt_find_ref_commit "$branch_ref" || status=$?
     [[ "$status" == 0 && "$GT_REF_OID" == "$branch_oid" ]] ||
       _die "branch changed while inventory was collected: $branch_ref"
-    [[ "$branch" != "$_base" && "$branch" != "$_inferred_base" ]] || continue
     _branches+=("$branch")
     _branch_oids+=("$branch_oid")
     _upstreams+=("$upstream")
@@ -676,6 +890,8 @@ _cleanup_branches() {
   [[ -z "$_base_skip_reason" ]] ||
     unproven="merge not proven against the local $_base, which was not updated"
   _inventory_branches
+  # Branches an alias points at were reported (kept) by the inventory itself.
+  skipped=${#_symref_branches[@]}
   for index in "${!_branches[@]}"; do
     branch=${_branches[$index]}
     branch_oid=${_branch_oids[$index]}
@@ -719,19 +935,43 @@ _cleanup_branches() {
         skipped=$((skipped + 1))
         continue
         ;;
-      closed-pr) _closed_branches+=("$branch") ;;
-      pr-unknown) _pr_unknown_branches+=("$branch") ;;
+      # Say what the pull request evidence found rather than a bare
+      # merge-unproven: a closed unmerged PR is a fact worth reporting, and a
+      # failed lookup (bad gh auth, API errors) must not look like a healthy
+      # run that simply found nothing.
+      closed-pr)
+        _closed_branches+=("$branch")
+        gt_cleanup_report keep-branch "$branch" closed-pr "$detail" \
+          "keeping $branch; $unproven; its pull request #$detail was closed unmerged"
+        skipped=$((skipped + 1))
+        continue
+        ;;
+      pr-unknown)
+        _pr_unknown_branches+=("$branch")
+        gt_cleanup_report keep-branch "$branch" pr-unknown "" \
+          "keeping $branch; $unproven; its pull requests could not be looked up"
+        skipped=$((skipped + 1))
+        continue
+        ;;
     esac
     # Upstream state comes from remote-tracking refs as of the last fetch;
     # cleanup fetches only the base, so say so rather than claim it is live.
-    if gt_own_upstream_gone "$branch" "$upstream_track" "$remote_name" \
+    if _gone_upstream_is_evidence "$branch" "$upstream_track" "$remote_name" \
       "$remote_ref"; then
       gt_cleanup_report keep-branch "$branch" merge-unproven upstream-gone \
         "keeping $branch; $unproven; upstream is gone; --gone selects it for cleanup"
+    elif gt_own_upstream_gone "$branch" "$upstream_track" "$remote_name" \
+      "$remote_ref"; then
+      gt_cleanup_report keep-branch "$branch" merge-unproven default-upstream-gone \
+        "keeping $branch; $unproven; its upstream, a default branch, is gone, which means a rename, so --gone never selects it"
     elif [[ "$upstream_track" == "[gone]" ]]; then
       gt_cleanup_report keep-branch "$branch" merge-unproven \
         other-upstream-gone \
         "keeping $branch; $unproven; upstream $upstream is gone, but it is not this branch's own remote branch"
+    elif [[ -n "$upstream" && "$remote_name" == "$_remote" &&
+      "$remote_ref" == "refs/heads/$_base" ]]; then
+      gt_cleanup_report keep-branch "$branch" merge-unproven upstream \
+        "keeping $branch; $unproven; it tracks the base $upstream, which says nothing about its own commits"
     elif [[ -n "$upstream" ]]; then
       gt_cleanup_report keep-branch "$branch" merge-unproven upstream \
         "keeping $branch; $unproven; upstream $upstream still exists as of the last fetch"
@@ -794,7 +1034,7 @@ _parse_args() {
       -r | --remote)
         local opt="$1"
         shift
-        (($#)) || _die "$opt requires a value"
+        (($#)) && [[ -n "$1" ]] || _die "$opt requires a value"
         _remote="$1"
         shift
         ;;
@@ -802,6 +1042,10 @@ _parse_args() {
         _remote="${1#--remote=}"
         [[ -n "$_remote" ]] || _die "--remote requires a value"
         shift
+        ;;
+      --interface-version)
+        printf '%s\n' "$_interface_version"
+        exit 0
         ;;
       -a | --all)
         _all=1
@@ -1081,7 +1325,7 @@ _retire_worktrees() {
       index=0
       while ((index < ${#_branches[@]})); do
         if [[ "${_branches[$index]}" == "$branch" ]] &&
-          gt_own_upstream_gone "$branch" "${_upstream_tracks[$index]}" \
+          _gone_upstream_is_evidence "$branch" "${_upstream_tracks[$index]}" \
             "${_upstream_remotes[$index]}" "${_upstream_refs[$index]}"; then
           code="upstream-gone"
         fi
@@ -1093,7 +1337,19 @@ _retire_worktrees() {
       fi
     fi
     if [[ -z "$code" ]]; then
-      _keep_worktree "$path" merge-unproven "$branch" \
+      # Carry the code that kept the branch, as the branch record does.
+      code=merge-unproven
+      if [[ -n "$branch" ]] &&
+        _listed "$branch" ${_closed_branches[@]+"${_closed_branches[@]}"}; then
+        code=closed-pr
+      elif [[ -n "$branch" ]] &&
+        _listed "$branch" ${_pr_unknown_branches[@]+"${_pr_unknown_branches[@]}"}; then
+        code=pr-unknown
+      elif [[ -n "$branch" ]] &&
+        _listed "$branch" ${_symref_branches[@]+"${_symref_branches[@]}"}; then
+        code=symref
+      fi
+      _keep_worktree "$path" "$code" "$branch" \
         "merge not proven for ${branch:-its detached HEAD}"
       continue
     fi
@@ -1148,8 +1404,7 @@ _github_host=""
 _github_repo=""
 if [[ "$_fetch" == 1 ]] && command -v gh >/dev/null 2>&1 &&
   command -v jq >/dev/null 2>&1 &&
-  _github_identity=$(gt_github_repo_transport_identity_from_url "$_remote_url" \
-    2>/dev/null); then
+  _github_identity=$(_cleanup_github_identity "$_remote_url" 2>/dev/null); then
   _github_host=${_github_identity%%/*}
   _github_repo=${_github_identity#*/}
 fi

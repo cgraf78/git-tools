@@ -401,21 +401,26 @@ complete tree equals some snapshot on the base's first-parent history also
 counts as merged (`tree-landed`): a stacked landing can bring a branch to the
 base through several commits that neither detector matches, yet every byte of
 the branch is then recoverable from mainline history. When `gh` and `jq` are
-available and the remote is on GitHub, a branch whose tip belongs to a merged
-pull request on the base also counts (`merged-pr`): the PR's own commit list
-must contain the tip and its merge commit must be in the pinned base, so an
-earlier snapshot of a squash-merged PR is recognized. An open PR containing the
-tip, or named after the branch, keeps it (`open-pr`). Missing tools, API
-failures, and `--no-fetch` simply leave this evidence out. The complete branch
-and upstream-state inventory is validated before the first mutation. Each
-candidate is rechecked before deletion, and the ref is deleted only if it still
-has the exact proven OID. Use `--gone` to also select branches whose own
-remote branch (the same name on a real remote) is gone. A branch that tracks a
-different branch, such as the base it was cut from, is never selected that way,
-because its upstream's deletion says nothing about its own commits. The command
-deliberately does not run
-configured fetch or prune mappings; refresh other remote-tracking state
-separately when needed.
+available and the remote is on GitHub (github.com, or another host `gh` has a
+credential for; an SSH Host alias remote such as `work:owner/repo` resolves
+through `ssh -G`), a branch whose tip belongs to a merged pull request on the
+base also counts (`merged-pr`): the PR's own commit list must contain the tip
+and its merge commit must be in the pinned base, so an earlier snapshot of a
+squash-merged PR is recognized. An open PR containing the tip, or named after
+the branch, keeps it (`open-pr`). Missing tools, API failures, and `--no-fetch`
+simply leave this evidence out. The complete branch and upstream-state
+inventory is validated before the first mutation. Each candidate is rechecked
+before deletion, and the ref is deleted only if it still has the exact proven
+OID. Use `--gone` to also select branches whose own remote branch (the same
+name on a real remote) is gone. A branch that tracks a different branch, such
+as the base it was cut from, is never selected that way, because its upstream's
+deletion says nothing about its own commits; neither is one whose upstream was
+a default branch (`main`, `master`, `trunk`, or the branch the
+remote's recorded `HEAD` names), since a default branch disappears when it is
+renamed, not after landing. Symbolic refs under `refs/heads` (an alias such as
+`master` pointing at `main`) and the branches they point at are never deleted.
+The command deliberately does not run configured fetch or prune mappings;
+refresh other remote-tracking state separately when needed.
 
 Base updates do not depend on configured fetch refspecs or short ref names. The
 command pins exactly `refs/heads/<base>` from the resolved endpoint, fetches it
@@ -467,7 +472,10 @@ is locked).
 A dry run stops, with exit status 2 and `would refuse: <reason>`, wherever the
 real run refuses before changing anything (a dirty worktree, an active
 operation, or a local base that cannot fast-forward), instead of describing a
-cleanup that would not happen.
+cleanup that would not happen. That includes Git refusing the base switch or
+fast-forward because an untracked or ignored file is in the way, which the dry
+run predicts by checking for untracked or ignored files at the paths the base
+would add.
 
 Dry-run uses isolated temporary object storage, so it leaves no permanent
 objects or refs behind. The command retains the single raw configured fetch URL
@@ -506,8 +514,11 @@ git cleanup-repo --all --remove-worktrees
 Before removing an otherwise eligible worktree, the command can prune two
 explicit classes of disposable top-level entries:
 
-- A real top-level directory whose real `CACHEDIR.TAG` file begins with the
-  standard `Signature: 8a477f597d28d172789f06886806bc55` line.
+- A real top-level directory with no tracked content whose real, untracked
+  `CACHEDIR.TAG` file begins with the standard
+  `Signature: 8a477f597d28d172789f06886806bc55` line. A directory holding
+  tracked files is a source directory and never counts, so a committed tag
+  cannot authorize deleting untracked work.
 - A literal top-level entry named by the target repository's local
   `cleanupRepo.worktreePrunePath` configuration.
 
@@ -555,7 +566,11 @@ contain commits the remote dropped, so prefer a fetching run when the base may
 have been rewritten. `--worktree <path>` (repeatable, implies
 `--remove-worktrees`) limits removal to the listed linked worktrees, so a
 caller can apply its own policy, such as an age limit, to which checkouts may
-go. `--porcelain` prints one record per decision on stdout and leaves only
+go; an explicit `--remove-worktrees` alongside it still removes every eligible
+worktree. `--interface-version` prints an integer that grows whenever the
+options, records, codes, or exit statuses gain or change anything a caller
+relies on, so a driver can require a version instead of probing for options.
+`--porcelain` prints one record per decision on stdout and leaves only
 diagnostics on stderr:
 
 ```text
@@ -574,13 +589,17 @@ diagnostics on stderr:
 
 | Code | Detail | Meaning |
 | --- | --- | --- |
-| `merge-unproven` | `upstream-gone`, `other-upstream-gone`, `upstream`, or `no-upstream` | no proof; the detail is the upstream state |
+| `merge-unproven` | `upstream-gone`, `default-upstream-gone`, `other-upstream-gone`, `upstream`, or `no-upstream` | no proof; the detail is the upstream state (`default-upstream-gone`: its own upstream was a default branch and is gone, which `--gone` never selects) |
 | `open-pr` | PR number | an open pull request contains the tip or is named after the branch |
+| `closed-pr` | PR number | no proof, and a pull request containing the tip was closed unmerged |
+| `pr-unknown` | empty | no proof, and its pull requests could not be looked up (for example, `gh` failed) |
+| `symref` | the aliases' branch names, space-separated | a symbolic ref under `refs/heads` points at it |
 | `too-new` | reflog time, or empty without a reflog | proven only by ancestry, but younger than `--min-age` |
 | `current-worktree` | worktree path | checked out in the checkout cleanup runs from |
 | `checked-out` | worktree path | checked out in a worktree cleanup may not remove |
 | `main-worktree`, `locked`, `dirty`, `hidden` | worktree path | that worktree must stay |
 | `operation` | operation name | the worktree has an active rebase, merge, or similar |
+| `submodule` | worktree path | the worktree has a populated submodule, which Git cannot remove |
 | `in-use` | process ID | a process's working directory is in the worktree |
 | `uninspectable` | worktree path or empty | Git or the process view could not be read |
 | `branch-changed`, `reserved` | path or empty | the branch moved or was checked out during cleanup |
@@ -591,13 +610,14 @@ diagnostics on stderr:
 Every selected worktree gets exactly one `remove-worktree`,
 `would-remove-worktree`, or `keep-worktree` record (two spellings of the same
 worktree select it once). A `keep-worktree` carries the code that kept its
-branch (or the gate code that kept the checkout) with the same detail as above,
-`merge-unproven` with the branch name, `current-worktree`, `main-worktree`,
-`missing` (the path or its directory is gone), `not-linked` (not a linked
-worktree of this repository, including a subdirectory of one),
-`unreachable-head` with the detached HEAD's OID, or `pr-unknown` with the
-branch when a requested retirement could not confirm that no open pull request
-holds it. Retirement codes are `requested`, `upstream-gone`, `closed-pr`, or,
+branch (or the gate code that kept the checkout) with the same detail as
+above, except that `merge-unproven`, `closed-pr`, `pr-unknown`, and `symref`
+carry the branch name. Other `keep-worktree` codes are `current-worktree`,
+`main-worktree`, `missing` (the path or its directory is gone), `not-linked`
+(not a linked worktree of this repository, including a subdirectory of one),
+and `unreachable-head` with the detached HEAD's OID. `pr-unknown` also keeps a
+requested retirement that could not confirm that no open pull request holds
+the branch. Retirement codes are `requested`, `upstream-gone`, `closed-pr`, or,
 for a detached HEAD, its merge proof.
 
 Worktree subjects are the paths Git's worktree list records, and selection
@@ -641,7 +661,12 @@ branch that advances during cleanup. It also keeps a worktree whose own index
 or HEAD lock is held, and keeps every branch while any worktree holds one,
 because a `git switch` in progress holds those locks after it has resolved the
 branch it checks out. A lock left behind by a crashed Git keeps branches until
-it is removed.
+it is removed. Switching to or fast-forwarding the base never overwrites an
+ignored file (a local `.env`, say) with a newly tracked one. In the invoking
+checkout the command then stops with status 2, back where it started (the
+message says so if switching back failed); a base checked out in another
+worktree is left not updated, as the summary says. It also refuses to switch
+away from a branch with no commits yet.
 
 ### `git stash-audit`
 

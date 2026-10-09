@@ -1,8 +1,10 @@
 # Bash completion for git-cleanup-repo
 # shellcheck shell=bash disable=SC2207
 
+# --base names a branch on the remote; local branch names are the useful
+# candidates (a remote-tracking name such as origin/main is not one).
 _git_cleanup_repo_refs() {
-  git for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null
+  git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null
 }
 
 _git_cleanup_repo_remotes() {
@@ -28,9 +30,12 @@ _git_cleanup_repo() {
       COMPREPLY=($(compgen -d -- "$cur"))
       return
       ;;
+    --min-age)
+      return
+      ;;
   esac
 
-  COMPREPLY=($(compgen -W "-b --base -r --remote --gone -a --all --remove-worktrees --worktree --no-update-base --no-fetch --porcelain --min-age --retire-worktree --include-closed -n --dry-run -h --help" -- "$cur"))
+  COMPREPLY=($(compgen -W "-b --base -r --remote --gone -a --all --remove-worktrees --worktree --no-update-base --no-fetch --porcelain --min-age --retire-worktree --include-closed -n --dry-run --interface-version -h --help" -- "$cur"))
 }
 
 complete -F _git_cleanup_repo git-cleanup-repo

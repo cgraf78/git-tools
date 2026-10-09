@@ -32,9 +32,11 @@ GT_WORKTREE_FAILED_LOCKED=0
 gt_default_branch() {
   local remote="${1:-origin}" ref candidate
 
-  ref=$(git symbolic-ref -q --short "refs/remotes/$remote/HEAD" 2>/dev/null || true)
-  if [[ "$ref" == "$remote/"* ]]; then
-    printf '%s\n' "${ref#"$remote"/}"
+  # Full ref names: --short would render an ambiguous name (one a tag or
+  # local branch shares) as remotes/<remote>/<branch>.
+  ref=$(git symbolic-ref -q "refs/remotes/$remote/HEAD" 2>/dev/null || true)
+  if [[ "$ref" == "refs/remotes/$remote/"?* ]]; then
+    printf '%s\n' "${ref#"refs/remotes/$remote"/}"
     return 0
   fi
 

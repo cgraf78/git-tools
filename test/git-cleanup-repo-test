@@ -5578,6 +5578,60 @@ dp_out=$(git -C "$dp_repo" cleanup-repo 2>&1)
 _assert_contains "a sparse base worktree is left not updated" "main not updated" "$dp_out"
 _assert_eq "the sparse base worktree's ignored file survives" local "$(cat "$dp_wt/.env")"
 
+# The predictor batches its untracked-file lookups: 600 occupied paths that
+# are all tracked predict success, and one untracked file past the first batch
+# still blocks.
+bp_out=$(
+  bp_repo=$(_tmpdir)
+  _git_init "$bp_repo"
+  git -C "$bp_repo" commit -q --allow-empty -m seed
+  from=$(git -C "$bp_repo" rev-parse HEAD)
+  for i in $(seq 1 600); do printf '%s\n' "$i" >"$bp_repo/f$i"; done
+  git -C "$bp_repo" add .
+  git -C "$bp_repo" commit -q -m many
+  to=$(git -C "$bp_repo" rev-parse HEAD)
+  cd "$bp_repo" || exit 1
+  # shellcheck source=../lib/git-tools-base.sh
+  . "$ROOT/lib/git-tools-base.sh"
+  # shellcheck source=../lib/git-tools-cleanup.sh
+  . "$ROOT/lib/git-tools-cleanup.sh"
+  gt_checkout_would_succeed "" "$from" "$to" && printf 'clear\n' || printf 'blocked\n'
+  printf 'x\n' >"$bp_repo/zz-late"
+  git -C "$bp_repo" rm -q --cached f600
+  git -C "$bp_repo" commit -q -m drop
+  late_from=$(git -C "$bp_repo" rev-parse HEAD)
+  printf '600\n' >"$bp_repo/f600"
+  gt_checkout_would_succeed "" "$late_from" "$to" && printf 'clear\n' || printf 'blocked\n'
+)
+_assert_eq "tracked occupied paths in many batches predict success; a late untracked one blocks" \
+  "$(printf 'clear\nblocked')" "$bp_out"
+
+# A tag sharing a branch's name must not hide the branch's keep reason from
+# its selected worktree.
+tc_repo=$(_clone_remote)
+tc_wt=$(_tmpdir)
+rm -rf "$tc_wt"
+git -C "$tc_repo" worktree add --quiet "$tc_wt" -b tc-feat
+git -C "$tc_repo" tag tc-feat
+tc_out=$(git -C "$tc_repo" cleanup-repo --no-update-base --min-age 1 --worktree "$tc_wt" \
+  --porcelain 2>/dev/null)
+_assert_contains "a branch named like a tag keeps its worktree as too-new" \
+  $'keep-worktree\t'"$tc_wt"$'\ttoo-new' "$tc_out"
+
+# A local branch literally named origin/main does not hide origin/HEAD.
+amb_out=$(
+  amb_repo=$(_clone_remote)
+  git -C "$amb_repo" push --quiet origin main:develop
+  git -C "$amb_repo" fetch --quiet origin
+  git -C "$amb_repo" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/develop
+  git -C "$amb_repo" branch --quiet origin/develop main
+  cd "$amb_repo" || exit 1
+  # shellcheck source=../lib/git-tools-base.sh
+  . "$ROOT/lib/git-tools-base.sh"
+  gt_default_branch origin
+)
+_assert_eq "origin/HEAD resolves despite an ambiguous local branch" develop "$amb_out"
+
 # The interface version is pinned, so an unintended change fails here.
 _assert_eq "--interface-version is 1" 1 "$(git-cleanup-repo --interface-version)"
 

@@ -553,43 +553,47 @@ gt_worktree_is_sparse() {
 # the untracked-file listing runs in the target worktree. A lookup failure
 # predicts success, leaving any refusal to Git.
 gt_checkout_would_succeed() {
-  local path="$1" from="$2" to="$3" top meta added parent
-  local -a wt_git=(git)
+  local path="$1" from="$2" to="$3" top meta added parent blocker listed i
+  local -a wt_git=(git) candidates=()
 
   [[ -z "$path" ]] || wt_git=(gt_git_without_local_env -C "$path")
   top=$("${wt_git[@]}" rev-parse --show-toplevel 2>/dev/null) || return 0
   [[ -n "$from" ]] || from=$(git hash-object -t tree --stdin </dev/null) || return 0
   # Raw records: ":<old mode> <new mode> <old oid> <new oid> A" NUL <path> NUL.
+  # Collect the occupied paths first, then ask Git about them in batches: a
+  # landing after a long gap can add thousands of paths that already exist as
+  # tracked files, and one Git process per path would take tens of seconds.
   while IFS= read -r -d '' meta && IFS= read -r -d '' added; do
     if [[ "$meta" == *" 160000 "* && -d "$top/$added" && ! -L "$top/$added" ]]; then
       continue
     fi
-    _gt_untracked_in_way "$top" "$added" && return 1
+    # Something other than a directory above the path blocks it; only that
+    # one is asked about, since Git rejects a pathspec beyond a symlink.
+    blocker=""
     parent=$added
     while [[ "$parent" == */* ]]; do
       parent=${parent%/*}
       if [[ -e "$top/$parent" || -L "$top/$parent" ]] &&
         [[ ! -d "$top/$parent" || -L "$top/$parent" ]]; then
-        _gt_untracked_in_way "$top" "$parent" && return 1
+        blocker=$parent
       fi
     done
+    if [[ -n "$blocker" ]]; then
+      candidates+=(":(top,literal)$blocker")
+    elif [[ -e "$top/$added" || -L "$top/$added" ]]; then
+      candidates+=(":(top,literal)$added")
+    fi
   done < <(git diff-tree -r -z --no-renames --diff-filter=A "$from" "$to" \
     2>/dev/null)
+  # `ls-files -o` lists untracked and ignored files alike (no exclude rules
+  # given) and nothing tracked. An empty candidate list must not reach it,
+  # since no pathspec would list the whole worktree.
+  for ((i = 0; i < ${#candidates[@]}; i += 500)); do
+    listed=$(gt_git_without_local_env -C "$top" ls-files -o -- \
+      "${candidates[@]:i:500}" 2>/dev/null) || return 0
+    [[ -z "$listed" ]] || return 1
+  done
   return 0
-}
-
-# Succeed when an untracked or ignored file occupies path $2 (relative to the
-# worktree top $1). Cheap disk test first; only an existing path pays for the
-# Git lookup, which lists untracked and ignored files alike (no exclude rules
-# given) and nothing tracked. Only emptiness matters, so no -z (Bash would
-# warn about the NULs).
-_gt_untracked_in_way() {
-  local top="$1" rel="$2" listed
-
-  [[ -e "$top/$rel" || -L "$top/$rel" ]] || return 1
-  listed=$(gt_git_without_local_env -C "$top" ls-files -o -- \
-    ":(top,literal)$rel" 2>/dev/null) || return 1
-  [[ -n "$listed" ]]
 }
 
 # Succeed (0) when `git worktree remove` would refuse the worktree for its

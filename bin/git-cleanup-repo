@@ -1225,8 +1225,11 @@ _retire_worktrees() {
     head_oid=$(gt_git_without_local_env -C "$path" rev-parse --verify -q \
       HEAD 2>/dev/null) || head_oid=""
     status=0
-    branch=$(gt_git_without_local_env -C "$path" symbolic-ref -q --short \
-      HEAD 2>/dev/null) || status=$?
+    # Strip refs/heads/ by hand: --short turns the name into heads/<name>
+    # when a tag shares it, which would match no decided branch.
+    branch=$(gt_git_without_local_env -C "$path" symbolic-ref -q HEAD \
+      2>/dev/null) || status=$?
+    branch=${branch#refs/heads/}
     if [[ -z "$head_oid" || "$status" -gt 1 ]]; then
       _keep_worktree "$path" uninspectable "" "could not read its HEAD"
       continue

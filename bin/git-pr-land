@@ -479,7 +479,9 @@ gt_require_repo
 gt_refuse_external_checkout "$_dry_run"
 gt_find_current_worktree || gt_die "could not resolve current worktree"
 _invoking_worktree=$GT_WORKTREE_PATH
-_invoking_branch=$(git symbolic-ref -q --short HEAD) || _invoking_branch=""
+# Strip refs/heads/ by hand: --short yields heads/<name> when a tag shares it.
+_invoking_branch=$(git symbolic-ref -q HEAD) || _invoking_branch=""
+_invoking_branch=${_invoking_branch#refs/heads/}
 gt_require_gh
 _status=$(GIT_OPTIONAL_LOCKS=0 git status --porcelain) ||
   gt_die "could not inspect worktree status"

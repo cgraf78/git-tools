@@ -275,35 +275,35 @@ may switch to it, and a linked worktree never does, advancing only the base ref
 when nothing has it checked out. Any update to another checkout is reported.
 Neither the switch nor the fast-forward overwrites an ignored file (a local
 `.env`) with a newly tracked one; the base is then left for you, and the
-diagnostic says the PR already merged. The command refuses before merging when the worktree that would receive the
-base has local changes or an active operation, or when a rebase or bisect
-reserves the base. A base checked out in a main worktree whose files live
-outside its Git directory (such as a `core.worktree` dotfiles checkout) is
-never touched or inspected; it is reported with a `not updating` message.
-The command refuses to run, before merging, in a main checkout that Git
-reaches only through `GIT_DIR`/`GIT_WORK_TREE` or `core.worktree` (a dotfiles
-checkout of `$HOME`, which a Git launcher may route any directory into): land
-from a linked worktree of that repository instead. Checkouts whose `.git`
-directory or file leads back to their Git directory, including separate Git
-directories and submodules, are not affected. A dry run makes the same local
-checks and, where the real run would refuse, reports `would refuse: <reason>`
-and exits 1 instead of describing a landing.
-If GitHub reports an error after completing the server-side merge,
-the command rechecks structured PR state and identifies any remaining work as
-incomplete cleanup instead of incorrectly reporting that the merge failed.
-After a successful merge, the local PR head is deleted when it is exactly the
-landed head, or an earlier snapshot of it that tracks the PR head, through the
-same engine as
-`git cleanup-repo`: a clean linked worktree holding it is removed first, while
-the current worktree, a worktree with local content or an active operation, or
-one a process is using keeps the branch. A local head with commits the landed
-head lacks is kept and reported. Git has no portable primitive that serializes
-branch deletion with a checkout that already resolved the ref, so deletion is
-also refused while any worktree of the repository holds an index or HEAD lock,
-which a checkout in progress does. Use `--keep-branch` to keep the local head
-and its worktree. Remote deletion stays manual: a repository-scoped open-PR
-query cannot prove that a fork head is unused by PRs targeting another base
-repository, and a new consumer can appear after any query.
+diagnostic says the PR already merged. The command refuses before merging when
+the worktree that would receive the base has local changes or an active
+operation, or when a rebase or bisect reserves the base. A base checked out in
+a main worktree whose files live outside its Git directory (such as a
+`core.worktree` dotfiles checkout) is never touched or inspected; it is
+reported with a `not updating` message. The command refuses to run, before
+merging, in a main checkout that Git reaches only through
+`GIT_DIR`/`GIT_WORK_TREE` or `core.worktree` (a dotfiles checkout of `$HOME`,
+which a Git launcher may route any directory into): land from a linked worktree
+of that repository instead. Checkouts whose `.git` directory or file leads back
+to their Git directory, including separate Git directories and submodules, are
+not affected. A dry run makes the same local checks and, where the real run
+would refuse, reports `would refuse: <reason>` and exits 1 instead of
+describing a landing. If GitHub reports an error after completing the
+server-side merge, the command rechecks structured PR state and identifies any
+remaining work as incomplete cleanup instead of incorrectly reporting that the
+merge failed. After a successful merge, the local PR head is deleted when it is
+exactly the landed head, or an earlier snapshot of it that tracks the PR head,
+through the same engine as `git cleanup-repo`: a clean linked worktree holding
+it is removed first, while the current worktree, a worktree with local content
+or an active operation, or one a process is using keeps the branch. A local
+head with commits the landed head lacks is kept and reported. Git has no
+portable primitive that serializes branch deletion with a checkout that already
+resolved the ref, so deletion is also refused while any worktree of the
+repository holds an index or HEAD lock, which a checkout in progress does. Use
+`--keep-branch` to keep the local head and its worktree. Remote deletion stays
+manual: a repository-scoped open-PR query cannot prove that a fork head is
+unused by PRs targeting another base repository, and a new consumer can appear
+after any query.
 
 ### `git pr-land-stack`
 
@@ -667,8 +667,11 @@ it is removed. Switching to or fast-forwarding the base never overwrites an
 ignored file (a local `.env`, say) with a newly tracked one. In the invoking
 checkout the command then stops with status 2, back where it started (the
 message says so if switching back failed); a base checked out in another
-worktree is left not updated, as the summary says. It also refuses to switch
-away from a branch with no commits yet.
+worktree is left not updated, as the summary says. In a sparse checkout Git
+would overwrite such a file with only a warning, so the command checks first
+there and holds back, possibly also for a path outside the sparse patterns that
+Git would have left alone. It also refuses to switch away from a branch with no
+commits yet.
 
 ### `git stash-audit`
 

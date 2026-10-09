@@ -514,9 +514,6 @@ _switch_to_base() {
   else
     origin=$(git rev-parse --verify -q HEAD 2>/dev/null) || origin=""
   fi
-  # A dry run cannot let Git refuse, so check up front whether moving the
-  # files from HEAD to the local base or the remote base would overwrite an
-  # untracked or ignored file.
   # A dry run cannot let Git refuse, and in a sparse checkout Git does not
   # refuse at all (it overwrites the file with a warning), so check first
   # in both cases. The switch moves HEAD to the local base (when one exists);

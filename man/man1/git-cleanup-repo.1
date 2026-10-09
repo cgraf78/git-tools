@@ -386,7 +386,10 @@ left by a crashed Git keeps branches until it is removed.
 Updating the base never overwrites an ignored file with a newly tracked one:
 in the invoking checkout the command stops with status 2, back where it
 started (the message says so if switching back failed), and a base checked out in another worktree is left not
-updated. It also refuses to switch away from a branch with no commits yet.
+updated. In a sparse checkout Git would overwrite such a file with only a
+warning, so the command checks first there and holds back, possibly also for a
+path outside the sparse patterns that Git would have left alone. It also
+refuses to switch away from a branch with no commits yet.
 Symbolic refs under
 .B refs/heads
 (aliases such as master pointing at main) and the branches they point at are

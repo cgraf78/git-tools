@@ -5561,6 +5561,23 @@ git -C "$dp_repo" switch --quiet -c dp-feat
 dry_vs_real "a sparse checkout with an ignored file at an added path refuses" 2 "$dp_repo"
 _assert_eq "the sparse checkout's ignored file survives" local "$(cat "$dp_repo/.env")"
 
+# A sparse base worktree: Git would overwrite its ignored file, so cleanup
+# leaves the base not updated and the file intact.
+IFS=$'\t' read -r dp_repo dp_other < <(dp_new)
+git -C "$dp_repo" switch --quiet -c dp-feat
+dp_wt=$(_tmpdir)
+rm -rf "$dp_wt"
+git -C "$dp_repo" worktree add --quiet "$dp_wt" main
+git -C "$dp_wt" sparse-checkout set --cone sub >/dev/null 2>&1
+_commit_file "$dp_other" .env remote "track .env"
+git -C "$dp_other" push --quiet origin main
+mkdir -p "$dp_repo/.git/info"
+printf '.env\n' >>"$dp_repo/.git/info/exclude"
+printf 'local\n' >"$dp_wt/.env"
+dp_out=$(git -C "$dp_repo" cleanup-repo 2>&1)
+_assert_contains "a sparse base worktree is left not updated" "main not updated" "$dp_out"
+_assert_eq "the sparse base worktree's ignored file survives" local "$(cat "$dp_wt/.env")"
+
 # The interface version is pinned, so an unintended change fails here.
 _assert_eq "--interface-version is 1" 1 "$(git-cleanup-repo --interface-version)"
 

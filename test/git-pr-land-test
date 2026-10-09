@@ -1577,6 +1577,85 @@ _assert_eq "landing never overwrites an ignored file in the base worktree" local
 _assert_eq "the base worktree is left where it was" "$ig_before" \
   "$(git -C "$ig_base" rev-parse HEAD)"
 
+# _track_env_upstream <remote>: the remote base starts tracking .env.
+_track_env_upstream() {
+  local remote="$1" updater
+  updater=$(_tmpdir) || return 1
+  git clone --quiet "$remote" "$updater"
+  git -C "$updater" config user.email test@test.com
+  git -C "$updater" config user.name Test
+  git -C "$updater" config core.hooksPath /dev/null
+  _commit_file "$updater" .env remote "track .env"
+  git -C "$updater" push --quiet origin main
+}
+# _ignore_env <repo> <dir>: an ignored local .env in dir.
+_ignore_env() {
+  mkdir -p "$1/.git/info"
+  printf '.env\n' >>"$1/.git/info/exclude"
+  printf 'local\n' >"$2/.env"
+}
+
+# Switching the main worktree to the base would overwrite an ignored .env:
+# the landing completes, the checkout stays on its branch, and the file
+# survives.
+mw_repo=$(_tmpdir)
+mw_remote=$(_tmpdir)
+mw_log=$(_tmpdir)/gh.log
+_init_repo "$mw_repo" "$mw_remote"
+_track_env_upstream "$mw_remote"
+_ignore_env "$mw_repo" "$mw_repo"
+mw_rc=0
+result=$(GH_LOG="$mw_log" PATH="$bin_dir:$PATH" _pr_land "$mw_repo" 4 2>&1) || mw_rc=$?
+_assert_eq "a base switch over an ignored file leaves cleanup incomplete" 1 "$mw_rc"
+_assert_contains "the diagnostic says the PR merged" "PR #4 merged; cleanup incomplete" "$result"
+_assert_eq "the ignored file in the main worktree survives" local "$(cat "$mw_repo/.env")"
+_assert_eq "the main worktree stays on its branch" feature \
+  "$(git -C "$mw_repo" branch --show-current)"
+
+# A dry run predicts it without claiming the PR merged.
+dm_repo=$(_tmpdir)
+dm_remote=$(_tmpdir)
+dm_log=$(_tmpdir)/gh.log
+_init_repo "$dm_repo" "$dm_remote"
+_track_env_upstream "$dm_remote"
+git -C "$dm_repo" fetch --quiet origin
+_ignore_env "$dm_repo" "$dm_repo"
+dm_rc=0
+result=$(GH_LOG="$dm_log" PATH="$bin_dir:$PATH" _pr_land "$dm_repo" 4 --dry-run 2>&1) ||
+  dm_rc=$?
+_assert_eq "a dry run predicts the incomplete cleanup" 1 "$dm_rc"
+_assert_contains "the dry run says it would merge" \
+  "would merge PR #4, but cleanup would be incomplete" "$result"
+_assert_not_contains "the dry run never claims the PR merged" "PR #4 merged" "$result"
+
+# A dry run whose remote base advanced but was never fetched still runs.
+du_repo=$(_tmpdir)
+du_remote=$(_tmpdir)
+du_log=$(_tmpdir)/gh.log
+_init_repo "$du_repo" "$du_remote"
+_advance_remote_main "$du_remote" >/dev/null
+du_rc=0
+result=$(GH_LOG="$du_log" PATH="$bin_dir:$PATH" _pr_land "$du_repo" 4 --dry-run 2>&1) ||
+  du_rc=$?
+_assert_not_contains "a dry run with an unfetched base advance inspects the local base" \
+  "could not inspect local base branch" "$result"
+_assert_eq "a dry run with an unfetched base advance succeeds" 0 "$du_rc"
+
+# A sparse base worktree would have Git overwrite the ignored file with only a
+# warning; the landing leaves the base and keeps the file.
+sp_repo=$(_tmpdir)
+sp_remote=$(_tmpdir)
+sp_base="$(_tmpdir)/base"
+sp_log=$(_tmpdir)/gh.log
+_init_repo "$sp_repo" "$sp_remote"
+git -C "$sp_repo" worktree add --quiet "$sp_base" main
+git -C "$sp_base" sparse-checkout set --cone sub >/dev/null 2>&1
+_track_env_upstream "$sp_remote"
+_ignore_env "$sp_repo" "$sp_base"
+GH_LOG="$sp_log" PATH="$bin_dir:$PATH" _pr_land "$sp_repo" 4 >/dev/null 2>&1
+_assert_eq "a sparse base worktree's ignored file survives landing" local \
+  "$(cat "$sp_base/.env")"
+
 # A detached bisect that reserves the base is never merged into.
 rd_repo=$(_tmpdir)
 rd_remote=$(_tmpdir)

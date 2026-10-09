@@ -162,10 +162,13 @@ umask "$_old_umask"
 if ((${#_commit_oids[@]} == 1)); then
   # One commit already has the exact title/body structure GitHub needs. Avoid
   # opening an editor so the common typo-fix workflow stays as cheap as push.
-  _title=$(git show -s --format=%s "${_commit_oids[0]}") ||
+  # --no-show-signature: log.showSignature would add verification lines to
+  # the PR text.
+  _title=$(git show -s --no-show-signature --format=%s "${_commit_oids[0]}") ||
     gt_die "could not read the commit subject"
   [[ -n "$_title" ]] || gt_die "commit subject cannot be empty"
-  git show -s --format=%b "${_commit_oids[0]}" >"$_cleanup_file" ||
+  git show -s --no-show-signature --format=%b "${_commit_oids[0]}" \
+    >"$_cleanup_file" ||
     gt_die "could not read the commit body"
   _body_file=$_cleanup_file
 else
@@ -180,7 +183,8 @@ else
     # Git's pretty-printer adds its own record terminator after the commit
     # message. Normalize each message independently so separators and the
     # unchanged-buffer fingerprint do not depend on incidental blank lines.
-    git show -s --format=%B "$_oid" | git stripspace >>"$_cleanup_file" ||
+    git show -s --no-show-signature --format=%B "$_oid" | git stripspace \
+      >>"$_cleanup_file" ||
       gt_die "could not seed PR text from commit $_oid"
     _first=0
   done

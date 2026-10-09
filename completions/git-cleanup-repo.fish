@@ -19,7 +19,7 @@ complete -c git-cleanup-repo -l no-update-base -d "Prove against the remote base
 complete -c git-cleanup-repo -l no-fetch -d "Prove against the remote-tracking base ref instead of fetching"
 complete -c git-cleanup-repo -l porcelain -d "Print one tab-separated record per decision"
 complete -c git-cleanup-repo -l min-age -r -d "Keep young ancestry-only branches"
-complete -c git-cleanup-repo -l retire-worktree -r -F -d "Remove this linked worktree but keep its branch"
+complete -c git-cleanup-repo -l retire-worktree -r -F -d "Remove this linked worktree on request"
 complete -c git-cleanup-repo -l include-closed -d "Retire selected worktrees of closed, unmerged PRs"
 complete -c git-cleanup-repo -s n -l dry-run -d "Print deletion actions without changing anything"
 complete -c git-cleanup-repo -l interface-version -d "Print the porcelain interface version"

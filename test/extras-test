@@ -304,6 +304,54 @@ _assert_contains "fish cleanup describes worktree removal" \
   'remove-worktrees -d "Remove eligible linked worktrees for deleted branches"' \
   "$ROOT/completions/git-cleanup-repo.fish"
 
+# Every git-cleanup-repo option the parser accepts is documented in --help and
+# the man page and offered by all three completions, and none of those name an
+# option the parser lacks. Each extractor prints one option per line.
+_words() {
+  tr '|' ' ' | tr -s ' ' '\n' | grep -E '^--?[a-z][a-z-]*$' | LC_ALL=C sort -u
+}
+_cleanup_parser_options() {
+  sed -n '/^_parse_args() {/,/^}/p' "$ROOT/bin/git-cleanup-repo" |
+    grep -E '^ +[-a-z |=*]+\)$' | sed -e 's/)$//' -e 's/=\*//g' | _words
+}
+# Option rows start at column 3 (`-b, --base`) or 7 (`--gone`); a
+# description continued onto a line of its own may start with an option name
+# too, deeper in.
+_cleanup_help_options() {
+  "$ROOT/bin/git-cleanup-repo" --help | sed -n '/^Options:/,/^$/p' |
+    sed -nE 's/^(  (-[a-z]), |      )(--[a-z][a-z-]*).*/\2 \3/p' | _words
+}
+# The man page names an option in the line after each .TP tag; options named
+# in descriptions (--force, say) are not options of this command.
+_cleanup_man_options() {
+  sed -n '/^\.SH OPTIONS/,/^\.SH PORCELAIN/p' "$ROOT/man/man1/git-cleanup-repo.1" |
+    awk 'tagged { print; tagged = 0 } /^\.TP/ { tagged = 1 }' | sed 's/\\-/-/g' |
+    grep -oE -- '(^|[ "])--?[a-z][a-z-]*' | tr -d ' "' | _words
+}
+_cleanup_bash_options() {
+  sed -n 's/.*compgen -W "\(-[^"]*\)".*/\1/p' "$ROOT/completions/git-cleanup-repo.bash" |
+    _words
+}
+# A leading '(...)' group lists the options a spec excludes, not the ones it
+# offers.
+_cleanup_zsh_options() {
+  grep -E "^    '" "$ROOT/completions/git-cleanup-repo.zsh" |
+    sed -e "s/^    '([^)]*)'//" -e 's/\[.*//' | grep -oE -- '--?[a-z][a-z-]*' | _words
+}
+_cleanup_fish_options() {
+  grep -E '^complete ' "$ROOT/completions/git-cleanup-repo.fish" |
+    sed -E 's/ -d .*//' | grep -oE -- ' -[sl] [a-z][a-z-]*' |
+    sed -E 's/ -s /-/; s/ -l /--/' | _words
+}
+cleanup_options=$(_cleanup_parser_options)
+# An extractor that finds nothing would make every surface trivially agree.
+_assert_eq "the cleanup option extractor finds short and long options" 2 \
+  "$(printf '%s\n' "$cleanup_options" | grep -cxE -- '-b|--retire-worktree')"
+for cleanup_surface in help man bash zsh fish; do
+  _assert_eq "git-cleanup-repo $cleanup_surface lists exactly the parser's options" \
+    "$cleanup_options" "$("_cleanup_${cleanup_surface}_options")"
+done
+
 prefix=$(_tmpdir)
 install_out=$(_tmpdir)/install.out
 PREFIX="$prefix" "$ROOT/install.sh" >"$install_out" 2>&1

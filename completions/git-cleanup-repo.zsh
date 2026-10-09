@@ -25,7 +25,7 @@ _git_cleanup_repo() {
     '--no-fetch[Prove against the remote-tracking base ref instead of fetching]' \
     '--porcelain[Print one tab-separated record per decision]' \
     '--min-age[Keep young ancestry-only branches]:days' \
-    '*--retire-worktree[Remove this linked worktree but keep its branch]:worktree:_files -/' \
+    '*--retire-worktree[Remove this linked worktree on request]:worktree:_files -/' \
     '--include-closed[Retire selected worktrees of closed, unmerged PRs]' \
     '(-n --dry-run)'{-n,--dry-run}'[Print deletion actions without changing anything]' \
     '--interface-version[Print the porcelain interface version]' \

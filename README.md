@@ -244,7 +244,8 @@ git pr-restack 123 --base main --fork parent-branch
 
 Verifies and merges one ready GitHub PR, syncs the base branch locally, and
 deletes the local PR head when every local commit is in what landed. Remote PR
-heads are retained and reported with exact OIDs for manual cleanup.
+heads are retained and reported for manual cleanup, with their exact OID when a
+configured remote maps to the head repository.
 
 ```sh
 git pr-land 123
@@ -383,8 +384,9 @@ preview cleanup with `git cleanup-repo --dry-run` instead.
 
 ### `git cleanup-repo`
 
-Resolves the remote's fetch endpoint, fetches the exact default-branch ref, then
-deletes stale local branches whose exact OIDs are proven merged.
+Resolves the remote's fetch endpoint, fetches the exact base ref (the remote's
+default branch unless `--base` names another), then deletes stale local
+branches whose exact OIDs are proven merged.
 
 ```sh
 git cleanup-repo
@@ -409,17 +411,27 @@ through `ssh -G`), a branch whose tip belongs to a merged pull request on the
 base also counts (`merged-pr`): the PR's own commit list must contain the tip
 and its merge commit must be in the pinned base, so an earlier snapshot of a
 squash-merged PR is recognized. An open PR containing the tip, or named after
-the branch, keeps it (`open-pr`). Missing tools, API failures, and `--no-fetch`
-simply leave this evidence out. The complete branch and upstream-state
-inventory is validated before the first mutation. Each candidate is rechecked
-before deletion, and the ref is deleted only if it still has the exact proven
-OID. Use `--gone` to also select branches whose own remote branch (the same
-name on a real remote) is gone. A branch that tracks a different branch, such
-as the base it was cut from, is never selected that way, because its upstream's
-deletion says nothing about its own commits; neither is one whose upstream was
-a default branch (`main`, `master`, `trunk`, or the branch the
-remote's recorded `HEAD` names), since a default branch disappears when it is
-renamed, not after landing. Symbolic refs under `refs/heads` (an alias such as
+the branch, keeps it (`open-pr`). Missing tools, a host `gh` has no credential
+for, and `--no-fetch` leave this evidence out; a failed lookup keeps the branch
+(`pr-unknown`). The complete branch and upstream-state inventory is validated
+before the first mutation. Each candidate is rechecked before deletion, and the
+ref is deleted only if it still has the exact proven OID. Use `--gone` to also
+select branches whose own remote branch (the same name on a real remote) is
+gone. A branch that tracks a different branch, such as the base it was cut from,
+is never selected that way, because its upstream's deletion says nothing about
+its own commits; neither is one whose upstream was a default branch (`main`,
+`master`, `trunk`, or the branch the remote's recorded `HEAD` names), since a
+default branch disappears when it is renamed, not after landing. A gone upstream
+says the remote branch was retired, not that every local commit reached it, so
+with pull request evidence `--gone` also keeps a branch whose tip GitHub has
+never seen (`unpublished`: it holds commits made after the remote branch went)
+or whose lookup failed (`pr-unknown`). For a github.com remote, or a host `gh`
+holds a credential for, that means `--gone` deletes nothing it cannot prove
+otherwise while its pull request lookups fail (offline, or logged out of
+github.com; logging out of another host removes its credential, and with it
+the evidence). Without that evidence (no `gh` or
+`jq`, any other host, or `--no-fetch`), `--gone` still deletes such a branch and
+drops its unpushed commits. Symbolic refs under `refs/heads` (an alias such as
 `master` pointing at `main`) and the branches they point at are never deleted.
 The command deliberately does not run configured fetch or prune mappings;
 refresh other remote-tracking state separately when needed.
@@ -507,7 +519,45 @@ elsewhere is not detected. Unknown untracked
 or ignored content still blocks removal, and removal never uses `--force`.
 Git's own final clean check is run with untracked files visible, so a file
 created after these checks stops the removal even in a repository that sets
-`status.showUntrackedFiles=no`:
+`status.showUntrackedFiles=no`. A worktree's HEAD reflog and its own refs
+(`refs/worktree/*`, `refs/bisect/*`, `refs/rewritten/*`) go with it, so one
+whose reflog or refs hold a commit that no branch, tag, or remote branch
+reaches is kept (`unique-commits`). Precisely:
+
+- Always protected: commits held by the worktree's `refs/worktree/*`,
+  `refs/bisect/*`, or `refs/rewritten/*` that no branch, tag, remote branch,
+  or the stash reaches; none of the exceptions below apply to them.
+- Protected: every commit the HEAD reflog names, on either side of any entry
+  (a checkout, reset, amend, rebase, or a tool's own `GIT_REFLOG_ACTION`), on
+  a branch or detached. Old sides are read from the reflog file itself: after
+  gc expires old entries, a surviving entry's old side can be the only record
+  of a commit, and Git keeps it alive through that entry. With reftable
+  reflogs there is no such file, so a worktree whose HEAD reflog has entries
+  is kept (`uninspectable`).
+- Not protected, because their loss is accepted elsewhere or they were
+  replaced:
+  - commits a branch, tag, remote branch, or the stash reaches;
+  - commits named by the reflog of a branch that still exists or that the
+    same run deletes (an amended, reset, or rebased branch tip): deleting
+    that branch, not this removal, drops them, and a dry run judges them the
+    same way;
+  - the current HEAD's history, which the removal reason covers;
+  - the tips of branches the same run deletes;
+  - commits whose work is proven in the base by the same proofs that delete
+    branches, and the commits they were built on, such as an earlier branch
+    of the worktree that was squash-merged and deleted since. Proofs run
+    after the cheaper checks; once eight have failed, the rest stay
+    protected;
+  - commits replaced rather than discarded: an amend, or a rebase step that
+    makes a new commit (`rebase (pick)`, `rebase -i (fixup)`, `pull --rebase
+    origin main (pick)`, and reword, edit, squash, merge, or continue), moved
+    HEAD from the commit to one that is safe. A reset, a rebase's reset or
+    abort, or a checkout discards or leaves, so detached work reset away
+    (even to a newer `origin/main`) keeps the worktree;
+  - clean copies an aborted rebase made (pick, reword, edit, fixup, squash):
+    their originals are still on the branch or the tip it returned to. A copy
+    excuses only itself, so a conflict resolved and continued before the
+    abort, and commits made or amended by hand during it, stay protected.
 
 ```sh
 git cleanup-repo --all --remove-worktrees
@@ -571,7 +621,17 @@ caller can apply its own policy, such as an age limit, to which checkouts may
 go; an explicit `--remove-worktrees` alongside it still removes every eligible
 worktree. `--interface-version` prints an integer that grows whenever the
 options, records, codes, or exit statuses gain or change anything a caller
-relies on, so a driver can require a version instead of probing for options.
+relies on, so a driver can require a version instead of probing for options:
+
+- 1: exit status 3; the `pr-unknown`, `closed-pr`, `symref`, and `submodule`
+  codes; the `default-upstream-gone` detail; `pr-unknown` keeping a requested
+  retirement; following a renamed remote default branch.
+- 2: the `unpublished` and `unique-commits` codes; `pr-unknown` and
+  `unpublished` keeping a branch from `--gone` and its worktree from
+  upstream-gone retirement; `--min-age` dating a branch whose reflog expired
+  by its tip's commit (so `too-new` can carry a commit time); `submodule` also
+  covering files in an unpopulated submodule directory.
+
 `--porcelain` prints one record per decision on stdout and leaves only
 diagnostics on stderr:
 
@@ -594,15 +654,17 @@ diagnostics on stderr:
 | `merge-unproven` | `upstream-gone`, `default-upstream-gone`, `other-upstream-gone`, `upstream`, or `no-upstream` | no proof; the detail is the upstream state (`default-upstream-gone`: its own upstream was a default branch and is gone, which `--gone` never selects) |
 | `open-pr` | PR number | an open pull request contains the tip or is named after the branch |
 | `closed-pr` | PR number | no proof, and a pull request containing the tip was closed unmerged |
-| `pr-unknown` | empty | no proof, and its pull requests could not be looked up (for example, `gh` failed) |
+| `pr-unknown` | empty | no proof, and its pull requests could not be looked up (for example, `gh` failed); `--gone` keeps it too |
+| `unpublished` | empty | no proof, and its own upstream is gone, but GitHub has never seen its tip, so it holds commits that were never pushed; `--gone` keeps it |
 | `symref` | the aliases' branch names, space-separated | a symbolic ref under `refs/heads` points at it |
-| `too-new` | reflog time, or empty without a reflog | proven only by ancestry, but younger than `--min-age` |
+| `too-new` | reflog time (the tip's commit time once the reflog expired), or empty when the age is unknown | proven only by ancestry, but younger than `--min-age` |
 | `current-worktree` | worktree path | checked out in the checkout cleanup runs from |
 | `checked-out` | worktree path | checked out in a worktree cleanup may not remove |
 | `main-worktree`, `locked`, `dirty`, `hidden` | worktree path | that worktree must stay |
 | `operation` | operation name | the worktree has an active rebase, merge, or similar |
-| `submodule` | worktree path | the worktree has a populated submodule, which Git cannot remove |
+| `submodule` | worktree path | the worktree has a populated submodule, which Git cannot remove, or files in an unpopulated submodule's directory, which status does not show and Git would remove |
 | `in-use` | process ID | a process's working directory is in the worktree |
+| `unique-commits` | a commit OID | the worktree's own refs (`refs/worktree`, `refs/bisect`, `refs/rewritten`), or its HEAD reflog, hold a commit no branch, tag, or remote branch reaches and no exception excuses (see `--remove-worktrees`) |
 | `uninspectable` | worktree path or empty | Git or the process view could not be read |
 | `branch-changed`, `reserved` | path or empty | the branch moved or was checked out during cleanup |
 | `checkout-in-flight` | lock path | a Git command holds an index or HEAD lock, so a checkout may be in progress |
@@ -612,15 +674,15 @@ diagnostics on stderr:
 Every selected worktree gets exactly one `remove-worktree`,
 `would-remove-worktree`, or `keep-worktree` record (two spellings of the same
 worktree select it once). A `keep-worktree` carries the code that kept its
-branch (or the gate code that kept the checkout) with the same detail as
-above, except that `merge-unproven`, `closed-pr`, `pr-unknown`, and `symref`
-carry the branch name. Other `keep-worktree` codes are `current-worktree`,
-`main-worktree`, `missing` (the path or its directory is gone), `not-linked`
-(not a linked worktree of this repository, including a subdirectory of one),
-and `unreachable-head` with the detached HEAD's OID. `pr-unknown` also keeps a
-requested retirement that could not confirm that no open pull request holds
-the branch. Retirement codes are `requested`, `upstream-gone`, `closed-pr`, or,
-for a detached HEAD, its merge proof.
+branch (or the gate code that kept the checkout) with the same detail as above,
+except that `merge-unproven`, `closed-pr`, `pr-unknown`, `unpublished`, and
+`symref` carry the branch name. Other `keep-worktree` codes are
+`current-worktree`, `main-worktree`, `missing` (the path or its directory is
+gone), `not-linked` (not a linked worktree of this repository, including a
+subdirectory of one), and `unreachable-head` with the detached HEAD's OID.
+`pr-unknown` also keeps a requested retirement that could not confirm that no
+open pull request holds the branch. Retirement codes are `requested`,
+`upstream-gone`, `closed-pr`, or, for a detached HEAD, its merge proof.
 
 Worktree subjects are the paths Git's worktree list records, and selection
 arguments are matched to whole worktrees by those paths. Backslash, tab, and
@@ -635,24 +697,31 @@ after it succeeded.
 git cleanup-repo --no-update-base --porcelain --worktree ../old-feature
 ```
 
-A selected worktree whose branch cleanup keeps can still be retired, keeping
-the branch, when its own evidence allows: a detached HEAD proven merged, an
-own-name upstream that is gone, or, with `--include-closed`, a branch only a
-closed unmerged pull request contains. `--retire-worktree <path>` retires a
-linked worktree on the caller's say-so, except a detached HEAD that no branch,
-remote branch, or tag reaches, whose commits would become unreachable. Its
-branch stays unless cleanup proves it merged, in which case the branch goes as
-it would for `--worktree`, and a branch kept for a protective reason
-(`open-pr`, `too-new`) keeps its checkout. With `--remove-worktrees`, every
-eligible worktree is still considered; selections only add their own
-retirement.
-Every removal gate still applies, and a worktree whose HEAD moves during
-cleanup is kept.
+A selected worktree whose branch cleanup keeps can still be retired, keeping the
+branch, when its own evidence allows: a detached HEAD proven merged, an own-name
+upstream that is gone, or, with `--include-closed`, a branch only a closed
+unmerged pull request contains; a branch kept as `unpublished` or `pr-unknown`
+is not retired on its gone upstream. `--retire-worktree <path>` retires a linked
+worktree on the caller's say-so, except a detached HEAD that no branch, remote
+branch, or tag reaches, whose commits would become unreachable. Its branch stays
+unless cleanup proves it merged, in which case the branch goes as it would for
+`--worktree`, and a branch kept for a protective reason (`open-pr`, `too-new`,
+or `pr-unknown`, since a request cannot vouch that no open pull request holds
+it) keeps its checkout, as does a gate code such as `unique-commits`. With
+`--remove-worktrees`, every eligible worktree is still considered; selections
+only add their own retirement. Every removal gate still applies, and a worktree
+whose HEAD moves during cleanup is kept.
 
-`--min-age <days>` keeps a branch proven only by ancestry whose reflog shows it
-created or moved more recently than that, or that has no reflog: a branch with
-no commits of its own looks exactly like one that was fast-forward merged, and
-without a reflog its age is unknown.
+`--min-age <days>` keeps a branch proven only by ancestry that was created or
+moved more recently than that: a branch with no commits of its own looks
+exactly like one that was fast-forward merged. Its reflog says when; reflog
+entries expire (`gc.reflogExpire`, 90 days by default) and leave an empty
+reflog, so a branch whose reflog is empty is dated by its tip's commit instead.
+That is safe because creating or moving a logged branch writes an entry, so a
+new branch at an old commit still reads as new. A branch with no reflog at all
+was never logged (with `core.logAllRefUpdates=false`, or created by
+`git worktree add -b` in a bare repository), so its age is unknown and it is
+kept.
 
 Unless `--no-update-base` is given, the command refuses to run with a dirty
 current worktree or an active rebase/merge/cherry-pick/revert. Git cannot

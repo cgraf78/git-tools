@@ -1477,17 +1477,34 @@ failing_od_rc=0
 ') >/dev/null 2>&1 || failing_od_rc=$?
 _assert_eq "failed nonce generation fails worktree inventory" "1" "$failing_od_rc"
 
-result=$(GH_PR_CASE=pending GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 2>&1 || true)
+# A PR that is not ready exits 1; a usage error exits 2.
+rc=0
+result=$(GH_PR_CASE=pending GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 2>&1) || rc=$?
 _assert_contains "refuses pending checks" "checks are pending" "$result"
+_assert_eq "pending checks exit 1" "1" "$rc"
 
-result=$(GH_PR_CASE=pending GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 --dry-run 2>&1 || true)
+rc=0
+result=$(GH_PR_CASE=pending GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 --dry-run 2>&1) || rc=$?
 _assert_contains "dry run still refuses unready PRs" "checks are pending" "$result"
+_assert_eq "a dry run refusing an unready PR exits 1" "1" "$rc"
 
-result=$(GH_PR_CASE=dirty GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 2>&1 || true)
+rc=0
+result=$(GH_PR_CASE=dirty GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 2>&1) || rc=$?
 _assert_contains "refuses dirty merge state" "merge state is DIRTY" "$result"
+_assert_eq "a dirty merge state exits 1" "1" "$rc"
 
-result=$(GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 --method bad 2>&1 || true)
+rc=0
+result=$(GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 --method bad 2>&1) || rc=$?
 _assert_contains "validates merge method" "merge method must be squash, merge, or rebase" "$result"
+_assert_eq "a bad merge method is a usage error" "2" "$rc"
+
+# A target before `--` and another after it is two targets, never the
+# second one silently.
+rc=0
+result=$(GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 -- 5 2>&1) || rc=$?
+_assert_eq "a target on both sides of -- is a usage error" "2" "$rc"
+_assert_contains "a target on both sides of -- is diagnosed" \
+  "expected exactly one target" "$result"
 
 # Base synchronization follows the `git cleanup-repo` rules: a linked worktree
 # never takes the base over, a reservation is never merged into, and an
@@ -1506,6 +1523,37 @@ _advance_remote_main() {
   git -C "$updater" push --quiet origin main
   git -C "$updater" rev-parse HEAD
 }
+
+# The PR head's worktree once had an earlier branch whose commit only its
+# HEAD reflog still holds; that work landed on the base as a squash, so the
+# base proof excuses it and the landed head's worktree goes.
+eb_repo=$(_tmpdir)
+eb_remote=$(_tmpdir)
+eb_linked="$(_tmpdir)/linked"
+eb_log=$(_tmpdir)/gh.log
+_init_repo "$eb_repo" "$eb_remote"
+git -C "$eb_repo" switch --quiet --detach
+git -C "$eb_repo" worktree add --quiet "$eb_linked" feature
+git -C "$eb_linked" switch --quiet -c earlier main
+_commit_file "$eb_linked" earlier.txt earlier "earlier work"
+_commit_file "$eb_linked" earlier2.txt earlier2 "more earlier work"
+git -C "$eb_linked" switch --quiet feature
+git -C "$eb_repo" branch --quiet -D earlier
+eb_updater=$(_tmpdir)
+git clone --quiet "$eb_remote" "$eb_updater"
+git -C "$eb_updater" config user.email test@test.com
+git -C "$eb_updater" config user.name Test
+git -C "$eb_updater" config core.hooksPath /dev/null
+printf 'earlier\n' >"$eb_updater/earlier.txt"
+git -C "$eb_updater" add earlier.txt
+_commit_file "$eb_updater" earlier2.txt earlier2 "land earlier work"
+git -C "$eb_updater" push --quiet origin main
+eb_rc=0
+result=$(GH_LOG="$eb_log" PATH="$bin_dir:$PATH" _pr_land "$eb_repo" 4 2>&1) ||
+  eb_rc=$?
+_assert_eq "landing beside an earlier squash-landed branch succeeds" 0 "$eb_rc"
+_assert_contains "an earlier branch proven in the base does not pin the head's worktree" \
+  "removed worktree $eb_linked" "$result"
 
 # With the base checked out nowhere, a linked worktree advances only the ref.
 lr_repo=$(_tmpdir)

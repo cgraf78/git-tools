@@ -32,23 +32,29 @@ _usage() {
   cat <<'EOF'
 Usage: git pr-land [options] <number|url|branch>
 
-Verify that one GitHub pull request is ready, merge it, and sync the base branch.
-Then delete the local PR head when it is exactly the landed head, or an earlier
-snapshot of it that tracks the PR head, removing its clean linked worktree as
-git cleanup-repo would.
+Verify that one GitHub pull request is ready, merge it, and sync the base
+branch. Then delete the local PR head when it is exactly the landed head, or an
+earlier snapshot of it that tracks the PR head, removing its clean linked
+worktree as git cleanup-repo would.
 Remote heads are reported for manual cleanup and are never deleted.
 This command does not discover or land stacks.
 
 Options:
-  -m, --method <method>   Merge method: squash, merge, or rebase (default: squash).
+  -m, --method <method>   Merge method: squash, merge, or rebase
+                          (default: squash).
       --keep-branch       Keep the local PR head and its worktree.
   -n, --dry-run           Print actions without changing anything.
   -h, --help              Show this help.
 
 Exit status:
   0  PR was landed.
-  1  PR is not ready, merge failed, or post-merge cleanup is incomplete.
-  2  Usage or local environment error.
+  1  The PR was not landed: it is not ready, the merge failed, a
+     precondition refused it (local changes or an active operation, a base
+     that cannot fast-forward, an external checkout, gh not authenticated),
+     or a lookup failed. Also when it merged but post-merge cleanup is
+     incomplete.
+  2  Usage error, not inside a repository, a bare repository, or gh not
+     installed.
 EOF
 }
 
@@ -139,6 +145,8 @@ while (($#)); do
       ;;
     --)
       shift
+      # A target already given before `--` would be silently replaced.
+      [[ -z "$_target" ]] || gt_usage_error "expected exactly one target"
       (($# == 1)) || gt_usage_error "expected exactly one target"
       _target="$1"
       break
@@ -450,6 +458,9 @@ _retire_local_head() {
   GT_CLEANUP_SWITCHED_TO_BASE=$_switched_to_base
   GT_CLEANUP_CURRENT_BRANCH=$_invoking_branch
   GT_CLEANUP_CURRENT_WORKTREE=$_invoking_worktree
+  # The base as last fetched; before a dry run's merge it lacks the landing,
+  # which only makes the worktree gate excuse fewer commits.
+  GT_CLEANUP_BASE_OID=${_exact_base_oid:-}
   if ! gt_cleanup_load_prune_paths; then
     gt_say "keeping the worktree of $head; $GT_CLEANUP_ERROR"
     GT_CLEANUP_REMOVE_WORKTREES=0

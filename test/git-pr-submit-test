@@ -859,6 +859,35 @@ _assert_eq "divergence leaves local main untouched" "$diverged_local_head" \
 _assert_not_contains "divergence creates no pull request" \
   "pr create" "$(cat "$diverged_log" 2>/dev/null || true)"
 
+# log.showSignature makes `git show` print verification lines (here `No
+# signature`, for SSH signatures without allowed signers) before the
+# formatted message; they must not reach the PR title or description.
+if command -v ssh-keygen >/dev/null 2>&1; then
+  signed_repo=$(_tmpdir)/signed
+  signed_log=$(_tmpdir)/gh.log
+  _clone_main_repo "$remote" "$signed_repo"
+  signed_key=$(_tmpdir)/key
+  ssh-keygen -q -t ed25519 -N '' -f "$signed_key" >/dev/null
+  git -C "$signed_repo" config log.showSignature true
+  git -C "$signed_repo" config gpg.format ssh
+  git -C "$signed_repo" config user.signingkey "$signed_key.pub"
+  git -C "$signed_repo" config commit.gpgsign true
+  git -C "$signed_repo" pull --quiet --ff-only origin main
+  printf 'signed\n' >"$signed_repo/signed.txt"
+  git -C "$signed_repo" add signed.txt
+  git -C "$signed_repo" commit -m "Signed fix" -m "Signed body." >/dev/null
+  status=0
+  result=$(cd "$signed_repo" && GH_LOG="$signed_log" PATH="$bin_dir:$PATH" \
+    "$ROOT/bin/git-pr-submit" 2>&1) || status=$?
+  _assert_eq "submits a signed commit with log.showSignature" "0" "$status"
+  _assert_contains "a signed commit's PR title is its subject alone" \
+    "--title Signed fix" "$(cat "$signed_log" 2>/dev/null || true)"
+  _assert_eq "a signed commit's PR description is its body alone" \
+    "Signed body." "$(cat "${signed_log}.body" 2>/dev/null || true)"
+else
+  printf 'skip - signature output cases need ssh-keygen\n'
+fi
+
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2
   exit 1

@@ -25,7 +25,8 @@ unset _gt_lib_dir
 # GT_CLEANUP_CURRENT_BRANCH (or, in a dry run, would leave it) for the base.
 # A non-empty GT_CLEANUP_WORKTREE_SCOPE limits removal to those worktree paths;
 # GT_CLEANUP_ECHO_DRY_RUN=0 silences the dry-run command echo for callers that
-# render every decision themselves.
+# render every decision themselves. GT_CLEANUP_BASE_OID, the pinned base, lets
+# the worktree gate excuse commits proven in it.
 {
   GT_CLEANUP_COMMAND=git-tools
   GT_CLEANUP_DRY_RUN=0
@@ -43,6 +44,7 @@ unset _gt_lib_dir
   GT_CLEANUP_KEEP_DETAIL=""
   GT_CLEANUP_KEEP_WHY=""
   GT_CLEANUP_LOCK=""
+  GT_CLEANUP_BASE_OID=""
 }
 # What the branch pass decided for each scoped worktree it reached, so a
 # caller can give every selected worktree exactly one outcome record.
@@ -50,6 +52,11 @@ _GT_CLEANUP_WT_PATHS=()
 _GT_CLEANUP_WT_OUTCOMES=()
 _GT_CLEANUP_WT_CODES=()
 _GT_CLEANUP_WT_DETAILS=()
+# Tips of the branches this run deleted, and the commits their reflogs named
+# (both sides, newline-separated), which deleting them dropped. A dry run
+# deletes none, so the branches themselves still vouch for these there.
+_GT_CLEANUP_RETIRED_OIDS=()
+_GT_CLEANUP_RETIRED_LOGGED=
 
 # @brief Report one cleanup decision. Callers may redefine this after sourcing.
 # @param $1 Event: keep-branch, delete-branch, remove-worktree, or prune-entry;
@@ -107,8 +114,9 @@ gt_tree_landed() {
   base_tree=$(git rev-parse --verify -q "$merge_base^{tree}" 2>/dev/null) ||
     return 1
   [[ "$tree" != "$base_tree" ]] || return 1
-  trees=$(git log --first-parent --ancestry-path --format=%T \
-    "$merge_base..$base" -- 2>/dev/null) || return 1
+  # --no-show-signature: log.showSignature would add verification lines.
+  trees=$(git log --no-show-signature --first-parent --ancestry-path \
+    --format=%T "$merge_base..$base" -- 2>/dev/null) || return 1
   [[ $'\n'"$trees"$'\n' == *$'\n'"$tree"$'\n'* ]]
 }
 
@@ -297,6 +305,8 @@ _gt_cleanup_classify_status() {
   # can run Git; status output is sorted, so remembering the last top-level
   # entry's answer asks once per entry instead of once per file.
   local last_top="" last_disposable=0
+  # The top-level entries that keep the worktree, for the human message.
+  local blockers="" blocker_count=0
 
   while :; do
     record=""
@@ -323,6 +333,8 @@ _gt_cleanup_classify_status() {
             has_disposable=1
           else
             has_hidden=1
+            [[ "$entry" != */* ]] || top+=/
+            _gt_cleanup_note_path blockers blocker_count "$top"
           fi
           ;;
         ??' '*) has_dirty=1 ;;
@@ -338,7 +350,7 @@ _gt_cleanup_classify_status() {
   if [[ "$has_dirty" == 1 ]]; then
     printf 'dirty\n'
   elif [[ "$has_hidden" == 1 ]]; then
-    printf 'hidden\n'
+    printf 'hidden\tuntracked or ignored %s\n' "$blockers"
   elif [[ "$has_disposable" == 1 ]]; then
     printf 'disposable\n'
   else
@@ -359,14 +371,38 @@ _gt_cleanup_status_state() {
   printf '%s\n' "$state"
 }
 
+# Add path $3 to a display list of at most three paths, comma-separated,
+# then `, ...`. $1 names the list variable and $2 its count, so a sparse
+# checkout flagging every file costs no more than the first few. A repeat
+# of a listed path is skipped, and control characters are shown as `?`,
+# since the list goes into a one-line message.
+_gt_cleanup_note_path() {
+  local list="${!1}" count="${!2}" item="${3//[[:cntrl:]]/?}"
+
+  ((count <= 3)) || return 0
+  case ", $list, " in
+    *", $item, "*) return 0 ;;
+  esac
+  count=$((count + 1))
+  if ((count > 3)); then
+    list+=", ..."
+  else
+    list+="${list:+, }$item"
+  fi
+  printf -v "$1" '%s' "$list"
+  printf -v "$2" '%s' "$count"
+}
+
 # @brief Print a worktree's content state: clean, disposable (only untracked or
 # ignored entries that are cache-tagged or configured as disposable), dirty
 # (tracked changes), hidden (other untracked or ignored content, or index
-# entries marked skip-worktree or assume-unchanged), or unknown.
+# entries marked skip-worktree or assume-unchanged), or unknown. A hidden
+# state is followed by a tab and a human description naming what keeps the
+# worktree; never parse it.
 # Ignored files such as .env or local databases count as hidden: Git's own
 # removal check cannot see them, and removing the worktree would destroy them.
 gt_worktree_content_state() {
-  local path="$1" entry index_state state
+  local path="$1" entry index_state state flagged="" flagged_count=0
 
   if ! state=$(_gt_cleanup_status_state "$path"); then
     printf 'unknown\n'
@@ -379,12 +415,16 @@ gt_worktree_content_state() {
     while IFS= read -r entry; do
       case "$entry" in
         [a-z]' '* | S' '*)
-          printf 'hidden\n'
-          return 0
+          _gt_cleanup_note_path flagged flagged_count "${entry#??}"
           ;;
       esac
     done <<<"$index_state"
-    printf '%s\n' "$state"
+    if [[ -n "$flagged" ]]; then
+      printf 'hidden\tindex entries marked skip-worktree or assume-unchanged %s\n' \
+        "$flagged"
+    else
+      printf '%s\n' "$state"
+    fi
   fi
 }
 
@@ -551,24 +591,43 @@ gt_worktree_is_sparse() {
 # would leave alone, which errs toward keeping. The diff runs in this
 # process's environment, where a dry run's fetched objects are visible; only
 # the untracked-file listing runs in the target worktree. A lookup failure
-# predicts success, leaving any refusal to Git.
+# predicts success, leaving any refusal to Git, except in a sparse checkout:
+# there Git overwrites instead of refusing, so nothing would catch a miss and
+# a failure predicts a block.
 gt_checkout_would_succeed() {
   local path="$1" from="$2" to="$3" top meta added parent blocker listed i
+  local status=""
   local -a wt_git=(git) candidates=()
 
   [[ -z "$path" ]] || wt_git=(gt_git_without_local_env -C "$path")
-  top=$("${wt_git[@]}" rev-parse --show-toplevel 2>/dev/null) || return 0
-  [[ -n "$from" ]] || from=$(git hash-object -t tree --stdin </dev/null) || return 0
-  # Raw records: ":<old mode> <new mode> <old oid> <new oid> A" NUL <path> NUL.
+  top=$("${wt_git[@]}" rev-parse --show-toplevel 2>/dev/null) ||
+    {
+      _gt_checkout_lookup_failed "$path"
+      return
+    }
+  [[ -n "$from" ]] || from=$(git hash-object -t tree --stdin </dev/null) ||
+    {
+      _gt_checkout_lookup_failed "$path"
+      return
+    }
+  # Raw records: ":<old mode> <new mode> <old oid> <new oid> A" NUL <path> NUL,
+  # then diff-tree's exit status as a final record, which a raw record (always
+  # starting with a colon) can never be mistaken for.
   # Collect the occupied paths first, then ask Git about them in batches: a
   # landing after a long gap can add thousands of paths that already exist as
   # tracked files, and one Git process per path would take tens of seconds.
-  while IFS= read -r -d '' meta && IFS= read -r -d '' added; do
+  while IFS= read -r -d '' meta; do
+    if [[ "$meta" != :* ]]; then
+      status=$meta
+      break
+    fi
+    IFS= read -r -d '' added || break
     if [[ "$meta" == *" 160000 "* && -d "$top/$added" && ! -L "$top/$added" ]]; then
       continue
     fi
-    # Something other than a directory above the path blocks it; only that
-    # one is asked about, since Git rejects a pathspec beyond a symlink.
+    # Something other than a directory above the path blocks it. Git checks
+    # only the shallowest such component when it writes the path, so only
+    # that one is asked about.
     blocker=""
     parent=$added
     while [[ "$parent" == */* ]]; do
@@ -583,26 +642,46 @@ gt_checkout_would_succeed() {
     elif [[ -e "$top/$added" || -L "$top/$added" ]]; then
       candidates+=(":(top,literal)$added")
     fi
-  done < <(git diff-tree -r -z --no-renames --diff-filter=A "$from" "$to" \
-    2>/dev/null)
+  done < <(
+    git diff-tree -r -z --no-renames --diff-filter=A "$from" "$to" 2>/dev/null
+    printf '%s\0' "$?"
+  )
+  [[ "$status" == 0 ]] || {
+    _gt_checkout_lookup_failed "$path"
+    return
+  }
   # `ls-files -o` lists untracked and ignored files alike (no exclude rules
   # given) and nothing tracked. An empty candidate list must not reach it,
   # since no pathspec would list the whole worktree.
   for ((i = 0; i < ${#candidates[@]}; i += 500)); do
     listed=$(gt_git_without_local_env -C "$top" ls-files -o -- \
-      "${candidates[@]:i:500}" 2>/dev/null) || return 0
+      "${candidates[@]:i:500}" 2>/dev/null) ||
+      {
+        _gt_checkout_lookup_failed "$path"
+        return
+      }
     [[ -z "$listed" ]] || return 1
   done
   return 0
 }
 
-# Succeed (0) when `git worktree remove` would refuse the worktree for its
-# submodules, 1 when it would not, 2 when that cannot be determined. Mirrors
-# Git's own rule: a `modules` directory in the worktree's Git directory, or a
-# gitlink whose submodule is populated (has a .git). Checking up front keeps a
-# dry run from promising a removal every real run then fails.
+# The prediction when a lookup fails: success (0), so Git's own refusal
+# decides, except in a sparse checkout, where Git would overwrite instead and
+# only the prediction stands between it and the file (1).
+_gt_checkout_lookup_failed() {
+  ! gt_worktree_is_sparse "$1"
+}
+
+# Succeed (0) when the worktree's submodules must keep it, 1 when they need
+# not, 2 when that cannot be determined. Git's own rule refuses a `modules`
+# directory in the worktree's Git directory or a gitlink whose submodule is
+# populated (has a .git); checking that up front keeps a dry run from
+# promising a removal every real run then fails. An unpopulated submodule's
+# directory is also kept when it holds anything: status reports nothing
+# there and Git removes it without asking, so files a user put in it (notes,
+# a copy of the code) would be lost.
 _gt_cleanup_has_submodules() {
-  local path="$1" gitdir index record
+  local path="$1" gitdir index record sub
 
   gitdir=$(gt_git_without_local_env -C "$path" rev-parse --absolute-git-dir \
     2>/dev/null) || return 2
@@ -618,8 +697,226 @@ _gt_cleanup_has_submodules() {
   ) || return 2
   while IFS= read -r record; do
     [[ "$record" == 160000\ * ]] || continue
-    [[ ! -e "$path/${record#*$'\t'}/.git" ]] || return 0
+    sub=$path/${record#*$'\t'}
+    [[ ! -e "$sub/.git" ]] || return 0
+    ! _gt_cleanup_dir_has_entries "$sub" || return 0
   done <<<"$index"
+  return 1
+}
+
+# Print the first commit that removing the worktree at $1 would leave
+# unreachable, or nothing. Its HEAD reflog and its per-worktree refs
+# (refs/worktree, refs/bisect, refs/rewritten) live in its administrative
+# directory and go with it, and Git keeps every commit they name alive, so
+# a commit only they hold would be lost. A commit the refs hold is safe only
+# when a branch, tag, remote branch, or the stash reaches it.
+#
+# Every commit the HEAD reflog names, old or new side of any entry, is a
+# candidate, whatever moved HEAD there or away (a checkout, a reset, an
+# amend, a rebase, a tool's own GIT_REFLOG_ACTION), on a branch or detached.
+# Old sides come from the reflog file itself: once gc expires old entries,
+# a surviving entry's old side can be the only record of a commit, and no
+# `git log -g` format prints old sides. A candidate is safe when:
+# - a branch, tag, remote branch, or the stash reaches it, or HEAD's current
+#   history holds it (the removal reason covers that: its branch's decision,
+#   a detached HEAD's merge proof, or the unreachable-head check);
+# - the reflog of a branch that still exists, or that this run deleted, names
+#   it, so deleting that branch, not this removal, drops it (an amended,
+#   reset, or rebased branch tip); a dry run, where the branch still exists,
+#   judges it the same way;
+# - it is the tip of a branch this run deleted (for any reason);
+# - its work is proven in the base GT_CLEANUP_BASE_OID (when set) by the
+#   same proofs that delete branches, and so are the commits it was built on,
+#   such as an earlier branch of the worktree, squash-merged and deleted
+#   since; proofs run after the cheaper checks, and after eight fail the rest
+#   stay unexcused;
+# - it was replaced, not discarded: an amend, or a rebase step that makes a
+#   new commit (pick, reword, edit, fixup, squash, merge, continue), moved
+#   HEAD from it to a commit that is safe. Neither moves HEAD to an ancestor.
+#   A reset, a rebase's reset or abort, or a checkout discards or leaves, so
+#   a reset to an unrelated commit (a refresh to origin/main) replaces
+#   nothing;
+# - an aborted rebase copied it cleanly (pick, reword, edit, fixup, squash):
+#   the originals are still on the branch or the tip the abort returned to.
+#   Such a copy excuses only itself, never what HEAD held before it, so a
+#   conflict the user resolved (continue), an amend, and manual commits made
+#   during the rebase stay at risk.
+# Git with reftable reflogs keeps no reflog file to read old sides from, so
+# a HEAD reflog with entries there keeps the worktree. Fails when this cannot
+# be determined.
+#
+# The work is a constant number of processes per worktree plus a few per
+# proof: reflogs reach thousands of entries.
+_gt_cleanup_unique_commit() {
+  local path="$1" listed refs="" stash="" name value paths head_log heads_log
+  local records cands unreachable logged unexcused excused="" found reach
+  local failures=0 tried=" " nl=$'\n' retired
+  local -a wt_git=(gt_git_without_local_env -C "$path")
+
+  listed=$("${wt_git[@]}" for-each-ref --format='%(refname) %(objectname)' \
+    refs/worktree refs/bisect refs/rewritten refs/stash 2>/dev/null) || return 1
+  while read -r name value; do
+    case "$name" in
+      "") ;;
+      refs/stash) stash=$value ;;
+      *) refs+="$value"$'\n' ;;
+    esac
+  done <<<"$listed"
+  # A parked ref is deliberate, so only reachability excuses its commit.
+  if [[ -n "$refs" ]]; then
+    found=$({
+      printf '%s' "$refs"
+      [[ -z "$stash" ]] || printf '^%s\n' "$stash"
+    } | "${wt_git[@]}" rev-list --stdin -n 1 --not --branches --tags \
+      --remotes 2>/dev/null) || return 1
+    if [[ -n "$found" ]]; then
+      printf '%s\n' "$found"
+      return 0
+    fi
+  fi
+  paths=$("${wt_git[@]}" rev-parse --git-path logs/HEAD \
+    --git-path logs/refs/heads 2>/dev/null) || return 1
+  head_log=${paths%%"$nl"*}
+  heads_log=${paths#*"$nl"}
+  [[ "$head_log" == /* ]] || head_log=$path/$head_log
+  [[ "$heads_log" == /* ]] || heads_log=$path/$heads_log
+  if [[ ! -f "$head_log" ]]; then
+    # --no-show-signature: log.showSignature would add verification lines.
+    found=$("${wt_git[@]}" log -g -n 1 --no-show-signature --format=%H \
+      HEAD -- 2>/dev/null) || return 1
+    [[ -z "$found" ]] && return 0
+    return 1
+  fi
+  # Each line is `<old> <new> <identity> TAB <message>`; the message starts
+  # with the action Git (or GIT_REFLOG_ACTION) recorded, up to the first
+  # colon. Print `<old> <new> <kind>`, oldest first, where <kind> is amend,
+  # a rebase step's name, or other. A rebase step's action is its command
+  # (`rebase`, `rebase -i`, or `pull` with its arguments) and the step in
+  # parentheses. All-zero sides (a branch's birth, an orphan's first commit)
+  # name nothing and print as `-`.
+  records=$(awk -F '\t' '
+    function oid(s) { return s ~ /^[0-9a-f]+$/ && s !~ /^0+$/ &&
+      (length(s) == 40 || length(s) == 64) }
+    {
+      split($1, side, " "); action = $2; sub(/:.*/, "", action)
+      kind = "other"
+      if (action == "commit (amend)") kind = "amend"
+      else if (action ~ /^(rebase|pull)( .*)? \([a-z -]+\)$/) {
+        kind = action; sub(/.*\(/, "", kind); sub(/\)$/, "", kind)
+        gsub(/ /, "-", kind)
+      }
+      print (oid(side[1]) ? side[1] : "-") " " \
+        (oid(side[2]) ? side[2] : "-") " " kind
+    }
+  ' "$head_log") || return 1
+  cands=$(awk '
+    $1 != "-" && !seen[$1]++ { print $1 }
+    $2 != "-" && !seen[$2]++ { print $2 }
+  ' <<<"$records") || return 1
+  [[ -n "$cands" ]] || return 0
+  # Revisions go through stdin: a reflog can list thousands of commits.
+  # Stdin revisions are read as given whatever --not does on the command
+  # line, so `^` marks the excluded ones. The output is every commit the
+  # candidates reach that nothing safe reaches.
+  unreachable=$({
+    printf '%s\n' "$cands" ^HEAD
+    [[ -z "$stash" ]] || printf '^%s\n' "$stash"
+    for retired in ${_GT_CLEANUP_RETIRED_OIDS[@]+"${_GT_CLEANUP_RETIRED_OIDS[@]}"}; do
+      printf '^%s\n' "$retired"
+    done
+  } | "${wt_git[@]}" rev-list --stdin --not --branches --tags --remotes \
+    2>/dev/null) || return 1
+  [[ -n "$unreachable" ]] || return 0
+  logged=$_GT_CLEANUP_RETIRED_LOGGED
+  if [[ -d "$heads_log" ]]; then
+    logged+=$(find "$heads_log" -type f -exec cat {} + 2>/dev/null |
+      awk '{ print $1; print $2 }') || return 1
+  fi
+  while :; do
+    unexcused=$(_gt_cleanup_unexcused "$records" "$unreachable" \
+      "$logged" "$excused") || return 1
+    [[ -n "$unexcused" ]] || return 0
+    if ((failures >= 8)) || [[ -z "$GT_CLEANUP_BASE_OID" ]]; then
+      break
+    fi
+    # Try the newest untried candidate.
+    found=""
+    while read -r value; do
+      [[ "$tried" != *" $value "* ]] || continue
+      found=$value
+      break
+    done <<<"$unexcused"
+    [[ -n "$found" ]] || break
+    tried+="$found "
+    if ! gt_merge_proof "$found" "$GT_CLEANUP_BASE_OID"; then
+      failures=$((failures + 1))
+      continue
+    fi
+    # Work proven in the base includes the commits it was built on, such as
+    # the earlier commits of a branch squash-merged as one: drop every
+    # candidate the proven commit reaches.
+    reach=$(printf '%s\n' "$unexcused" "^$found" | "${wt_git[@]}" rev-list \
+      --stdin 2>/dev/null) || return 1
+    excused+=$(awk '
+      FNR == NR { kept[$0] = 1; next }
+      !kept[$0] { print }
+    ' <(printf '%s\n' "$reach") <(printf '%s\n' "$unexcused"))$'\n'
+  done
+  printf '%s\n' "${unexcused%%"$nl"*}"
+}
+
+# Print the unexcused candidates of _gt_cleanup_unique_commit, newest first,
+# from its reflog records ($1, oldest first), the commits nothing safe
+# reaches ($2), the commits branch reflogs name ($3), and those already
+# excused by proof ($4), all newline-separated. One awk pass over a tagged
+# stream, since awk -v cannot portably carry newlines. Entries replacing a
+# commit are always newer than the one that made it, so walking newest first
+# settles a chain of replacements in one pass.
+_gt_cleanup_unexcused() {
+  {
+    printf '%s\n' "$2" | sed 's/^/u /'
+    printf '%s\n' "$3" | sed 's/^/b /'
+    printf '%s\n' "$4" | sed 's/^/x /'
+    printf '%s\n' "$1" | sed 's/^/r /'
+  } | awk '
+    $1 == "u" { at_risk[$2] = 1; next }
+    $1 == "b" || $1 == "x" { safe[$2] = 1; next }
+    $1 == "r" { n++; old[n] = $2; new[n] = $3; kind[n] = $4; next }
+    function excused(c) { return c == "-" || !at_risk[c] || safe[c] }
+    END {
+      # Clean copies an aborted rebase made, between its abort and start.
+      # They are not safe themselves, only not worth keeping: a copy must
+      # never excuse what HEAD held before it (a manual commit, an amend, or
+      # a resolved conflict), so the replacement pass never sees them.
+      for (i = n; i >= 1; i--) {
+        if (kind[i] == "abort") aborting = 1
+        else if (kind[i] == "start") aborting = 0
+        else if (aborting && kind[i] ~ /^(pick|reword|edit|fixup|squash)$/)
+          copy[new[i]] = 1
+      }
+      for (i = n; i >= 1; i--) {
+        if (kind[i] ~ /^(amend|pick|reword|edit|fixup|squash|merge|continue)$/ &&
+          old[i] != new[i] && excused(new[i]))
+          safe[old[i]] = 1
+      }
+      for (i = n; i >= 1; i--) {
+        if (!excused(new[i]) && !copy[new[i]] && !seen[new[i]]++) print new[i]
+        if (!excused(old[i]) && !copy[old[i]] && !seen[old[i]]++) print old[i]
+      }
+    }
+  '
+}
+
+# Succeed when $1 is a directory with at least one entry, hidden ones
+# included. The globs cover every name but `.` and `..`; one that matched
+# nothing stays literal and names no existing path.
+_gt_cleanup_dir_has_entries() {
+  local entry
+
+  [[ -d "$1" ]] || return 1
+  for entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [[ ! -e "$entry" && ! -L "$entry" ]] || return 0
+  done
   return 1
 }
 
@@ -629,9 +926,11 @@ _gt_cleanup_has_submodules() {
 # and GT_CLEANUP_KEEP_WHY for the caller to report, and returns 1.
 # @param $1 Worktree path. @param $2 Branch checked out there, or "".
 # @param $3 Branch tip OID that must not move before pruning, or "".
+# @param $4 Optional reason code removal would carry, such as a merge proof;
+#   it only makes a hidden-content message say whether the work is merged.
 gt_cleanup_worktree_gate() {
-  local path="$1" branch="$2" branch_oid="$3" operation state in_use_status
-  local submodule_status
+  local path="$1" branch="$2" branch_oid="$3" proof="${4:-}" operation state
+  local in_use_status submodule_status what unique
 
   GT_CLEANUP_KEEP_CODE=""
   GT_CLEANUP_KEEP_DETAIL=""
@@ -668,7 +967,7 @@ gt_cleanup_worktree_gate() {
   case "$submodule_status" in
     0)
       _gt_cleanup_block submodule "$path" \
-        "worktree contains populated submodules, which Git cannot remove: $path"
+        "worktree has a populated submodule or files in a submodule directory: $path"
       return 1
       ;;
     1) ;;
@@ -678,6 +977,16 @@ gt_cleanup_worktree_gate() {
       return 1
       ;;
   esac
+  if ! unique=$(_gt_cleanup_unique_commit "$path"); then
+    _gt_cleanup_block uninspectable "$path" \
+      "could not inspect the worktree's HEAD reflog and own refs: $path"
+    return 1
+  fi
+  if [[ -n "$unique" ]]; then
+    _gt_cleanup_block unique-commits "$unique" \
+      "its HEAD reflog or own refs hold commits that no branch, tag, or remote branch reaches, such as $unique; removing it would lose them: $path"
+    return 1
+  fi
   if _gt_cleanup_worktree_busy "$path"; then
     _gt_cleanup_block checkout-in-flight "$GT_CLEANUP_LOCK" \
       "a Git command is writing in the worktree (lock $GT_CLEANUP_LOCK)"
@@ -703,6 +1012,8 @@ gt_cleanup_worktree_gate() {
   esac
 
   state=$(gt_worktree_content_state "$path")
+  what=${state#*$'\t'}
+  state=${state%%$'\t'*}
   case "$state" in
     clean) ;;
     disposable)
@@ -718,6 +1029,8 @@ gt_cleanup_worktree_gate() {
       fi
       if [[ "$GT_CLEANUP_DRY_RUN" != 1 ]]; then
         state=$(gt_worktree_content_state "$path")
+        what=${state#*$'\t'}
+        state=${state%%$'\t'*}
         case "$state" in
           clean) ;;
           dirty)
@@ -727,7 +1040,7 @@ gt_cleanup_worktree_gate() {
             ;;
           hidden)
             _gt_cleanup_block hidden "$path" \
-              "worktree has hidden local content: $path"
+              "$(_gt_cleanup_hidden_why "$path" "$what" "$proof")"
             return 1
             ;;
           disposable)
@@ -748,7 +1061,8 @@ gt_cleanup_worktree_gate() {
       return 1
       ;;
     hidden)
-      _gt_cleanup_block hidden "$path" "worktree has hidden local content: $path"
+      _gt_cleanup_block hidden "$path" \
+        "$(_gt_cleanup_hidden_why "$path" "$what" "$proof")"
       return 1
       ;;
     *)
@@ -757,6 +1071,26 @@ gt_cleanup_worktree_gate() {
       return 1
       ;;
   esac
+}
+
+# Print why hidden content keeps a worktree: what it is, whether the work is
+# merged anyway (so that content is all that stands in the way), and, for
+# untracked or ignored files, how a repository marks generated ones
+# disposable.
+_gt_cleanup_hidden_why() {
+  local path="$1" what="$2" proof="$3" why
+
+  why="worktree has hidden local content: $path ($what)"
+  case "$proof" in
+    merged | content-merged | tree-landed | merged-pr)
+      why+="; it is proven merged ($proof), so only that content keeps it"
+      ;;
+    "") ;;
+    *) why+="; it is not proven merged" ;;
+  esac
+  [[ "$what" != "untracked or ignored "* ]] ||
+    why+="; for generated entries, see cleanupRepo.worktreePrunePath"
+  printf '%s' "$why"
 }
 
 # @brief Remove a linked worktree that passed gt_cleanup_worktree_gate, and
@@ -865,7 +1199,7 @@ _gt_cleanup_release_branch() {
     return 1
   fi
   # Each failed step leaves its keep fields set for the report below.
-  if ! gt_cleanup_worktree_gate "$path" "$branch" "$branch_oid"; then
+  if ! gt_cleanup_worktree_gate "$path" "$branch" "$branch_oid" "$code"; then
     :
   elif ! gt_branch_still_at "$branch" "$branch_oid"; then
     _gt_cleanup_block branch-changed "$path" "branch changed during cleanup" || :
@@ -888,7 +1222,7 @@ _gt_cleanup_release_branch() {
 # @param $4 Optional human label for the reason; defaults to the code.
 # Returns 0 when the branch was deleted (or would be in a dry run).
 gt_cleanup_retire_branch() {
-  local branch="$1" branch_oid="$2" code="$3" reason="${4:-}"
+  local branch="$1" branch_oid="$2" code="$3" reason="${4:-}" log logged=""
 
   _gt_cleanup_release_branch "$branch" "$branch_oid" "$code" || return 1
 
@@ -926,12 +1260,20 @@ gt_cleanup_retire_branch() {
   # Report a deletion only once it happened, so a failed one is reported
   # exactly once, as a kept branch. --no-deref: should the name have become
   # a symbolic ref since the inventory, delete only that alias, never the
-  # branch it points at.
+  # branch it points at. Read the branch's reflog first, since it goes with
+  # the branch, so a worktree judged later in the run is judged as a dry run
+  # judges it.
+  log=$(git rev-parse --git-path "logs/refs/heads/$branch" 2>/dev/null) ||
+    log=""
+  [[ -z "$log" || ! -f "$log" ]] ||
+    logged=$(awk '{ print $1; print $2 }' "$log" 2>/dev/null) || logged=""
   if ! git update-ref --no-deref -d "refs/heads/$branch" "$branch_oid"; then
     _gt_cleanup_keep "$branch" ref-delete-failed "$branch_oid" \
       "exact ref deletion failed"
     return 1
   fi
+  _GT_CLEANUP_RETIRED_OIDS+=("$branch_oid")
+  [[ -z "$logged" ]] || _GT_CLEANUP_RETIRED_LOGGED+="$logged"$'\n'
   gt_cleanup_report delete-branch "$branch" "$code" "$branch_oid" \
     "deleting $branch ($reason)"
 }
@@ -940,7 +1282,11 @@ gt_cleanup_retire_branch() {
 # an exact commit on a repository's base branch: open (a PR still under review
 # contains it, or an open PR is named after the branch), merged (a merged PR
 # contains it and its merge commit is in the pinned base), closed (only a closed,
-# unmerged PR contains it), or none after a complete observation. Prints nothing
+# unmerged PR contains it), unpublished (GitHub has no such commit, so it was
+# never pushed there, and no open PR is named after the branch), or none
+# after a complete observation; none may add `TAB <number> TAB <base>` for a
+# merged PR into another base of this repository that GitHub associates with
+# the commit, a hint for messages that proves nothing. Prints nothing
 # and fails on any tool, transport, paging, or shape problem: missing evidence
 # is never proof. Membership is checked against the PR's own commit list, so a
 # commit that merely shares a branch name proves nothing.
@@ -950,6 +1296,7 @@ gt_cleanup_pr_lineage() (
   local host="$1" repo="$2" branch="$3" target_oid="$4" base_oid="$5" ref="$6"
   local owner named associated pages candidates number state merged merge_oid
   local members verified merged_number='' closed_number='' open_number=''
+  local unpublished=0 elsewhere
   export LC_ALL=C
 
   command -v gh >/dev/null 2>&1 || return 1
@@ -972,6 +1319,7 @@ gt_cleanup_pr_lineage() (
       and (.[0] | type == "object" and (.status == "422" or .status == 422)
         and .errors == null))' <<<"$associated" >/dev/null 2>&1 || return 1
     associated='[[]]'
+    unpublished=1
   fi
   named=$(gh api --hostname "$host" --method GET --paginate --slurp \
     "repos/$repo/pulls" -f state=all -f "head=$owner:$branch" \
@@ -1039,15 +1387,32 @@ gt_cleanup_pr_lineage() (
     fi
   done <<<"$candidates"
   # An exact commit still under review in another PR is live work even if an
-  # earlier PR landed it, so an open PR outranks every other observation.
+  # earlier PR landed it, so an open PR outranks every other observation. A
+  # tip GitHub does not know holds commits no remote branch ever had, which
+  # no other observation can outweigh.
   if [[ -n $open_number ]]; then
     printf 'open\t%s\n' "$open_number"
+  elif [[ $unpublished == 1 ]]; then
+    printf 'unpublished\t-\n'
   elif [[ -n $merged_number ]]; then
     printf 'merged\t%s\n' "$merged_number"
   elif [[ -n $closed_number ]]; then
     printf 'closed\t%s\n' "$closed_number"
   else
-    printf 'none\t-\n'
+    # The pages were validated above. A stacked PR that merged into its
+    # parent branch, not this base, is the usual reason for no proof. Only
+    # GitHub's association with the commit counts: a PR found by branch name
+    # alone may be an old one that reused the name.
+    elsewhere=$(jq -r --arg repo "$repo" --arg ref "$ref" '
+      add // [] | map(select((.base.repo.full_name | ascii_downcase) == $repo
+        and .base.ref != $ref and .merged_at != null))
+      | max_by(.number) // empty | [.number, .base.ref] | @tsv
+    ' <<<"$associated" 2>/dev/null) || elsewhere=""
+    if [[ -n "$elsewhere" ]]; then
+      printf 'none\t-\t%s\n' "$elsewhere"
+    else
+      printf 'none\t-\n'
+    fi
   fi
 )
 
@@ -1063,7 +1428,7 @@ gt_cleanup_pr_lineage() (
 gt_cleanup_retire_worktree() {
   local path="$1" branch="$2" code="$3" head_oid="$4" current
 
-  gt_cleanup_worktree_gate "$path" "$branch" "" || return 1
+  gt_cleanup_worktree_gate "$path" "$branch" "" "$code" || return 1
   current=$(gt_git_without_local_env -C "$path" rev-parse --verify -q \
     HEAD 2>/dev/null) || current=""
   if [[ "$current" != "$head_oid" ]]; then

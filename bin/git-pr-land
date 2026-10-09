@@ -283,8 +283,9 @@ _sync_base() {
   case "$GT_BASE_SYNC_ACTION" in
     current | switch) _switch_and_merge_base "$remote" "$base" "$base_oid" ;;
     worktree)
-      _run gt_git_without_local_env -C "$path" merge --quiet --ff-only "$base_oid" ||
-        return 1
+      _base_update_clear "$path" "$base" "$base_oid" || return 1
+      _run gt_git_without_local_env -C "$path" merge --quiet --ff-only \
+        --no-overwrite-ignore "$base_oid" || return 1
       [[ "$_dry_run" == 1 ]] || gt_say "fast-forwarded $base in worktree $path"
       ;;
     ref) _fast_forward_base_ref "$remote" "$base" "$base_oid" ;;
@@ -306,24 +307,52 @@ _record_base_config() {
   git config --local --replace-all "branch.$base.merge" "refs/heads/$base"
 }
 
+# Succeed when updating the worktree at $1 (empty: the current one) to the
+# base commit $3 would not overwrite an untracked or ignored file. Git itself
+# refuses with --no-overwrite-ignore, but not in a dry run, and not in a sparse
+# checkout, where it overwrites with only a warning; check first there. The
+# path moves from its HEAD to the local base (when switching to one) and then
+# to the base commit.
+_base_update_clear() {
+  local path="$1" base="$2" base_oid="$3" head_oid local_oid=""
+  local -a wt_git=(git)
+
+  [[ "$_dry_run" == 1 ]] || gt_worktree_is_sparse "$path" || return 0
+  [[ -z "$path" ]] || wt_git=(gt_git_without_local_env -C "$path")
+  head_oid=$("${wt_git[@]}" rev-parse --verify -q HEAD 2>/dev/null) || head_oid=""
+  local_oid=$(git rev-parse --verify -q "refs/heads/$base^{commit}" 2>/dev/null) ||
+    local_oid=""
+  if [[ -n "$local_oid" && "$local_oid" != "$head_oid" ]] &&
+    ! gt_checkout_would_succeed "$path" "$head_oid" "$local_oid"; then
+    gt_say "not updating $base; an untracked or ignored file is in the way"
+    return 1
+  fi
+  if ! gt_checkout_would_succeed "$path" "${local_oid:-$head_oid}" "$base_oid"; then
+    gt_say "not updating $base; an untracked or ignored file is in the way"
+    return 1
+  fi
+}
+
 # Check out the base in the invoking checkout, which is either already on it
-# or the main worktree.
+# or the main worktree. Neither the switch nor the fast-forward may overwrite
+# an ignored file (a local .env) with a newly tracked one.
 _switch_and_merge_base() {
   local remote="$1" base="$2" base_oid="$3" ref_status=0
 
+  _base_update_clear "" "$base" "$base_oid" || return 1
   _local_branch_exists "$base" || ref_status=$?
   if [[ "$ref_status" == 0 ]]; then
-    _run git switch --quiet "$base" || return 1
+    _run git switch --quiet --no-overwrite-ignore "$base" || return 1
   elif [[ "$ref_status" != 1 ]]; then
     return 1
   else
-    _run git switch --quiet -c "$base" "$base_oid" || return 1
+    _run git switch --quiet --no-overwrite-ignore -c "$base" "$base_oid" || return 1
     if [[ "$_dry_run" != 1 ]]; then
       _record_base_config "$remote" "$base" || return 1
     fi
   fi
 
-  _run git merge --quiet --ff-only "$base_oid" || return 1
+  _run git merge --quiet --ff-only --no-overwrite-ignore "$base_oid" || return 1
   # The invoking checkout no longer holds the PR head (or, in a dry run,
   # would not), which releases that branch for deletion.
   _switched_to_base=1

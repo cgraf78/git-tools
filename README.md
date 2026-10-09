@@ -273,7 +273,9 @@ The local base is synchronized under the same rules as `git cleanup-repo`: it
 is fast-forwarded in the worktree that has it checked out, the main worktree
 may switch to it, and a linked worktree never does, advancing only the base ref
 when nothing has it checked out. Any update to another checkout is reported.
-The command refuses before merging when the worktree that would receive the
+Neither the switch nor the fast-forward overwrites an ignored file (a local
+`.env`) with a newly tracked one; the base is then left for you, and the
+diagnostic says the PR already merged. The command refuses before merging when the worktree that would receive the
 base has local changes or an active operation, or when a rebase or bisect
 reserves the base. A base checked out in a main worktree whose files live
 outside its Git directory (such as a `core.worktree` dotfiles checkout) is

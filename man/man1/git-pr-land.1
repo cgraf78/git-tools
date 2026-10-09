@@ -41,7 +41,10 @@ colliding tags, or importing unrelated tags.
 The local base is fast-forwarded in the worktree that has it checked out. Only
 the main worktree may switch to the base; a linked worktree never does, and
 advances only the base ref, by fast-forward, when nothing has it checked out.
-Updates to a checkout other than the current one are always reported. The
+Updates to a checkout other than the current one are always reported. Neither
+the switch nor the fast-forward overwrites an ignored file with a newly tracked
+one; the base is then left for the user, and the diagnostic says the pull
+request already merged. The
 command refuses before merging when the worktree that would receive the base
 has local changes or an active operation, or when a rebase or bisect reserves
 the base. A base checked out in a main worktree whose files live outside its

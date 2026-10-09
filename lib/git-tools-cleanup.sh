@@ -523,6 +523,75 @@ _gt_cleanup_locked() {
   return 1
 }
 
+# Succeed when the worktree at $1 (empty: the current one) is a sparse
+# checkout. There Git does not refuse to overwrite an untracked or ignored
+# file at a path inside the sparse patterns: it replaces the file with only a
+# warning, even with --no-overwrite-ignore, so callers must check first.
+gt_worktree_is_sparse() {
+  local path="$1" value
+  local -a wt_git=(git)
+
+  [[ -z "$path" ]] || wt_git=(gt_git_without_local_env -C "$path")
+  value=$("${wt_git[@]}" config --bool core.sparseCheckout 2>/dev/null) ||
+    return 1
+  [[ "$value" == true ]]
+}
+
+# @brief Predict whether moving a worktree's files between two commits would
+# hit an untracked or ignored file. Succeeds (0) unless moving the worktree
+# at $1 (empty: the current one) from commit $2 (empty: an unborn HEAD) to
+# commit $3 would make Git refuse for an untracked or ignored file in the way,
+# as --no-overwrite-ignore does (or, in a sparse checkout, silently overwrite
+# it). Git has no dry run for that check (`read-tree -n` skips it), so
+# predict it, and only when certain: a path the target adds is blocked when an
+# untracked or ignored file occupies it or any directory above it. A tracked
+# path that merely changes type is Git's to replace and never blocks, nor
+# does a directory under a newly added gitlink, which Git leaves in place. In
+# a sparse checkout this may also block a path outside the patterns that Git
+# would leave alone, which errs toward keeping. The diff runs in this
+# process's environment, where a dry run's fetched objects are visible; only
+# the untracked-file listing runs in the target worktree. A lookup failure
+# predicts success, leaving any refusal to Git.
+gt_checkout_would_succeed() {
+  local path="$1" from="$2" to="$3" top meta added parent
+  local -a wt_git=(git)
+
+  [[ -z "$path" ]] || wt_git=(gt_git_without_local_env -C "$path")
+  top=$("${wt_git[@]}" rev-parse --show-toplevel 2>/dev/null) || return 0
+  [[ -n "$from" ]] || from=$(git hash-object -t tree --stdin </dev/null) || return 0
+  # Raw records: ":<old mode> <new mode> <old oid> <new oid> A" NUL <path> NUL.
+  while IFS= read -r -d '' meta && IFS= read -r -d '' added; do
+    if [[ "$meta" == *" 160000 "* && -d "$top/$added" && ! -L "$top/$added" ]]; then
+      continue
+    fi
+    _gt_untracked_in_way "$top" "$added" && return 1
+    parent=$added
+    while [[ "$parent" == */* ]]; do
+      parent=${parent%/*}
+      if [[ -e "$top/$parent" || -L "$top/$parent" ]] &&
+        [[ ! -d "$top/$parent" || -L "$top/$parent" ]]; then
+        _gt_untracked_in_way "$top" "$parent" && return 1
+      fi
+    done
+  done < <(git diff-tree -r -z --no-renames --diff-filter=A "$from" "$to" \
+    2>/dev/null)
+  return 0
+}
+
+# Succeed when an untracked or ignored file occupies path $2 (relative to the
+# worktree top $1). Cheap disk test first; only an existing path pays for the
+# Git lookup, which lists untracked and ignored files alike (no exclude rules
+# given) and nothing tracked. Only emptiness matters, so no -z (Bash would
+# warn about the NULs).
+_gt_untracked_in_way() {
+  local top="$1" rel="$2" listed
+
+  [[ -e "$top/$rel" || -L "$top/$rel" ]] || return 1
+  listed=$(gt_git_without_local_env -C "$top" ls-files -o -- \
+    ":(top,literal)$rel" 2>/dev/null) || return 1
+  [[ -n "$listed" ]]
+}
+
 # Succeed (0) when `git worktree remove` would refuse the worktree for its
 # submodules, 1 when it would not, 2 when that cannot be determined. Mirrors
 # Git's own rule: a `modules` directory in the worktree's Git directory, or a

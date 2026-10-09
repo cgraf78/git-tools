@@ -971,7 +971,7 @@ result=$(GH_LOG="$log_dry_linked" PATH="$bin_dir:$PATH" \
 rc=$?
 _assert_eq "linked base dry run: succeeds" "0" "$rc"
 _assert_contains "linked base dry run: prints the Git command it would run" \
-  "would run: git -C $(printf %q "$main_dry_linked") merge --quiet --ff-only" "$result"
+  "would run: git -C $(printf %q "$main_dry_linked") merge --quiet --ff-only --no-overwrite-ignore" "$result"
 _assert_not_contains "linked base dry run: hides the environment wrapper" \
   "gt_git_without_local_env" "$result"
 _assert_eq "linked base dry run: does not advance base" \
@@ -1550,6 +1550,32 @@ _assert_eq "landing keeps the main worktree on its branch" feature \
   "$(git -C "$lw_repo" branch --show-current)"
 _assert_contains "landing reports updating the base worktree" \
   "fast-forwarded main in worktree $lw_base" "$result"
+
+# Fast-forwarding the base worktree never overwrites an ignored file with a
+# newly tracked one (a local .env): the landing completes, but the base is
+# left for the user, and the file survives.
+ig_repo=$(_tmpdir)
+ig_remote=$(_tmpdir)
+ig_base="$(_tmpdir)/base"
+ig_log=$(_tmpdir)/gh.log
+_init_repo "$ig_repo" "$ig_remote"
+git -C "$ig_repo" worktree add --quiet "$ig_base" main
+ig_before=$(git -C "$ig_base" rev-parse HEAD)
+ig_updater=$(_tmpdir)
+git clone --quiet "$ig_remote" "$ig_updater"
+git -C "$ig_updater" config user.email test@test.com
+git -C "$ig_updater" config user.name Test
+git -C "$ig_updater" config core.hooksPath /dev/null
+_commit_file "$ig_updater" .env remote "track .env"
+git -C "$ig_updater" push --quiet origin main
+mkdir -p "$ig_repo/.git/info"
+printf '.env\n' >>"$ig_repo/.git/info/exclude"
+printf 'local\n' >"$ig_base/.env"
+GH_LOG="$ig_log" PATH="$bin_dir:$PATH" _pr_land "$ig_repo" 4 >/dev/null 2>&1
+_assert_eq "landing never overwrites an ignored file in the base worktree" local \
+  "$(cat "$ig_base/.env")"
+_assert_eq "the base worktree is left where it was" "$ig_before" \
+  "$(git -C "$ig_base" rev-parse HEAD)"
 
 # A detached bisect that reserves the base is never merged into.
 rd_repo=$(_tmpdir)

@@ -517,18 +517,20 @@ _switch_to_base() {
   # A dry run cannot let Git refuse, so check up front whether moving the
   # files from HEAD to the local base or the remote base would overwrite an
   # untracked or ignored file.
-  # The switch moves HEAD to the local base (when one exists); the
-  # fast-forward then moves it to the remote base only when the plan takes
-  # the remote's commit (a local base ahead of the remote stays put).
-  if [[ "$_dry_run" == 1 ]]; then
+  # A dry run cannot let Git refuse, and in a sparse checkout Git does not
+  # refuse at all (it overwrites the file with a warning), so check first
+  # in both cases. The switch moves HEAD to the local base (when one exists);
+  # the fast-forward then moves it to the remote base only when the plan
+  # takes the remote's commit (a local base ahead of the remote stays put).
+  if [[ "$_dry_run" == 1 ]] || gt_worktree_is_sparse ""; then
     local head_oid ff_from
     head_oid=$(git rev-parse --verify -q HEAD 2>/dev/null) || head_oid=""
     ff_from=${_local_base_oid:-$head_oid}
     if { [[ -n "$_local_base_oid" ]] &&
-      ! _checkout_would_succeed "" "$head_oid" "$_local_base_oid"; } ||
+      ! gt_checkout_would_succeed "" "$head_oid" "$_local_base_oid"; } ||
       { [[ "$_planned_base_oid" == "$_remote_oid" ]] &&
-        ! _checkout_would_succeed "" "$ff_from" "$_remote_oid"; }; then
-      _refuse "could not update $_base; Git would refuse because an untracked or ignored file is in the way"
+        ! gt_checkout_would_succeed "" "$ff_from" "$_remote_oid"; }; then
+      _refuse "could not update $_base; Git would refuse (or, in a sparse checkout, overwrite) because an untracked or ignored file is in the way"
     fi
   fi
   if [[ "$_base_local_exists" == 1 ]]; then
@@ -559,60 +561,6 @@ _switch_to_base() {
   GT_CLEANUP_SWITCHED_TO_BASE=1
 }
 
-# Succeed (0) unless moving the worktree at $1 (empty: the current one) from
-# commit $2 (empty: an unborn HEAD) to commit $3 would make Git refuse for an
-# untracked or ignored file in the way, as --no-overwrite-ignore does. Git
-# has no dry run for that check (`read-tree -n` skips it), so predict it, and
-# only when certain: a path the target adds is blocked when an untracked or
-# ignored file occupies it or any directory above it. A tracked path that
-# merely changes type is Git's to replace and never blocks, nor does a
-# directory under a newly added gitlink, which Git leaves in place. A sparse
-# checkout is not predicted, since Git skips paths outside its patterns. The
-# diff runs in this process's environment, where a dry run's fetched objects
-# are visible; only the untracked-file listing runs in the target worktree.
-# Any lookup failure predicts success, leaving the refusal to the real run.
-_checkout_would_succeed() {
-  local path="$1" from="$2" to="$3" top meta added parent sparse
-  local -a wt_git=(git)
-
-  [[ -z "$path" ]] || wt_git=(gt_git_without_local_env -C "$path")
-  top=$("${wt_git[@]}" rev-parse --show-toplevel 2>/dev/null) || return 0
-  sparse=$("${wt_git[@]}" config --bool core.sparseCheckout 2>/dev/null) || sparse=""
-  [[ "$sparse" != true ]] || return 0
-  [[ -n "$from" ]] || from=$(git hash-object -t tree --stdin </dev/null) || return 0
-  # Raw records: ":<old mode> <new mode> <old oid> <new oid> A" NUL <path> NUL.
-  while IFS= read -r -d '' meta && IFS= read -r -d '' added; do
-    if [[ "$meta" == *" 160000 "* && -d "$top/$added" && ! -L "$top/$added" ]]; then
-      continue
-    fi
-    _untracked_in_way "$top" "$added" && return 1
-    parent=$added
-    while [[ "$parent" == */* ]]; do
-      parent=${parent%/*}
-      if [[ -e "$top/$parent" || -L "$top/$parent" ]] &&
-        [[ ! -d "$top/$parent" || -L "$top/$parent" ]]; then
-        _untracked_in_way "$top" "$parent" && return 1
-      fi
-    done
-  done < <(git diff-tree -r -z --no-renames --diff-filter=A "$from" "$to" \
-    2>/dev/null)
-  return 0
-}
-
-# Succeed when an untracked or ignored file occupies path $2 (relative to the
-# worktree top $1). Cheap disk test first; only an existing path pays for the
-# Git lookup, which lists untracked and ignored files alike (no exclude rules
-# given) and nothing tracked. Only emptiness matters, so no -z (Bash would
-# warn about the NULs).
-_untracked_in_way() {
-  local top="$1" rel="$2" listed
-
-  [[ -e "$top/$rel" || -L "$top/$rel" ]] || return 1
-  listed=$(gt_git_without_local_env -C "$top" ls-files -o -- \
-    ":(top,literal)$rel" 2>/dev/null) || return 1
-  [[ -n "$listed" ]]
-}
-
 # Another worktree owns the base, so only that worktree can advance it without
 # leaving its index and files behind the moved ref. Its pending edits belong to
 # the user, so skip the update rather than merge into them.
@@ -639,9 +587,10 @@ _fast_forward_base_worktree() {
   fi
   # Report the user-visible command; the real run clears this worktree's
   # inherited Git environment so the merge happens in the base worktree. A
-  # dry run predicts the real run's refusal for an untracked or ignored file.
-  if [[ "$_dry_run" == 1 ]] &&
-    ! _checkout_would_succeed "$path" "$_local_base_oid" "$_remote_oid"; then
+  # dry run predicts the real run's refusal for an untracked or ignored file,
+  # and a sparse worktree, where Git would overwrite instead, is checked first.
+  if { [[ "$_dry_run" == 1 ]] || gt_worktree_is_sparse "$path"; } &&
+    ! gt_checkout_would_succeed "$path" "$_local_base_oid" "$_remote_oid"; then
     _skip_base_update "could not fast-forward it in worktree $path"
     return 0
   fi

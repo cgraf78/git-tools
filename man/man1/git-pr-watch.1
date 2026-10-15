@@ -229,7 +229,8 @@ reader should also check that the process is alive and is
 .BR "bash git-pr-watch" ;
 where a launcher repeats the interpreter, as Termux does with
 .RI \(dq "bash /path/to/bash git-pr-watch" \(dq,
-skip a first argument whose basename the second repeats).
+skip a first argument whose basename the second repeats, then apply the
+same rule to the rest).
 .TP
 .BI watchers/pending. scope . pid
 Exists while a waiting run is still resolving its targets (branch names), and
@@ -238,14 +239,19 @@ written before it is removed.
 .TP
 .BI exited/ key
 Written when a waiting run ends, for each pull request it had resolved by
-then, whatever its state: the pull request was watched until then and the
-caller got the result. Its content,
-.RI \(dq "status state reason" \(dq
-(the exit status, then
+then, whatever its state, holding
+.RI \(dq "status state reason epoch" \(dq:
+the exit status, the state and reason last reported (or
 .B \-
-for a state or reason not judged yet), is informational; its modification
-time is when the watch ended. It is written before the watcher files are
-removed.
+if not judged yet), and, when the run delivered a result for the pull
+request (status 0, 1, or 8 with it read), when the check behind that result
+started, in seconds since the epoch by this host's clock. A run cut short (a
+signal, an error, GitHub unreadable) writes
+.B \-
+for the epoch, to be treated as before any event. An epoch later than an
+event such as a push means the pull request was watched after it and its
+result delivered, whatever the state. The file's modification time is when
+the run ended; it is written before the watcher files are removed.
 .TP
 .BI done/ key
 Written by any run that finds the pull request finished, holding

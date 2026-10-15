@@ -1109,6 +1109,8 @@ _state_done=()
 # test clock does not apply to files other tools compare with their own clock.
 _state_wall_base=""
 _state_check_wall=""
+# Start of the check whose judgments are the current ones, for exit records.
+_state_judged_wall=""
 
 # @brief Choose the state directory and this repository's scope.
 # Leaves _state_dir empty (no state files) when they are turned off, when no
@@ -1278,6 +1280,7 @@ _state_finished() {
   local i head word
 
   [[ -n "$_state_dir" ]] || return 0
+  _state_judged_wall=$_state_check_wall
   for ((i = 0; i < ${#_numbers[@]}; i++)); do
     case "${_state[i]:-}:${_reason[i]:-}" in
       "done":merged) word=merged ;;
@@ -1297,13 +1300,15 @@ _state_finished() {
 }
 
 # @brief Record a waiting run's exit and remove its watcher files.
-# exited/<key> holds "<exit status> <state> <reason>" (informational), for
-# every target resolved by then, so a run that dies while resolving a later
-# branch target still records the earlier ones. A reader takes it to mean
-# the pull request was watched until then and the caller got the result,
-# whatever it was (a stall included).
+# exited/<key> holds "<exit status> <state> <reason> <epoch>", for every
+# target resolved by then, so a run that dies while resolving a later branch
+# target still records the earlier ones. The epoch is when the check behind
+# the reported result started, and only when the run delivered one (exit 0,
+# 1, or 8 with the pull request read): a run cut short by a signal, an
+# error, or an unreadable GitHub gets `-`, so a reader never takes it for a
+# watch of a head pushed meanwhile.
 _state_finish() {
-  local status="$1" i key
+  local status="$1" i key epoch
   local -a files
 
   [[ "$_wait" == 1 ]] || return 0
@@ -1311,7 +1316,12 @@ _state_finish() {
   for ((i = 0; i < ${#_numbers[@]}; i++)); do
     key=${_state_scope}_${_numbers[$i]}
     files+=("$_state_dir/watchers/$key.$$")
-    _state_write "$_state_dir/exited/$key" "$status ${_state[i]:--} ${_reason[i]:--}"
+    epoch=-
+    case "$status:${_state[i]:-}:${_reason[i]:-}" in
+      [018]:*:unreadable | [018]::* | [018]:*:) ;;
+      [018]:*) epoch=${_state_judged_wall:--} ;;
+    esac
+    _state_write "$_state_dir/exited/$key" "$status ${_state[i]:--} ${_reason[i]:--} $epoch"
   done
   [[ -z "$_state_pending" ]] || files+=("$_state_pending")
   ((${#files[@]} == 0)) || rm -f -- "${files[@]}" 2>/dev/null || true

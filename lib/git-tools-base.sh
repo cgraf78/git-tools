@@ -428,7 +428,7 @@ _gt_squash_patch_merged() (
     esac
     [[ "${#source}" == "$width" ]] || return 1
     [[ "$expected_width" == 0 || "$width" == "$expected_width" ]] || return 1
-    [[ "$id" != *[!0-9a-f]* && "$source" != *[!0-9a-f]* ]]
+    [[ "$id" != *[!0-9abcdef]* && "$source" != *[!0-9abcdef]* ]]
   }
 
   case "$native_width" in
@@ -437,8 +437,8 @@ _gt_squash_patch_merged() (
   esac
   [[ "${#base}" == "$native_width" && "${#merge_base}" == "$native_width" ]] ||
     exit 2
-  [[ "$branch" != *[!0-9a-f]* && "$base" != *[!0-9a-f]* ]] || exit 2
-  [[ "$merge_base" != *[!0-9a-f]* ]] || exit 2
+  [[ "$branch" != *[!0-9abcdef]* && "$base" != *[!0-9abcdef]* ]] || exit 2
+  [[ "$merge_base" != *[!0-9abcdef]* ]] || exit 2
 
   # Invoked indirectly by the EXIT trap below.
   # shellcheck disable=SC2317,SC2329
@@ -616,7 +616,7 @@ _gt_branch_content_merged_oids() {
     *) return 1 ;;
   esac
   [[ "${#base}" == "$native_width" ]] || return 1
-  [[ "$branch" != *[!0-9a-f]* && "$base" != *[!0-9a-f]* ]] || return 1
+  [[ "$branch" != *[!0-9abcdef]* && "$base" != *[!0-9abcdef]* ]] || return 1
 
   merge_base=$(git merge-base "$base" "$branch" 2>/dev/null) || return 1
 
@@ -786,7 +786,7 @@ _gt_materialize_worktree_list() {
   # The nonhex suffix is emitted only after od succeeds, preserving its status.
   set -- "$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null && printf x)"
   set -- "${1//[[:space:]]/}"
-  [[ ${#1} -eq 33 && "$1" == *x && "${1%x}" != *[!0-9a-f]* ]] || return 1
+  [[ ${#1} -eq 33 && "$1" == *x && "${1%x}" != *[!0-9abcdef]* ]] || return 1
   set -- $'\036git-tools-worktree-list-complete-'"${1%x}"
   # The unpredictable completion record carries the producer status through
   # the pipe. Bash 3.2 does not reliably retain process-substitution children

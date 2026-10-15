@@ -1340,11 +1340,30 @@ else
   _pass "the hung gh process is gone"
 fi
 
+# Print "<pid> <ppid>" for every process. Minimal Linux container images ship
+# without ps, so read /proc there.
+_process_table() {
+  local stat line rest ppid
+
+  if command -v ps >/dev/null 2>&1; then
+    ps -A -o pid= -o ppid= 2>/dev/null || ps -o pid,ppid 2>/dev/null
+    return
+  fi
+  for stat in /proc/[0-9]*/stat; do
+    { read -r line <"$stat"; } 2>/dev/null || continue
+    # The command name in parentheses can hold spaces; fields follow its
+    # last ") ".
+    rest=${line##*) }
+    read -r _ ppid _ <<<"$rest"
+    printf '%s %s\n' "${stat//[!0-9]/}" "$ppid"
+  done
+}
+
 # Print every descendant of a process, from one process-table snapshot.
 _descendants() {
   local table
 
-  table=$(ps -A -o pid= -o ppid= 2>/dev/null || ps -o pid,ppid 2>/dev/null) || return 0
+  table=$(_process_table) || return 0
   printf '%s\n' "$table" | awk -v root="$1" '
     $1 ~ /^[0-9]+$/ { parent[$1] = $2; pids[n++] = $1 }
     END {

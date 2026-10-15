@@ -112,6 +112,9 @@ _csv() {
 _on_exit() {
   local status=$?
 
+  # The exit is decided; a signal now must not report a second result or cut
+  # the state files short. What is left is bounded and makes no network call.
+  trap '' INT TERM HUP
   [[ -z "${GT_PR_SNAPSHOT_TMP:-}" ]] || rm -rf -- "$GT_PR_SNAPSHOT_TMP"
   [[ "$_result_done" == 1 ]] || status=2
   [[ -z "$_state_dir" ]] || _state_finish "$status"
@@ -1101,8 +1104,11 @@ _state_chars='abcdefghijklmnopqrstuvwxyz0123456789._-'
 _state_scope=""
 _state_ready=0
 _state_pending=""
-_state_keys=()
 _state_done=()
+# Wall-clock time when the current check started, for done/ records: the
+# test clock does not apply to files other tools compare with their own clock.
+_state_wall_base=""
+_state_check_wall=""
 
 # @brief Choose the state directory and this repository's scope.
 # Leaves _state_dir empty (no state files) when they are turned off, when no
@@ -1120,12 +1126,17 @@ _state_init() {
   else
     return 0
   fi
+  # Someone else's root is left alone: under sudo with HOME kept, writing would
+  # leave root-owned directories in the user's home.
+  if [[ -e "$root" ]]; then
+    [[ -O "$root" ]] || return 0
+  elif [[ "$root" == "${HOME:-}"/* ]]; then
+    [[ -O "$HOME" ]] || return 0
+  fi
   # GT_CURRENT_REPO_IDENTITY is host/owner/repository, already lowercased.
   # The host is left out: the same owner/repository on two hosts share keys.
   scope=${GT_CURRENT_REPO_IDENTITY#*/}
   scope=${scope/\//_}
-  # GitHub owners cannot contain `_`, so the first one splits owner from
-  # repository.
   [[ "$scope" == ?*_?* && "$scope" != *[!$_state_chars]* ]] || return 0
   _state_scope=$scope
   _state_dir=$root/git-tools/pr-watch
@@ -1152,8 +1163,10 @@ _state_write() {
   local file="$1" tmp
 
   _state_mkdir || return 0
+  # mv would move the file into a directory standing in the record's place.
+  [[ ! -d "$file" ]] || return 0
   tmp=$(mktemp "$file~$$.XXXXXX" 2>/dev/null) || return 0
-  if printf '%s\n' "$2" >"$tmp" 2>/dev/null && mv -f -- "$tmp" "$file" 2>/dev/null; then
+  if printf '%s\n' "$2" 2>/dev/null >"$tmp" && mv -f -- "$tmp" "$file" 2>/dev/null; then
     return 0
   fi
   rm -f -- "$tmp" 2>/dev/null || true
@@ -1169,40 +1182,50 @@ _state_pid_dead() {
   [[ "$1" =~ ^[1-9][[:digit:]]*$ ]] && ! kill -0 "$1" 2>/dev/null
 }
 
+# @brief List regular files directly in the given state directories that pass
+# the find age test, whose names use only layout characters (plus `~` and the
+# uppercase letters of temporary names), so no name can span two lines of the
+# listing.
+# Usage: _state_old <age test> <age> <directory>...
+_state_old() {
+  local test="$1" age="$2"
+  shift 2
+
+  find "$@" -maxdepth 1 -type f "$test" "$age" ! -name "*[!~ABCDEFGHIJKLMNOPQRSTUVWXYZ$_state_chars]*" \
+    -print 2>/dev/null
+}
+
 # @brief Remove state left behind by earlier runs.
-# Finished and exited records go after 30 days, temporary files once their
-# writer is gone, and watcher files once their watcher is gone and a day old
-# (a watcher killed outright cannot remove its own). Only regular files whose
-# names match the layout are removed, one at a time.
+# Finished and exited records go after 30 days, temporary files an hour after
+# their writer is gone (the age spares a writer on another host sharing this
+# home), and watcher files once their watcher is gone and a day old (a watcher
+# killed outright cannot remove its own). Only regular files whose names
+# match the layout are removed, one at a time.
 _state_prune() {
   local file name pid
 
   while IFS= read -r file; do
-    [[ "$file" == "$_state_dir"/*/* ]] || continue
     name=${file##*/}
     _state_is_key "$name" || continue
     rm -f -- "$file" 2>/dev/null || true
-  done < <(find "$_state_dir/exited" "$_state_dir/done" -maxdepth 1 -type f \
-    -mtime +30 -print 2>/dev/null)
-  for file in "$_state_dir"/*/*~*.*; do
-    [[ -f "$file" && ! -L "$file" ]] || continue
+  done < <(_state_old -mtime +30 "$_state_dir/exited" "$_state_dir/done")
+  while IFS= read -r file; do
     name=${file##*/}
+    [[ "$name" == ?*~* ]] || continue
     pid=${name##*~}
     pid=${pid%%.*}
     _state_pid_dead "$pid" || continue
     rm -f -- "$file" 2>/dev/null || true
-  done
+  done < <(_state_old -mmin +60 "$_state_dir/watchers" "$_state_dir/exited" "$_state_dir/done")
   while IFS= read -r file; do
-    [[ "$file" == "$_state_dir/watchers/"* ]] || continue
     name=${file##*/}
+    [[ "$name" != *~* ]] || continue
     pid=${name##*.}
     name=${name%.*}
-    [[ "$name" != *[!$_state_chars]* ]] || continue
     [[ "$name" == pending || "$name" == pending.?* ]] || _state_is_key "$name" || continue
     _state_pid_dead "$pid" || continue
     rm -f -- "$file" 2>/dev/null || true
-  done < <(find "$_state_dir/watchers" -maxdepth 1 -type f -mmin +1440 \
-    -print 2>/dev/null)
+  done < <(_state_old -mmin +1440 "$_state_dir/watchers")
 }
 
 # @brief Announce a waiting run before its targets are known.
@@ -1216,16 +1239,15 @@ _state_start() {
   _state_write "$_state_pending" "$$"
 }
 
-# @brief Record the resolved targets' keys and, for a waiting run, their
-# watcher files. Watcher files are written before the pending file goes, so a
-# reader never sees neither.
+# @brief Write a waiting run's watcher files once its targets are resolved.
+# Watcher files are written before the pending file goes, so a reader never
+# sees neither.
 _state_targets() {
   local number
 
-  [[ -n "$_state_dir" ]] || return 0
-  for number in ${_numbers[@]+"${_numbers[@]}"}; do
-    _state_keys+=("${_state_scope}_$number")
-    [[ "$_wait" == 0 ]] || _state_write "$_state_dir/watchers/${_state_scope}_$number.$$" "$$"
+  [[ -n "$_state_dir" && "$_wait" == 1 ]] || return 0
+  for number in "${_numbers[@]}"; do
+    _state_write "$_state_dir/watchers/${_state_scope}_$number.$$" "$$"
   done
   if [[ -n "$_state_pending" ]]; then
     rm -f -- "$_state_pending" 2>/dev/null || true
@@ -1233,15 +1255,29 @@ _state_targets() {
   fi
 }
 
+# @brief Note the wall-clock time a check starts (no process is started).
+_state_check_start() {
+  [[ -n "$_state_dir" ]] || return 0
+  if [[ -z "$_state_wall_base" ]]; then
+    _state_wall_base=$(date +%s 2>/dev/null) || _state_wall_base=""
+    [[ "$_state_wall_base" =~ ^[1-9][[:digit:]]*$ ]] || _state_wall_base=x
+    [[ "$_state_wall_base" == x ]] || _state_wall_base=$((_state_wall_base - SECONDS))
+  fi
+  _state_check_wall=-
+  [[ "$_state_wall_base" == x ]] || _state_check_wall=$((_state_wall_base + SECONDS))
+}
+
 # @brief Record pull requests this check found finished.
-# done/<key> holds "<head commit> <green|merged|closed>". A green record is
-# only written for a judgment of the current head, and it is rewritten only
-# when it changes.
+# done/<key> holds "<head commit> <green|merged|closed> <epoch>", the epoch
+# being when the check that judged it started, so a reader can tell a
+# judgment made before some later event (a push, say) from one made after.
+# A green record is only written for a judgment of the current head. A record
+# is rewritten only when its commit or word changes.
 _state_finished() {
   local i head word
 
   [[ -n "$_state_dir" ]] || return 0
-  for ((i = 0; i < ${#_state_keys[@]}; i++)); do
+  for ((i = 0; i < ${#_numbers[@]}; i++)); do
     case "${_state[i]:-}:${_reason[i]:-}" in
       "done":merged) word=merged ;;
       "done":*) word=green ;;
@@ -1252,27 +1288,30 @@ _state_finished() {
     [[ "$head" =~ ^[0123456789abcdef]{40}([0123456789abcdef]{24})?$ ]] || head=-
     [[ "${_state_done[i]:-}" != "$head $word" ]] || continue
     _state_done[i]="$head $word"
-    _state_write "$_state_dir/done/${_state_keys[$i]}" "$head $word"
+    _state_write "$_state_dir/done/${_state_scope}_${_numbers[$i]}" \
+      "$head $word $_state_check_wall"
   done
+  # Under errexit the caller would exit with a failing last command's status.
+  return 0
 }
 
 # @brief Record a waiting run's exit and remove its watcher files.
-# exited/<key> holds "<exit status> <state> <reason>" (informational). A pull
-# request in a named stall gets none: it waits on something outside it, and
-# watching again would not change that.
+# exited/<key> holds "<exit status> <state> <reason>" (informational), for
+# every target resolved by then, so a run that dies while resolving a later
+# branch target still records the earlier ones. A pull request last reported
+# in a named stall gets none: it waits on something outside it, and watching
+# again would not change that.
 _state_finish() {
-  local status="$1" i
+  local status="$1" i key
   local -a files
 
   [[ "$_wait" == 1 ]] || return 0
-  for ((i = 0; i < ${#_state_keys[@]}; i++)); do
-    [[ "${_state[i]:-}" != stall ]] || continue
-    _state_write "$_state_dir/exited/${_state_keys[$i]}" \
-      "$status ${_state[i]:--} ${_reason[i]:--}"
-  done
   files=()
-  for ((i = 0; i < ${#_state_keys[@]}; i++)); do
-    files+=("$_state_dir/watchers/${_state_keys[$i]}.$$")
+  for ((i = 0; i < ${#_numbers[@]}; i++)); do
+    key=${_state_scope}_${_numbers[$i]}
+    files+=("$_state_dir/watchers/$key.$$")
+    [[ "${_state[i]:-}" != stall ]] || continue
+    _state_write "$_state_dir/exited/$key" "$status ${_state[i]:--} ${_reason[i]:--}"
   done
   [[ -z "$_state_pending" ]] || files+=("$_state_pending")
   ((${#files[@]} == 0)) || rm -f -- "${files[@]}" 2>/dev/null || true
@@ -1333,6 +1372,7 @@ _state_targets
 while :; do
   _reset_tick
   _check_now=$(_now)
+  _state_check_start
   _snapshot_all
   [[ -n "$_server_now" ]] || _server_now=$_check_now
   _judge_all

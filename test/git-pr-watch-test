@@ -1469,6 +1469,21 @@ _state_scenario() {
   XDG_STATE_HOME=$(_tmpdir)
   export XDG_STATE_HOME
   _state=$XDG_STATE_HOME/git-tools/pr-watch
+  _state_t0=$(date +%s)
+}
+
+# Print a done record's commit and word, checking that its epoch is when this
+# case ran.
+_done_record() {
+  local commit word epoch now
+
+  { read -r commit word epoch <"$1"; } 2>/dev/null || return 0
+  now=$(date +%s)
+  if [[ "$epoch" =~ ^[0-9]+$ ]] && ((epoch >= _state_t0 && epoch <= now)); then
+    printf '%s %s\n' "$commit" "$word"
+  else
+    printf 'epoch %s outside %s..%s\n' "$epoch" "$_state_t0" "$now"
+  fi
 }
 
 # List a state directory's entries, one per line, sorted.
@@ -1492,10 +1507,13 @@ _state_scenario
 _serve 1 "$(_response "$(_green_pr 12)")"
 _watch 12
 _assert_eq "a one-shot green run exits zero" 0 "$status"
-_assert_eq "a green pull request is recorded as done" "$HEAD green" "$(cat "$_state/done/example_repo_12" 2>/dev/null)"
+_assert_eq "a green pull request is recorded as done" "$HEAD green" "$(_done_record "$_state/done/example_repo_12")"
 _assert_eq "a one-shot run writes no watcher files" "" "$(_state_ls watchers)"
 _assert_eq "a one-shot run writes no exit records" "" "$(_state_ls exited)"
-_assert_eq "the state directory is private" "$_state" "$(find "$_state" -prune -perm 700 -print)"
+# A setgid parent can add g+s to new directories; only access bits matter.
+# shellcheck disable=SC2012 # one known path, not a listing
+_perms=$(ls -ld "$_state" | cut -c2-10)
+_assert_eq "the state directory is private" "rwx------" "${_perms//S/-}"
 
 _state_scenario
 _serve 1 "$(_response "$(_running_pr 12)")"
@@ -1511,8 +1529,8 @@ _state_scenario
 _serve 1 "$(_response "$(_green_pr 12 '{"state":"MERGED","mergeable":"UNKNOWN"}')" \
   "$(_green_pr 13 '{"state":"CLOSED"}')" "$(_running_pr 14)")"
 _watch 12 13 14
-_assert_eq "a merged pull request is recorded" "$HEAD merged" "$(cat "$_state/done/example_repo_12" 2>/dev/null)"
-_assert_eq "a closed pull request is recorded" "$HEAD closed" "$(cat "$_state/done/example_repo_13" 2>/dev/null)"
+_assert_eq "a merged pull request is recorded" "$HEAD merged" "$(_done_record "$_state/done/example_repo_12")"
+_assert_eq "a closed pull request is recorded" "$HEAD closed" "$(_done_record "$_state/done/example_repo_13")"
 _assert_eq "only finished pull requests are recorded" "example_repo_12
 example_repo_13" "$(_state_ls "done")"
 
@@ -1524,7 +1542,7 @@ _serve 2 "$(_response "$(_green_pr 12)")"
 _wait_watch 12
 _assert_eq "a waiting run to green exits zero" 0 "$status"
 _assert_eq "the exit is recorded" "0 done green" "$(cat "$_state/exited/example_repo_12" 2>/dev/null)"
-_assert_eq "the finish is recorded" "$HEAD green" "$(cat "$_state/done/example_repo_12" 2>/dev/null)"
+_assert_eq "the finish is recorded" "$HEAD green" "$(_done_record "$_state/done/example_repo_12")"
 _assert_eq "the watcher files are removed at exit" "" "$(_state_ls watchers)"
 _assert_eq "no temporary files are left" "" "$(cd "$_state" && find . -name '*~*' -print)"
 
@@ -1574,6 +1592,145 @@ wait "$_watcher"
 _assert_eq "the pending file is removed at exit" "" "$(_state_ls watchers)"
 _assert_eq "a run with no resolved targets records no exit" "" "$(_state_ls exited)"
 
+# A run that dies while resolving a later branch target still records the
+# targets resolved before it.
+_state_scenario
+touch "$FAKE_GH_DIR/branch-1.hang"
+printf '200\n' >"$FAKE_GH_DIR/branch-1.status"
+(cd "$repo" && PATH="$bin_dir:$PATH" exec bash "$ROOT/bin/git-pr-watch" --wait \
+  12 topic >"$FAKE_GH_DIR/out" 2>"$FAKE_GH_DIR/err") &
+_watcher=$!
+_deadline=$((SECONDS + 20))
+while [[ ! -s "$FAKE_GH_DIR/hang.pid" ]] && ((SECONDS < _deadline)); do sleep 0.1; done
+kill -TERM "$_watcher" 2>/dev/null
+wait "$_watcher"
+_assert_eq "a target resolved before the exit is recorded" "143 - -" \
+  "$(cat "$_state/exited/example_repo_12" 2>/dev/null)"
+_assert_eq "nothing is left in watchers after an exit while resolving" "" "$(_state_ls watchers)"
+
+# A signal that arrives while the exit records are written changes neither the
+# result nor the records. The mktemp shim holds the exit-record write open.
+_state_scenario
+_slow=$(_tmpdir)
+_real_mktemp=$(type -P mktemp)
+cat >"$_slow/mktemp" <<EOF
+#!/usr/bin/env bash
+if [[ "\$*" == */exited/* ]]; then
+  : >"$FAKE_GH_DIR/in-exit"
+  sleep 2
+fi
+exec "$_real_mktemp" "\$@"
+EOF
+chmod +x "$_slow/mktemp"
+_serve 1 "$(_response "$(_green_pr 12)")"
+(cd "$repo" && PATH="$_slow:$bin_dir:$PATH" exec bash "$ROOT/bin/git-pr-watch" --wait \
+  12 >"$FAKE_GH_DIR/out" 2>"$FAKE_GH_DIR/err") &
+_watcher=$!
+_deadline=$((SECONDS + 20))
+while [[ ! -e "$FAKE_GH_DIR/in-exit" ]] && ((SECONDS < _deadline)); do sleep 0.1; done
+kill -TERM "$_watcher" 2>/dev/null
+wait "$_watcher"
+_assert_eq "a signal during the exit keeps the status" 0 "$?"
+_assert_eq "a signal during the exit adds no second result" 1 \
+  "$(grep -c '^result:' "$FAKE_GH_DIR/out")"
+_assert_eq "a signal during the exit still records it" "0 done green" \
+  "$(cat "$_state/exited/example_repo_12" 2>/dev/null)"
+_assert_eq "a signal during the exit still removes the watcher file" "" "$(_state_ls watchers)"
+
+# Stand-ins for mv and mktemp that log state writes and can fail them, for
+# the checks below that a mode-bit change cannot make (root ignores modes).
+_shim_dir=$(_tmpdir)
+_real_mv=$(type -P mv)
+_real_mktemp=$(type -P mktemp)
+cat >"$_shim_dir/mv" <<EOF
+#!/bin/sh
+for last; do :; done
+case "\$last" in
+  */git-tools/pr-watch/*)
+    dir=\${last%/*}
+    printf '%s ->' "\$dir" >>"\$SHIM_LOG"
+    for entry in "\$dir"/*; do
+      [ ! -e "\$entry" ] || printf ' %s' "\${entry##*/}" >>"\$SHIM_LOG"
+    done
+    printf '\n' >>"\$SHIM_LOG"
+    for arg; do
+      case "\$arg" in */git-tools/pr-watch/*~*) printf 'src %s\n' "\${arg##*/}" >>"\$SHIM_LOG" ;; esac
+    done
+    [ -z "\${SHIM_MV_FAIL:-}" ] || exit 1
+    ;;
+esac
+exec "$_real_mv" "\$@"
+EOF
+cat >"$_shim_dir/mktemp" <<EOF
+#!/bin/sh
+case "\$*" in */git-tools/pr-watch/*) [ -z "\${SHIM_MKTEMP_FAIL:-}" ] || exit 1 ;; esac
+exec "$_real_mktemp" "\$@"
+EOF
+chmod +x "$_shim_dir/mv" "$_shim_dir/mktemp"
+
+# The watcher file lands while the pending file still exists, through a
+# temporary file named <name>~<pid>.XXXXXX.
+_state_scenario
+SHIM_LOG=$FAKE_GH_DIR/shim.log
+export SHIM_LOG
+_serve 1 "$(_response "$(_running_pr 12)")"
+_serve 2 "$(_response "$(_green_pr 12)")"
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$_shim_dir:$bin_dir:$PATH" \
+  git -C "$repo" pr-watch --wait 12 2>/dev/null)
+_assert_contains "the pending file exists when the watcher file lands" "pending.example_repo." \
+  "$(grep '/watchers ->' "$SHIM_LOG" | sed -n 2p)"
+if grep -q '^src example_repo_12\.[0-9][0-9]*~[0-9][0-9]*\.' "$SHIM_LOG"; then
+  _pass "state files are written through <name>~<pid>.XXXXXX"
+else
+  _fail "state files are written through <name>~<pid>.XXXXXX"
+  cat "$SHIM_LOG" >&2
+fi
+unset SHIM_LOG
+
+# A failed temporary file or rename never changes the exit status.
+for _mode in SHIM_MKTEMP_FAIL SHIM_MV_FAIL; do
+  _state_scenario
+  _serve 1 "$(_response "$(_green_pr 12)")"
+  out=$(env "$_mode=1" SHIM_LOG=/dev/null PATH="$_shim_dir:$bin_dir:$PATH" \
+    git -C "$repo" pr-watch 12 2>/dev/null)
+  _assert_eq "$_mode leaves a one-shot exit unchanged" 0 "$?"
+  _state_scenario
+  _serve 1 "$(_response "$(_running_pr 12)")"
+  _serve 2 "$(_response "$(_green_pr 12)")"
+  printf '1000\n' >"$_clock"
+  out=$(env "$_mode=1" SHIM_LOG=/dev/null GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" \
+    PATH="$_shim_dir:$bin_dir:$PATH" git -C "$repo" pr-watch --wait 12 2>/dev/null)
+  _assert_eq "$_mode leaves a waiting exit unchanged" 0 "$?"
+done
+
+# With neither an absolute XDG_STATE_HOME nor an absolute HOME there are none.
+_state_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+out=$(env -u XDG_STATE_HOME HOME=relhome PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>/dev/null)
+if [[ ! -e "$repo/relhome/.local/state" ]]; then
+  _pass "no absolute root writes no state files"
+else
+  _fail "no absolute root writes no state files"
+fi
+
+# Green checks awaiting a review are done and recorded green; checks for an
+# older head are not recorded at all.
+_state_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"mergeStateStatus":"BLOCKED","reviewDecision":"REVIEW_REQUIRED"}')" \
+  "$(_green_pr 13 "{\"headRefOid\":\"$OTHER\"}")")"
+_watch 12 13
+_assert_eq "green awaiting review is recorded green" "$HEAD green" "$(_done_record "$_state/done/example_repo_12")"
+_assert_eq "checks for an older head write no done record" "example_repo_12" "$(_state_ls "done")"
+
+# An internal error still records the exit, with status 2.
+_state_scenario
+_serve 1 "$(_response)"
+out=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-watch --wait 12 2>/dev/null)
+_assert_contains "an internal error in a waiting run is reported" "result: 2 reason=internal" "$out"
+_assert_eq "an internal error records the exit" "2 - -" "$(cat "$_state/exited/example_repo_12" 2>/dev/null)"
+
 # Turned off, nothing is written; any other value warns and keeps them on.
 _state_scenario
 _serve 1 "$(_response "$(_green_pr 12)")"
@@ -1588,7 +1745,9 @@ _state_scenario
 _serve 1 "$(_response "$(_green_pr 12)")"
 out=$(GIT_PR_WATCH_STATE=no PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>&1)
 _assert_contains "a bad GIT_PR_WATCH_STATE is reported" "ignoring GIT_PR_WATCH_STATE=no" "$out"
-_assert_eq "a bad GIT_PR_WATCH_STATE keeps state files on" "$HEAD green" "$(cat "$_state/done/example_repo_12" 2>/dev/null)"
+out=$(GIT_PR_WATCH_STATE=1 PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>&1)
+_assert_not_contains "GIT_PR_WATCH_STATE=1 is not warned about" "ignoring" "$out"
+_assert_eq "a bad GIT_PR_WATCH_STATE keeps state files on" "$HEAD green" "$(_done_record "$_state/done/example_repo_12")"
 
 # A relative XDG_STATE_HOME is ignored for HOME's default; with no absolute
 # root there are no state files.
@@ -1597,12 +1756,21 @@ _serve 1 "$(_response "$(_green_pr 12)")"
 _home=$(_tmpdir)
 out=$(XDG_STATE_HOME=relative HOME="$_home" PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>/dev/null)
 _assert_eq "a relative XDG_STATE_HOME falls back to HOME" "$HEAD green" \
-  "$(cat "$_home/.local/state/git-tools/pr-watch/done/example_repo_12" 2>/dev/null)"
+  "$(_done_record "$_home/.local/state/git-tools/pr-watch/done/example_repo_12")"
 if [[ ! -e "$repo/relative" ]]; then
   _pass "a relative XDG_STATE_HOME is never used"
 else
   _fail "a relative XDG_STATE_HOME is never used"
 fi
+
+# A directory standing in a record's place is left alone.
+_state_scenario
+mkdir -p "$_state/done/example_repo_12"
+_serve 1 "$(_response "$(_green_pr 12)")"
+_watch 12
+_assert_eq "a directory in a record's place does not change the exit" 0 "$status"
+_assert_eq "nothing is written into a directory in a record's place" "" \
+  "$(_state_ls "done/example_repo_12")"
 
 # State that cannot be written never changes the report or the exit.
 _state_scenario
@@ -1626,15 +1794,27 @@ for _f in done/example_repo_1 exited/example_repo_1 done/notes \
 done
 printf 'x\n' >"$_state/done/example_repo_6"
 printf 'x\n' >"$_state/watchers/example_repo_7.$_dead"
+# A fresh temporary file of a writer gone here may be another host's.
+printf 'x\n' >"$_state/done/example_repo_9~$_dead.AbC123"
+# An old name spanning two lines must not stand for a fresh record.
+printf 'x\n' >"$_state/done/example_repo_10"
+printf 'x\n' >"$_state/done/example_repo_10
+x"
+touch -t "$_old" "$_state/done/example_repo_10
+x"
 mkdir "$_state/done/example_repo_8"
 touch -t "$_old" "$_state/done/example_repo_8"
 _serve 1 "$(_response "$(_green_pr 12)")"
 _wait_watch 12
-_assert_eq "pruning keeps live, recent, and foreign entries" "example_repo_12
+_assert_eq "pruning keeps live, recent, and foreign entries" "example_repo_10
+example_repo_10
+example_repo_12
 example_repo_3~$$.AbC123
 example_repo_6
 example_repo_8
-notes" "$(_state_ls "done")"
+example_repo_9~$_dead.AbC123
+notes
+x" "$(_state_ls "done")"
 _assert_eq "pruning removes old exit records" "example_repo_12" "$(_state_ls exited)"
 _assert_eq "pruning removes only old watcher files of gone watchers" "example_repo_5.$$
 example_repo_7.$_dead

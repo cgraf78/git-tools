@@ -1383,7 +1383,13 @@ _signal_case() {
       sleep 0.1
     done
   fi
+  # Wait until the watcher has started its child (the hung call, or the
+  # sleep between checks) so the leftover check has something to check.
   children=$(_descendants "$watcher")
+  while [[ -z "$children" ]] && ((SECONDS < deadline)); do
+    sleep 0.1
+    children=$(_descendants "$watcher")
+  done
   if [[ -n "$children" ]]; then
     _pass "$signal during the $when: the watcher's processes were found"
   else
@@ -1408,6 +1414,38 @@ _signal_case() {
 _signal_case TERM 143 call
 _signal_case HUP 129 call
 _signal_case TERM 143 sleep
+
+# A rate limit while resolving a branch target is waited out in a waiting run.
+_scenario
+printf '403\n' >"$FAKE_GH_DIR/branch-1.status"
+printf '%s\n' '{"message":"API rate limit exceeded"}' >"$FAKE_GH_DIR/branch-1.json"
+printf '%s\n' 'X-Ratelimit-Remaining: 0' 'X-Ratelimit-Reset: 1792073710' >"$FAKE_GH_DIR/branch-1.headers"
+printf '%s\n' '{"data":{"repository":{"pullRequests":{"nodes":[{"number":21,"state":"OPEN","isCrossRepository":false}]}}}}' \
+  >"$FAKE_GH_DIR/branch.json"
+_serve 1 "$(_response "$(_green_pr 21)")"
+_wait_watch topic
+_assert_eq "a rate-limited branch lookup is waited out" 0 "$status"
+_assert_eq "the lookup waited for the reset" 1060 "$(cat "$_clock")"
+
+# A branch lookup that hangs is cut off by the watchdog and retried.
+_scenario
+touch "$FAKE_GH_DIR/branch-1.hang"
+printf '200\n' >"$FAKE_GH_DIR/branch-1.status"
+printf '%s\n' '{"data":{"repository":{"pullRequests":{"nodes":[{"number":21,"state":"OPEN","isCrossRepository":false}]}}}}' \
+  >"$FAKE_GH_DIR/branch.json"
+_serve 1 "$(_response "$(_green_pr 21)")"
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+_started=$SECONDS
+out=$(GIT_TOOLS_TEST_PR_WATCH_CALL_TIMEOUT=1 GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" \
+  PATH="$bin_dir:$PATH" git -C "$repo" pr-watch --wait topic 2>/dev/null)
+status=$?
+_assert_eq "a hung branch lookup is cut off and retried" 0 "$status"
+if ((SECONDS - _started < 15)); then
+  _pass "the watchdog cut the hung branch lookup off"
+else
+  _fail "the watchdog cut the hung branch lookup off"
+fi
 
 _scenario
 _watch --timeout 30 12

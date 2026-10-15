@@ -509,7 +509,7 @@ gt_pr_snapshot_call() {
     ) </dev/null >/dev/null 2>&1 &
     watchdog=$!
     wait "$gh_pid" || rc=$?
-    : >"$dir/done"
+    : >"$dir/done" 2>/dev/null || true
     kill -TERM "$watchdog" 2>/dev/null || true
     wait "$watchdog" 2>/dev/null || true
   else

@@ -1299,9 +1299,9 @@ _state_finished() {
 # @brief Record a waiting run's exit and remove its watcher files.
 # exited/<key> holds "<exit status> <state> <reason>" (informational), for
 # every target resolved by then, so a run that dies while resolving a later
-# branch target still records the earlier ones. A pull request last reported
-# in a named stall gets none: it waits on something outside it, and watching
-# again would not change that.
+# branch target still records the earlier ones. A reader takes it to mean
+# the pull request was watched until then and the caller got the result,
+# whatever it was (a stall included).
 _state_finish() {
   local status="$1" i key
   local -a files
@@ -1311,7 +1311,6 @@ _state_finish() {
   for ((i = 0; i < ${#_numbers[@]}; i++)); do
     key=${_state_scope}_${_numbers[$i]}
     files+=("$_state_dir/watchers/$key.$$")
-    [[ "${_state[i]:-}" != stall ]] || continue
     _state_write "$_state_dir/exited/$key" "$status ${_state[i]:--} ${_reason[i]:--}"
   done
   [[ -z "$_state_pending" ]] || files+=("$_state_pending")

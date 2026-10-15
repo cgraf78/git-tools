@@ -1565,7 +1565,7 @@ _assert_eq "the finish is recorded" "$HEAD green" "$(_done_record "$_state/done/
 _assert_eq "the watcher files are removed at exit" "" "$(_state_ls watchers)"
 _assert_eq "no temporary files are left" "" "$(cd "$_state" && find . -name '*~*' -print)"
 
-# A pull request in a named stall gets no exit record; the others do.
+# A pull request in a named stall gets an exit record like the others.
 _state_scenario
 _approval_pr=$(_pr 12 "$(_list "$(_run t COMPLETED SUCCESS 1 COMPLETED 21 "$OLD")")" \
   "$(_list "$(_suite 1 COMPLETED SUCCESS 1)" "$(_suite 2 COMPLETED ACTION_REQUIRED 0 .github/workflows/z.yml)")")
@@ -1573,7 +1573,8 @@ _serve 1 "$(_response "$_approval_pr" "$(_running_pr 13)")"
 _serve 2 "$(_response "$_approval_pr" "$(_green_pr 13)")"
 _wait_watch 12 13
 _assert_contains "the first pull request stalls" "pr=12 state=stall" "$out"
-_assert_eq "a stalled pull request gets no exit record" "example_repo_13" "$(_state_ls exited)"
+_assert_eq "a stalled pull request gets an exit record" "8 stall approval-required" \
+  "$(cat "$_state/exited/example_repo_12" 2>/dev/null)"
 _assert_eq "the other pull request's exit is recorded" "8 done green" "$(cat "$_state/exited/example_repo_13" 2>/dev/null)"
 _assert_eq "a stalled pull request's watcher file is removed too" "" "$(_state_ls watchers)"
 

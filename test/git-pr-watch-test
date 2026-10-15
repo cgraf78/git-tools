@@ -1098,6 +1098,15 @@ else
   _fail "an inherited temporary path is never removed"
 fi
 
+# A check name in a partial-error body cannot turn "not found" into a rate
+# limit: structured error types win over plain-text matches.
+_scenario
+_serve 1 "$(jq -cn --argjson pr "$(_pr 12 "$(_list "$(_run 'secondary rate limit' COMPLETED SUCCESS 1 COMPLETED 21 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED SUCCESS 1)")")" \
+  '{data: {repository: {p00: $pr, p01: null}}, errors: [{type: "NOT_FOUND", path: ["repository", "p01"], message: "Could not resolve"}]}')"
+_watch 12 13
+_assert_contains "check text cannot mask a missing pull request" "result: 2 reason=not-found" "$out"
+
 # --- time conversion ---------------------------------------------------------
 
 _epochs=$(

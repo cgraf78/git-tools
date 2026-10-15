@@ -363,6 +363,11 @@ gt_pr_classify_response() {
     GT_PR_RESPONSE_CLASS=auth
   elif [[ "$status" == 403 && "$sso" == 1 ]]; then
     GT_PR_RESPONSE_CLASS=sso
+  elif [[ "$status" == 200 && "$body" == *'"type":"NOT_FOUND"'* ]]; then
+    # Structured error types are checked before the plain-text matches below:
+    # a partial-error body still carries the found pull requests' data, whose
+    # check names a pull request author can write.
+    GT_PR_RESPONSE_CLASS=not-found
   elif [[ "$remaining" == 0 || "$retry_after" =~ ^[0-9]+$ || "$status" == 429 ||
     "$body" == *'"type":"RATE_LIMITED"'* || "$body" == *"secondary rate limit"* ]]; then
     GT_PR_RESPONSE_CLASS=rate-limited
@@ -390,8 +395,6 @@ gt_pr_classify_response() {
         GT_PR_RESPONSE_MESSAGE=$(_gt_pr_first_line "$errors")
         ;;
     esac
-  elif [[ "$status" == 200 && "$body" == *'"type":"NOT_FOUND"'* ]]; then
-    GT_PR_RESPONSE_CLASS=not-found
   elif [[ "$status" == 4?? || "$body" == *'"type":"FORBIDDEN"'* ||
     "$body" == *'"type":"INSUFFICIENT_SCOPES"'* ||
     "$body" == *'"code":"undefinedField"'* ||

@@ -46,6 +46,37 @@ git pr-checks --porcelain
 The command returns `0` when checks pass, `8` while checks are pending, and `1`
 when checks fail, are cancelled, or are missing.
 
+### `git pr-watch`
+
+Reports whether one or more GitHub pull requests are done (checks green, or
+merged), need action, or are still pending, with one exit status for the set.
+
+```sh
+git pr-watch
+git pr-watch 123 124 125
+git pr-watch feature/my-branch
+```
+
+Each pull request is judged on its current head commit. The newest run of each
+workflow replaces older runs on the same commit, and a check counts as green
+only once its whole workflow run has finished. A failure while the rest of the
+run continues is reported at once; other failures and cancellations are
+reported after they have stood for 150 seconds, which leaves room for an
+automatic re-run. A workflow that failed to start, or that is waiting for a
+maintainer's approval, is reported as such. Right after a push, while GitHub
+still shows the previous head, the pull request is pending. With auto-merge
+enabled, done means merged, and falling behind the base needs action.
+
+Output is one `pr=<n> state=<done|action|pending|stall> reason=<reason>
+head=<oid>` line per pull request, then details for pull requests that need
+action (failing checks and a command for each failed job's log), and a final
+`result:` line. A run takes at most 20 pull requests, all from the current
+checkout's repository. The test suite needs `jq` and skips without it.
+
+The command returns `0` when every pull request is done, `1` when one needs
+action, `8` while one is pending, `3` when GitHub could not be read, and `2`
+for usage, not-found, authentication, environment, and internal errors.
+
 ### `git pr-open`
 
 Pushes the current branch with upstream tracking and creates a GitHub pull
@@ -923,6 +954,7 @@ git pr-restack
 git pr-stack
 git pr-submit
 git pr-sync-stack
+git pr-watch
 git repo-state
 git resolve-base
 git stash-audit

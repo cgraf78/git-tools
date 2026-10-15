@@ -12,6 +12,7 @@ program	bin/git-pr-restack
 program	bin/git-pr-stack
 program	bin/git-pr-submit
 program	bin/git-pr-sync-stack
+program	bin/git-pr-watch
 program	bin/git-repo-state
 program	bin/git-resolve-base
 program	bin/git-stash-audit
@@ -28,6 +29,7 @@ program	completions/git-pr-restack.bash
 program	completions/git-pr-stack.bash
 program	completions/git-pr-submit.bash
 program	completions/git-pr-sync-stack.bash
+program	completions/git-pr-watch.bash
 program	completions/git-repo-state.bash
 program	completions/git-resolve-base.bash
 program	completions/git-stash-audit.bash
@@ -37,6 +39,7 @@ program	lib/git-tools-base.sh
 program	lib/git-tools-cleanup.sh
 program	lib/git-tools-git.sh
 program	lib/git-tools-inventory.sh
+program	lib/git-tools-pr-snapshot.sh
 program	lib/git-tools-pr.sh
 program	scripts/checkout-installer.conf
 program	share/git-tools/shell.sh
@@ -55,6 +58,7 @@ program	test/git-pr-restack-test
 program	test/git-pr-stack-test
 program	test/git-pr-submit-test
 program	test/git-pr-sync-stack-test
+program	test/git-pr-watch-test
 program	test/git-repo-state-test
 program	test/git-resolve-base-test
 program	test/git-stash-audit-test

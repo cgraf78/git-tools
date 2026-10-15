@@ -1,0 +1,1122 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PATH="$ROOT/bin:$PATH"
+export NO_COLOR=1
+
+_failures=0
+# shellcheck source=test/lib/test-temp.sh
+. "$ROOT/test/lib/test-temp.sh"
+gt_test_temp_init || exit 1
+# shellcheck source=test/lib/hermetic-git.sh
+. "$ROOT/test/lib/hermetic-git.sh"
+gt_test_git_isolate "$GT_TEST_TEMP_ROOT" || exit 1
+_tmpdir() { gt_test_temp_dir; }
+
+echo "=== git pr-watch ==="
+
+# The fake gh runs the command's real jq program, so the suite needs jq.
+if ! command -v jq >/dev/null 2>&1; then
+  echo "ok - skipped: jq is not installed"
+  exit 0
+fi
+
+_pass() {
+  printf 'ok - %s\n' "$1"
+}
+
+_fail() {
+  printf 'not ok - %s\n' "$1" >&2
+  _failures=$((_failures + 1))
+}
+
+_assert_eq() {
+  local name="$1" expected="$2" actual="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected: %s\n  actual:   %s\n' "$expected" "$actual" >&2
+  fi
+}
+
+_assert_contains() {
+  local name="$1" needle="$2" haystack="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output to contain: %s\n  actual output:\n%s\n' \
+      "$needle" "$haystack" >&2
+  fi
+}
+
+_assert_not_contains() {
+  local name="$1" needle="$2" haystack="$3"
+
+  if [[ "$haystack" != *"$needle"* ]]; then
+    _pass "$name"
+  else
+    _fail "$name"
+    printf '  expected output not to contain: %s\n  actual output:\n%s\n' \
+      "$needle" "$haystack" >&2
+  fi
+}
+
+# Every fake response carries this Date header; completion times below are
+# relative to it so the failure-confirmation window is deterministic.
+#   Thu, 15 Oct 2026 14:14:10 GMT = 1792073650
+RECENT=2026-10-15T14:13:10Z # 60s before the server clock: inside the window
+OLD=2026-10-15T14:04:10Z    # 600s before: past the window
+HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+OTHER=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+_write_gh_stub() {
+  local bin="$1/gh"
+
+  cat >"$bin" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+dir=${FAKE_GH_DIR:?}
+printf '%s\n' "$*" >>"$dir/log"
+printf '%s CLICOLOR_FORCE=%s GH_FORCE_TTY=%s GH_DEBUG=%s NO_COLOR=%s\n' "$1" \
+  "${CLICOLOR_FORCE-unset}" "${GH_FORCE_TTY-unset}" "${GH_DEBUG-unset}" \
+  "${NO_COLOR-unset}" >>"$dir/env-all"
+
+case "$1 ${2:-}" in
+  "auth status")
+    [[ ! -f "$dir/auth-fail" ]] || exit 1
+    exit 0
+    ;;
+  "repo view")
+    printf 'example/repo\thttps://github.test/example/repo\n'
+    exit 0
+    ;;
+  "api graphql")
+    # A real gh without credentials makes no request and exits 4.
+    if [[ -f "$dir/auth-fail" ]]; then
+      printf 'To get started with GitHub CLI, please run:  gh auth login\n' >&2
+      exit 4
+    fi
+    ;;
+  *)
+    printf 'unexpected gh call: %s\n' "$*" >&2
+    exit 99
+    ;;
+esac
+
+printf 'CLICOLOR_FORCE=%s GH_FORCE_TTY=%s GH_DEBUG=%s NO_COLOR=%s GH_HOST=%s GH_REPO=%s\n' \
+  "${CLICOLOR_FORCE-unset}" "${GH_FORCE_TTY-unset}" "${GH_DEBUG-unset}" \
+  "${NO_COLOR-unset}" "${GH_HOST-unset}" "${GH_REPO-unset}" >>"$dir/env"
+
+jq_program=""
+query=""
+include=0
+prev=""
+for arg in "$@"; do
+  case "$prev" in
+    --jq) jq_program=$arg ;;
+    -f) [[ "$arg" != query=* ]] || query=${arg#query=} ;;
+  esac
+  [[ "$arg" != -i ]] || include=1
+  prev=$arg
+done
+
+# Branch lookups have their own fixture so snapshot calls number from 1.
+if [[ "$query" == *PrWatchBranch* ]]; then
+  base="$dir/branch"
+else
+  n=$(($(cat "$dir/n" 2>/dev/null || printf 0) + 1))
+  printf '%s\n' "$n" >"$dir/n"
+  base="$dir/call-$n"
+  # Reuse the last fixture once a scenario runs out of numbered ones.
+  if [[ -e "$base.json" || -e "$base.status" ]]; then
+    printf '%s\n' "$base" >"$dir/last"
+  else
+    base=$(cat "$dir/last")
+  fi
+fi
+
+status=200
+[[ ! -f "$base.status" ]] || status=$(cat "$base.status")
+if [[ "$include" == 1 ]]; then
+  printf 'HTTP/2.0 %s X\n' "$status"
+  printf 'Access-Control-Expose-Headers: ETag, Retry-After, X-RateLimit-Remaining, X-RateLimit-Reset, X-GitHub-SSO\r\n'
+  [[ -f "$base.nodate" ]] || printf 'Date: Thu, 15 Oct 2026 14:14:10 GMT\r\n'
+  if [[ -f "$base.headers" ]]; then
+    while IFS= read -r header; do
+      printf '%s\r\n' "$header"
+    done <"$base.headers"
+  fi
+  printf '\r\n'
+fi
+# gh prints only headers, then an error, when the body is empty or not JSON.
+if [[ ! -f "$base.json" ]]; then
+  printf 'unexpected end of JSON input\n' >&2
+  exit 1
+fi
+# gh skips --jq and prints the raw body for errors and non-2xx statuses.
+if [[ "$status" != 200 ]] || jq -e 'has("errors")' "$base.json" >/dev/null 2>&1; then
+  cat "$base.json"
+  exit 1
+fi
+jq -r "$jq_program" "$base.json"
+EOF
+  chmod +x "$bin"
+}
+
+_git_init() {
+  local repo="$1"
+
+  git init -q --initial-branch=main "$repo"
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config core.hooksPath /dev/null
+  printf 'base\n' >"$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -q -m base
+}
+
+# --- fixture builders -------------------------------------------------------
+
+# A CheckRun context. Args: name status conclusion suite-id suite-status id
+# [completedAt] [required] [event] [workflow-path] [suite-conclusion].
+_run() {
+  jq -cn --arg name "$1" --arg status "$2" --arg conclusion "$3" \
+    --argjson suite "$4" --arg suite_status "$5" --argjson id "$6" \
+    --arg completed "${7:-}" --arg req "${8:-true}" --arg event "${9:-pull_request}" \
+    --arg path "${10:-.github/workflows/test.yml}" --arg suite_conclusion "${11:-}" '
+    {__typename: "CheckRun", databaseId: $id, name: $name, status: $status,
+     conclusion: (if $conclusion == "" then null else $conclusion end),
+     completedAt: (if $completed == "" then null else $completed end),
+     isRequired: ($req == "true"),
+     checkSuite: {databaseId: $suite, status: $suite_status,
+       conclusion: (if $suite_conclusion == "" then null else $suite_conclusion end),
+       app: {databaseId: 15368, slug: "github-actions"},
+       workflowRun: {event: $event, file: {path: $path}, workflow: {databaseId: 7}}}}'
+}
+
+# A StatusContext. Args: context state createdAt.
+_status_context() {
+  jq -cn --arg context "$1" --arg state "$2" --arg created "$3" '
+    {__typename: "StatusContext", context: $context, state: $state,
+     createdAt: $created, isRequired: false}'
+}
+
+# A check suite as listed under checkSuites. Args: id status conclusion runs
+# [workflow-path] [event] [app-slug].
+_suite() {
+  jq -cn --argjson id "$1" --arg status "$2" --arg conclusion "$3" \
+    --argjson runs "$4" --arg path "${5:-.github/workflows/test.yml}" \
+    --arg event "${6:-pull_request}" --arg app "${7:-github-actions}" '
+    {databaseId: $id, status: $status,
+     conclusion: (if $conclusion == "" then null else $conclusion end),
+     app: {slug: $app}, checkRuns: {totalCount: $runs},
+     workflowRun: {event: $event, file: {path: $path}}}'
+}
+
+# Join JSON values into a JSON array.
+_list() {
+  if (($# == 0)); then
+    printf '[]'
+  else
+    printf '%s\n' "$@" | jq -cs '.'
+  fi
+}
+
+# A pull request node. Args: number contexts-json suites-json [overrides].
+_pr() {
+  local extra=${4:-}
+
+  [[ -n "$extra" ]] || extra='{}'
+  jq -cn --argjson n "$1" --argjson ctx "$2" --argjson suites "$3" \
+    --argjson extra "$extra" --arg head "$HEAD" '
+    {number: $n, url: "https://github.test/example/repo/pull/\($n)",
+     state: "OPEN", isDraft: false, mergeable: "MERGEABLE",
+     mergeStateStatus: "CLEAN", reviewDecision: null, baseRefName: "main",
+     headRefName: "feature/\($n)", headRefOid: $head,
+     isCrossRepository: false, autoMergeRequest: null,
+     commits: {nodes: [{commit: {oid: $head,
+       statusCheckRollup: (if ($ctx | length) == 0 then null
+         else {contexts: {totalCount: ($ctx | length), nodes: $ctx}} end),
+       checkSuites: {totalCount: ($suites | length), nodes: $suites}}}]}}
+    * $extra'
+}
+
+# A snapshot response holding the given PR nodes as p00, p01, ...
+_response() {
+  printf '%s\n' "$@" | jq -cs '
+    {data: {repository: (to_entries
+      | map({key: ("p" + (if .key < 10 then "0" else "" end) + (.key | tostring)),
+             value: .value}) | from_entries)}}'
+}
+
+# One passing check in a completed suite.
+_green_pr() {
+  _pr "$1" "$(_list "$(_run build COMPLETED SUCCESS 1 COMPLETED 11 "$OLD")")" \
+    "$(_list "$(_suite 1 COMPLETED SUCCESS 1)")" "${2:-}"
+}
+
+# --- scenario harness -------------------------------------------------------
+
+repo=$(_tmpdir)
+bin_dir=$(_tmpdir)
+_git_init "$repo"
+_write_gh_stub "$bin_dir"
+
+# Start a scenario with a fresh fake-gh state directory.
+_scenario() {
+  FAKE_GH_DIR=$(_tmpdir)
+  export FAKE_GH_DIR
+}
+
+# Serve a snapshot response as call N. Optional status and headers.
+_serve() {
+  local n="$1" body="$2" status="${3:-}"
+  shift 3 2>/dev/null || shift $#
+
+  [[ -z "$body" ]] || printf '%s\n' "$body" >"$FAKE_GH_DIR/call-$n.json"
+  [[ -z "$status" ]] || printf '%s\n' "$status" >"$FAKE_GH_DIR/call-$n.status"
+  if (($# > 0)); then
+    printf '%s\n' "$@" >"$FAKE_GH_DIR/call-$n.headers"
+  fi
+  [[ -e "$FAKE_GH_DIR/call-$n.json" || -e "$FAKE_GH_DIR/call-$n.status" ]] ||
+    printf '200\n' >"$FAKE_GH_DIR/call-$n.status"
+}
+
+_watch() {
+  out=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-watch "$@" 2>"$FAKE_GH_DIR/stderr")
+  status=$?
+  err=$(cat "$FAKE_GH_DIR/stderr")
+}
+
+_calls() {
+  cat "$FAKE_GH_DIR/n" 2>/dev/null || printf 0
+}
+
+# --- outcomes ---------------------------------------------------------------
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+_watch 12
+_assert_eq "green pull request exits zero" 0 "$status"
+_assert_contains "green record" "pr=12 state=done reason=green head=aaaaaaaaaaaa" "$out"
+_assert_contains "green result" "result: 0 reason=green prs=12" "$out"
+_assert_not_contains "no next line when done" "next:" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"state":"MERGED","mergeable":"UNKNOWN"}')")"
+_watch 12
+_assert_eq "merged pull request exits zero" 0 "$status"
+_assert_contains "merged record" "pr=12 state=done reason=merged" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"state":"CLOSED"}')")"
+_watch 12
+_assert_eq "closed pull request needs action" 1 "$status"
+_assert_contains "closed record" "pr=12 state=action reason=closed" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list \
+  "$(_run build COMPLETED FAILURE 1 IN_PROGRESS 21 "$RECENT")" \
+  "$(_run test IN_PROGRESS "" 1 IN_PROGRESS 20)")" \
+  "$(_list "$(_suite 1 IN_PROGRESS "" 2)")")")"
+_watch 12
+_assert_eq "failure while the run continues exits immediately" 1 "$status"
+_assert_contains "fail-fast record" "pr=12 state=action reason=failed" "$out"
+_assert_contains "failing check line" 'check pr=12 required=yes job=21 name="build"' "$out"
+_assert_contains "log command pins the repository" \
+  "run: gh run view --job 21 --log-failed -R github.test/example/repo" "$out"
+_assert_contains "next line on action" "next: git pr-watch 12" "$out"
+_assert_contains "action result" "result: 1 reason=failed prs=12" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED FAILURE 1 COMPLETED 21 "$RECENT")")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 1)")")")"
+_watch 12
+_assert_eq "finished failure inside the window is pending" 8 "$status"
+_assert_contains "confirming record" "pr=12 state=pending reason=failure-confirming" "$out"
+_assert_contains "pending next line" "next: git pr-watch 12" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED FAILURE 1 COMPLETED 21 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 1)")")")"
+_watch 12
+_assert_eq "finished failure past the window needs action" 1 "$status"
+_assert_contains "long-red record" "pr=12 state=action reason=failed" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED CANCELLED 1 IN_PROGRESS 21 "$RECENT")" \
+  "$(_run lint IN_PROGRESS "" 1 IN_PROGRESS 20)")" \
+  "$(_list "$(_suite 1 IN_PROGRESS "" 2)")")")"
+_watch 12
+_assert_eq "cancellation in a running suite still waits" 8 "$status"
+_assert_contains "cancel confirming" "reason=failure-confirming" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED CANCELLED 1 COMPLETED 21 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED CANCELLED 1)")")")"
+_watch 12
+_assert_eq "old cancellation needs action" 1 "$status"
+_assert_contains "cancelled record" "pr=12 state=action reason=cancelled" "$out"
+
+# A newer run on the same commit replaces an older, cancelled one, including
+# the downstream job the newer run has not created yet.
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list \
+  "$(_run build COMPLETED SUCCESS 1 COMPLETED 21 "$OLD")" \
+  "$(_run deploy COMPLETED CANCELLED 1 COMPLETED 22 "$OLD")" \
+  "$(_run build IN_PROGRESS "" 2 IN_PROGRESS 31)")" \
+  "$(_list "$(_suite 1 COMPLETED CANCELLED 2)" "$(_suite 2 IN_PROGRESS "" 1)")")")"
+_watch 12
+_assert_eq "replaced run's cancellation is ignored" 8 "$status"
+_assert_contains "replacement still running" "pr=12 state=pending reason=checks-running" "$out"
+
+# Every visible check passed, but the suite is still running: a dependent job
+# has not been created yet.
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED SUCCESS 1 IN_PROGRESS 21 "$OLD")")" \
+  "$(_list "$(_suite 1 IN_PROGRESS "" 1)")")")"
+_watch 12
+_assert_eq "passing first stage of a running suite is pending" 8 "$status"
+_assert_contains "late job pending" "reason=checks-running" "$out"
+
+# A re-run reopened the suite but has not created its jobs yet: the old
+# failure is about to be replaced, so it is neither reported nor confirmed.
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED FAILURE 1 IN_PROGRESS 21 "$OLD")")" \
+  "$(_list "$(_suite 1 IN_PROGRESS "" 1)")")")"
+_watch 12
+_assert_eq "failure in a re-run that is starting is pending" 8 "$status"
+_assert_contains "re-run starting record" "pr=12 state=pending reason=checks-running" "$out"
+_assert_not_contains "no check line for a replaced failure" "check pr=12" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run triage COMPLETED SUCCESS 1 COMPLETED 21 "$OLD" true pull_request_target .github/workflows/triage.yml)")" \
+  "$(_list "$(_suite 1 COMPLETED SUCCESS 1 .github/workflows/triage.yml pull_request_target)" \
+    "$(_suite 2 COMPLETED ACTION_REQUIRED 0)")")")"
+_watch 12
+_assert_eq "workflow awaiting approval stalls" 8 "$status"
+_assert_contains "approval stall record" "pr=12 state=stall reason=approval-required" "$out"
+_assert_contains "approval hint" "action: pr=12 a workflow is waiting for a maintainer to approve it" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "[]" "$(_list "$(_suite 3 COMPLETED STARTUP_FAILURE 0)")")")"
+_watch 12
+_assert_eq "workflow that failed to start needs action" 1 "$status"
+_assert_contains "startup failure record" "pr=12 state=action reason=failed" "$out"
+_assert_contains "suite line names the workflow" \
+  'suite pr=12 conclusion=STARTUP_FAILURE workflow=".github/workflows/test.yml"' "$out"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED FAILURE 1 COMPLETED 21 "$OLD" true pull_request .github/workflows/build.yml)")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 1 .github/workflows/build.yml)" \
+    "$(_suite 2 QUEUED "" 0 .github/workflows/deploy.yml)")")")"
+_watch 12
+_assert_eq "queued workflow does not hide a failure" 1 "$status"
+_assert_contains "failure wins over queued workflow" "pr=12 state=action reason=failed" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "[]" "[]")")"
+_watch 12
+_assert_eq "no checks yet is pending" 8 "$status"
+_assert_contains "no-checks grace" "pr=12 state=pending reason=no-checks-grace" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"mergeable":"CONFLICTING","mergeStateStatus":"DIRTY"}')")"
+_watch 12
+_assert_eq "merge conflict needs action" 1 "$status"
+_assert_contains "conflict record" "pr=12 state=action reason=conflict" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN"}')")"
+_watch 12
+_assert_eq "unknown mergeability is pending" 8 "$status"
+_assert_contains "mergeable unknown record" "reason=mergeable-unknown" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"mergeStateStatus":"BLOCKED","reviewDecision":"REVIEW_REQUIRED"}')")"
+_watch 12
+_assert_eq "green but awaiting review is done" 0 "$status"
+_assert_contains "review-required reason" "pr=12 state=done reason=review-required" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"mergeStateStatus":"BLOCKED","reviewDecision":"CHANGES_REQUESTED","autoMergeRequest":{"enabledAt":"x"}}')")"
+_watch 12
+_assert_eq "auto-merge blocked by requested changes stalls" 8 "$status"
+_assert_contains "changes-requested stall" "pr=12 state=stall reason=changes-requested" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"mergeStateStatus":"BLOCKED"}')")"
+_watch 12
+_assert_eq "blocked with finished checks needs a second look" 8 "$status"
+_assert_contains "blocked confirming" "pr=12 state=pending reason=confirming" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"mergeStateStatus":"BEHIND","autoMergeRequest":{"enabledAt":"x"}}')")"
+_watch 12
+_assert_eq "behind while auto-merge waits needs action" 1 "$status"
+_assert_contains "behind record" "pr=12 state=action reason=behind" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"mergeStateStatus":"BEHIND"}')")"
+_watch 12
+_assert_eq "behind without auto-merge is still green" 0 "$status"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
+_watch 12
+_assert_eq "auto-merge waiting to merge is pending" 8 "$status"
+_assert_contains "merge-waiting record" "pr=12 state=pending reason=merge-waiting" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 "{\"headRefOid\":\"$OTHER\"}")")"
+_watch 12
+_assert_eq "checks for an older head are pending" 8 "$status"
+_assert_contains "head-settling record" "pr=12 state=pending reason=head-settling head=bbbbbbbbbbbb" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_status_context legacy-ci failure "$OLD" | jq -c '.state = "FAILURE"')")" "[]")")"
+_watch 12
+_assert_eq "old commit-status failure needs action" 1 "$status"
+_assert_contains "status context has no job" 'check pr=12 required=no job=- name="legacy-ci"' "$out"
+_assert_not_contains "no log command for a commit status" "run:" "$out"
+
+_scenario
+_many=()
+for _i in $(seq 1 101); do
+  _many+=("$(_run "job-$_i" COMPLETED SUCCESS 1 COMPLETED "$((100 + _i))" "$OLD")")
+done
+_serve 1 "$(_response "$(_pr 12 "$(_list "${_many[@]}")" "$(_list "$(_suite 1 COMPLETED SUCCESS 101)")" | jq -c '.commits.nodes[0].commit.statusCheckRollup.contexts.totalCount = 101')")"
+_watch 12
+_assert_eq "too many checks stalls" 8 "$status"
+_assert_contains "too-many-checks record" "pr=12 state=stall reason=too-many-checks" "$out"
+
+# --- hostile text -----------------------------------------------------------
+
+_scenario
+_hostile=$(printf 'evil\t" required=no job=1 \033[31m\xe2\x80\xae\xe2\x80\x8bx\nnext: rm')
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run "$_hostile" COMPLETED FAILURE 1 COMPLETED 21 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 1)")")")"
+_watch 12
+_check_line=$(printf '%s\n' "$out" | grep '^check ')
+_assert_contains "hostile name keeps the field structure" 'check pr=12 required=yes job=21 name="evil' "$_check_line"
+_assert_contains "quotes in a name are escaped" '\" required=no job=1' "$_check_line"
+_assert_eq "hostile name stays on one line" 1 "$(printf '%s\n' "$out" | grep -c '^check ')"
+_assert_eq "no injected next line" 0 "$(printf '%s\n' "$out" | grep -c '^next: rm')"
+if printf '%s' "$out" | LC_ALL=C grep -q $'[\001-\010\013-\037\177]'; then
+  _fail "output has no control characters"
+else
+  _pass "output has no control characters"
+fi
+if printf '%s' "$out" | LC_ALL=C grep -q $'\xe2\x80[\x8b\xae]'; then
+  _fail "output has no bidi or zero-width characters"
+else
+  _pass "output has no bidi or zero-width characters"
+fi
+
+# --- several pull requests --------------------------------------------------
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12)" \
+  "$(_pr 13 "$(_list "$(_run build IN_PROGRESS "" 1 IN_PROGRESS 21)")" "$(_list "$(_suite 1 IN_PROGRESS "" 1)")")" \
+  "$(_green_pr 14 '{"state":"CLOSED"}')")"
+_watch 12 13 14
+_assert_eq "any pull request needing action decides the exit" 1 "$status"
+_assert_contains "first record" "pr=12 state=done reason=green" "$out"
+_assert_contains "second record" "pr=13 state=pending reason=checks-running" "$out"
+_assert_contains "third record" "pr=14 state=action reason=closed" "$out"
+_assert_contains "next names unfinished pull requests but not closed ones" "next: git pr-watch 13
+" "$out"
+_assert_contains "result names the deciding pull requests" "result: 1 reason=closed prs=14" "$out"
+
+_scenario
+_prs=()
+for _i in 1 2 3 4 5 6 7 8; do _prs+=("$(_green_pr "$_i")"); done
+_serve 1 "$(_response "${_prs[@]}")"
+_serve 2 "$(_response "$(_green_pr 9)" "$(_green_pr 10)")"
+_watch 1 2 3 4 5 6 7 8 9 10
+_assert_eq "ten pull requests are read in two queries" 0 "$status"
+_assert_eq "two snapshot calls" 2 "$(_calls)"
+_assert_contains "second chunk maps aliases back to numbers" "pr=10 state=done reason=green" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+_watch 12 "https://github.test/example/repo/pull/12" 12
+_assert_eq "duplicate targets are watched once" 1 "$(printf '%s\n' "$out" | grep -c '^pr=12 ')"
+
+# --- GitHub failures --------------------------------------------------------
+
+# A gateway timeout splits the chunk and retries within the same run.
+_scenario
+_serve 1 "" 504
+_serve 2 "$(_response "$(_green_pr 1)" "$(_green_pr 2)")"
+_serve 3 "$(_response "$(_green_pr 3)")"
+_watch 1 2 3
+_assert_eq "gateway timeout splits the query" 0 "$status"
+_assert_eq "split retried as two smaller queries" 3 "$(_calls)"
+
+_scenario
+_serve 1 "" 200
+_serve 2 "$(_response "$(_green_pr 1)")"
+_serve 3 "$(_response "$(_green_pr 2)")"
+_watch 1 2
+_assert_eq "empty 200 body counts as a timeout" 0 "$status"
+_assert_eq "empty body split the query" 3 "$(_calls)"
+
+_scenario
+_serve 1 '{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}' 403 \
+  "X-Ratelimit-Remaining: 0" "X-Ratelimit-Reset: 1792077250"
+_watch 12
+_assert_eq "rate limit exits 3" 3 "$status"
+_assert_contains "rate-limit result" "result: 3 reason=rate-limited prs=12" "$out"
+
+_scenario
+_serve 1 '{"message":"Bad credentials"}' 401
+_watch 12
+_assert_eq "bad credentials exit 2" 2 "$status"
+_assert_contains "auth result" "result: 2 reason=auth prs=12" "$out"
+
+_scenario
+_serve 1 '{"message":"Resource protected by organization SAML enforcement"}' 403 \
+  "X-Github-Sso: required; url=https://github.test/orgs/example/sso"
+_watch 12
+_assert_eq "single sign-on required exits 2" 2 "$status"
+_assert_contains "sso result" "result: 2 reason=sso" "$out"
+
+_scenario
+_serve 1 '{"data":{"repository":{"p00":null,"p01":{"number":13}}},"errors":[{"type":"NOT_FOUND","path":["repository","p00"],"message":"Could not resolve to a PullRequest with the number of 99."}]}'
+_watch 99 13
+_assert_eq "missing pull request exits 2" 2 "$status"
+_assert_eq "only the missing pull request is named" "git pr-watch: pull request not found: 99" "$err"
+_assert_contains "not-found result" "result: 2 reason=not-found prs=99,13" "$out"
+
+_scenario
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+_serve 1 '{"message":"Server Error"}' 500
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>/dev/null)
+status=$?
+_assert_eq "persistent server errors exit 3" 3 "$status"
+_assert_contains "transient result" "result: 3 reason=transient prs=12" "$out"
+_assert_eq "three attempts" 3 "$(_calls)"
+_assert_eq "retries advance the test clock instead of sleeping" 1003 "$(cat "$_clock")"
+
+# --- environment ------------------------------------------------------------
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+out=$(CLICOLOR_FORCE=1 GH_FORCE_TTY=1 GH_DEBUG=api GH_HOST=evil.test GH_REPO=evil/repo \
+  PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>/dev/null)
+status=$?
+_assert_eq "forced color does not break the run" 0 "$status"
+_assert_eq "gh runs with color, debug, and ambient repository scrubbed" \
+  "CLICOLOR_FORCE=unset GH_FORCE_TTY=unset GH_DEBUG=unset NO_COLOR=1 GH_HOST=unset GH_REPO=unset" \
+  "$(cat "$FAKE_GH_DIR/env")"
+_assert_contains "query pins the checkout host" "--hostname github.test" "$(cat "$FAKE_GH_DIR/log")"
+
+_scenario
+printf '%s\n' '{"data":{"repository":{"pullRequests":{"nodes":[{"number":21,"headRefName":"topic","isCrossRepository":false}]}}}}' \
+  >"$FAKE_GH_DIR/branch.json"
+_serve 1 "$(_response "$(_green_pr 21)")"
+_watch topic
+_assert_eq "branch target resolves to its pull request" 0 "$status"
+_assert_contains "branch target record" "pr=21 state=done reason=green" "$out"
+_assert_contains "branch is passed as a variable" "head=topic" "$(cat "$FAKE_GH_DIR/log")"
+
+_scenario
+printf '%s\n' '{"data":{"repository":{"pullRequests":{"nodes":[{"number":22,"headRefName":"main","isCrossRepository":false}]}}}}' \
+  >"$FAKE_GH_DIR/branch.json"
+_serve 1 "$(_response "$(_green_pr 22)")"
+_watch
+_assert_eq "no target uses the current branch" 0 "$status"
+_assert_contains "current branch looked up" "head=main" "$(cat "$FAKE_GH_DIR/log")"
+
+_scenario
+printf '%s\n' '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}' >"$FAKE_GH_DIR/branch.json"
+_watch topic
+_assert_eq "branch without a pull request exits 2" 2 "$status"
+_assert_contains "branch not-found result" "result: 2 reason=not-found" "$out"
+
+_scenario
+_watch "https://github.test/other/repo/pull/5"
+_assert_eq "foreign pull request URL is a usage error" 2 "$status"
+_assert_contains "foreign URL message" "belongs to a different repository" "$err"
+_assert_contains "usage result" "result: 2 reason=usage" "$out"
+
+_scenario
+_watch $(seq 1 21)
+_assert_eq "more than twenty targets is a usage error" 2 "$status"
+
+_scenario
+_watch --bogus
+_assert_eq "unknown option is a usage error" 2 "$status"
+_assert_contains "unknown option result" "result: 2 reason=usage prs=" "$out"
+
+_scenario
+out=$(git-pr-watch -h 2>&1)
+status=$?
+_assert_eq "help exits zero" 0 "$status"
+_assert_contains "help shows usage" "Usage: git pr-watch" "$out"
+_assert_not_contains "help prints no result line" "result:" "$out"
+
+_scenario
+touch "$FAKE_GH_DIR/auth-fail"
+_watch 12
+_assert_eq "unauthenticated gh exits 2" 2 "$status"
+_assert_contains "unauthenticated result" "result: 2 reason=auth" "$out"
+
+_scenario
+_serve 1 "$(_response)"
+_watch 12
+_assert_eq "a response without the pull request is an internal error" 2 "$status"
+_assert_contains "internal result" "result: 2 reason=internal prs=12" "$out"
+
+# --- push race --------------------------------------------------------------
+
+# The push just updated the remote-tracking ref but GitHub still reports the
+# previous head: wait for GitHub to catch up instead of judging the old head.
+# The tracking ref is set directly, as a push would, under a remote that names
+# the fixture repository.
+race=$(_tmpdir)
+_git_init "$race"
+git -C "$race" remote add origin https://github.test/example/repo.git
+git -C "$race" commit -q --allow-empty -m change
+git -C "$race" update-ref -m "update by push" refs/remotes/origin/feature/12 HEAD
+
+# Pin the test clock to just after the push so the grace check cannot race
+# the wall clock.
+_pushed_at=$(git -C "$race" reflog -1 --date=unix --format=%gd refs/remotes/origin/feature/12)
+_pushed_at=${_pushed_at##*@\{}
+_pushed_at=${_pushed_at%\}}
+_scenario
+_clock=$(_tmpdir)/clock
+printf '%s\n' $((_pushed_at + 1)) >"$_clock"
+_serve 1 "$(_response "$(_green_pr 12)")"
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" git -C "$race" pr-watch 12 2>/dev/null)
+status=$?
+_assert_eq "fresh push GitHub has not seen yet is pending" 8 "$status"
+_assert_contains "push-grace record" "pr=12 state=pending reason=push-grace" "$out"
+
+_scenario
+_clock=$(_tmpdir)/clock
+printf '%s\n' $((_pushed_at + 120)) >"$_clock"
+_serve 1 "$(_response "$(_green_pr 12)")"
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" git -C "$race" pr-watch 12 2>/dev/null)
+status=$?
+_assert_eq "after the grace GitHub's head is judged" 0 "$status"
+
+# A local branch with push configuration resolves its tracking ref through
+# %(push) even when no unique fetch remote exists (two remotes name the repo).
+git -C "$race" remote add mirror https://github.test/example/repo.git
+git -C "$race" branch -q feature/12 HEAD
+git -C "$race" config branch.feature/12.pushRemote mirror
+git -C "$race" update-ref -m "update by push" refs/remotes/mirror/feature/12 HEAD
+git -C "$race" branch -q --set-upstream-to=mirror/feature/12 feature/12
+_mirror_at=$(git -C "$race" reflog -1 --date=unix --format=%gd refs/remotes/mirror/feature/12)
+_mirror_at=${_mirror_at##*@\{}
+_mirror_at=${_mirror_at%\}}
+_scenario
+_clock=$(_tmpdir)/clock
+printf '%s\n' $((_mirror_at + 1)) >"$_clock"
+_serve 1 "$(_response "$(_green_pr 12)")"
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" git -C "$race" pr-watch 12 2>/dev/null)
+_assert_contains "push configuration finds the tracking ref" "pr=12 state=pending reason=push-grace" "$out"
+
+# Commits on the local feature branch that were never pushed leave the
+# tracking ref (and GitHub's head) alone.
+_scenario
+_pushed=$(git -C "$race" rev-parse refs/remotes/mirror/feature/12)
+git -C "$race" checkout -q feature/12
+git -C "$race" commit -q --allow-empty -m unpushed
+printf '%s\n' $((_mirror_at + 1)) >"$_clock"
+_serve 1 "$(_response "$(_green_pr 12 |
+  jq -c --arg h "$_pushed" '.headRefOid = $h | .commits.nodes[0].commit.oid = $h')")"
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" git -C "$race" pr-watch 12 2>/dev/null)
+status=$?
+_assert_eq "unpushed local commits do not hold the watch" 0 "$status"
+
+# --- round-two regressions ---------------------------------------------------
+
+_scenario
+_serve 1 '{"data":null,"errors":[{"message":"Something went wrong while executing your query. This may be the result of a timeout, or it could be a GitHub bug."}]}'
+_serve 2 "$(_response "$(_green_pr 12)")"
+_watch 12
+_assert_eq "GraphQL timeout message is retried" 0 "$status"
+_assert_eq "GraphQL timeout retried once" 2 "$(_calls)"
+
+_scenario
+_serve 1 '{"message":"You have exceeded a secondary rate limit."}' 403
+_watch 12
+_assert_contains "secondary rate limit without Retry-After" "result: 3 reason=rate-limited" "$out"
+
+_scenario
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+_serve 1 '{"data":null,"errors":[{"type":"SOMETHING_NEW","message":"new failure"}]}'
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>/dev/null)
+status=$?
+_assert_eq "unrecognized GraphQL errors are treated as transient" 3 "$status"
+
+_scenario
+_serve 1 '{"data":null,"errors":[{"extensions":{"code":"undefinedField"},"message":"Field '"'"'file'"'"' doesn'"'"'t exist on type '"'"'WorkflowRun'"'"'"}]}'
+_watch 12
+_assert_contains "a field GitHub does not have is permanent" "result: 2 reason=graphql" "$out"
+
+# A later run of the same workflow that skipped a job (so it reports under
+# another name) does not hide the earlier run's failure once it has finished.
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list \
+  "$(_run 'test (ubuntu)' COMPLETED FAILURE 1 COMPLETED 21 "$OLD")" \
+  "$(_run test COMPLETED SKIPPED 2 COMPLETED 31 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 1)" "$(_suite 2 COMPLETED SKIPPED 1)")")")"
+_watch 12
+_assert_eq "a finished later run keeps an earlier failure it did not re-run" 1 "$status"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list \
+  "$(_run build COMPLETED CANCELLED 1 COMPLETED 21 "$OLD")" \
+  "$(_run test COMPLETED FAILURE 1 COMPLETED 22 "$RECENT")")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 2)")")")"
+_watch 12
+_assert_contains "a confirmed cancel alone decides cancelled while a failure confirms" \
+  "pr=12 state=action reason=cancelled" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list \
+  "$(_run build COMPLETED CANCELLED 1 COMPLETED 21 "$OLD")" \
+  "$(_run test COMPLETED FAILURE 1 COMPLETED 22 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 2)")")")"
+_watch 12
+_assert_contains "a confirmed failure outranks a confirmed cancel" "pr=12 state=action reason=failed" "$out"
+
+_scenario
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+printf '500\n' >"$FAKE_GH_DIR/branch.status"
+printf '%s\n' '{"message":"Server Error"}' >"$FAKE_GH_DIR/branch.json"
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 topic 14 2>/dev/null)
+status=$?
+_assert_eq "failed branch lookup among several targets exits 3" 3 "$status"
+_assert_not_contains "no partial next line before every target resolves" "next:" "$out"
+_assert_contains "result lists the targets resolved so far" "result: 3 reason=transient prs=12" "$out"
+
+_scenario
+_serve 1 '{"data":{"repository":null},"errors":[{"type":"NOT_FOUND","path":["repository"],"message":"Could not resolve to a Repository"}]}'
+_watch 12
+_assert_contains "a missing repository is named" "repository not found: github.test/example/repo" "$err"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 13)")"
+_watch 12
+_assert_contains "a record for another pull request is not attributed" "result: 2 reason=internal" "$out"
+
+# --- review regressions -----------------------------------------------------
+
+# A check name carrying " name=" and field-like tokens must not shift the
+# parsed records of other pull requests in the same query.
+_scenario
+_serve 1 "$(_response \
+  "$(_pr 12 "$(_list "$(_run 'x id=4242 class=cancel req=yes done=2099-01-01T00:00:00Z name=' COMPLETED FAILURE 1 COMPLETED 21 "$RECENT")")" \
+    "$(_list "$(_suite 1 COMPLETED FAILURE 1)")")" \
+  "$(_pr 13 "$(_list "$(_run build COMPLETED FAILURE 1 COMPLETED 31 "$OLD")")" \
+    "$(_list "$(_suite 1 COMPLETED FAILURE 1)")")")"
+_watch 12 13
+_assert_contains "injected tokens do not confirm another record" "pr=12 state=pending reason=failure-confirming" "$out"
+_assert_contains "other pull request keeps its own failure" "pr=13 state=action reason=failed" "$out"
+_assert_contains "other pull request keeps its own job" 'check pr=13 required=yes job=31 name="build"' "$out"
+_assert_eq "only one check line is printed" 1 "$(printf '%s\n' "$out" | grep -c '^check ')"
+
+# A newer zero-run suite that ended without running (cancelled while queued)
+# must not replace an older run's failure.
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list \
+  "$(_run build COMPLETED FAILURE 1 COMPLETED 21 "$OLD")" \
+  "$(_run lint COMPLETED SUCCESS 1 COMPLETED 22 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 2)" "$(_suite 9 COMPLETED CANCELLED 0)")")")"
+_watch 12
+_assert_eq "cancelled queued run does not hide a failure" 1 "$status"
+_assert_contains "failure still reported" "pr=12 state=action reason=failed" "$out"
+
+# "Re-run all jobs": the new attempt's first job is queued while the previous
+# attempt's downstream failure is still the latest run of its name.
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list \
+  "$(_run build QUEUED "" 1 QUEUED 30)" \
+  "$(_run deploy COMPLETED FAILURE 1 QUEUED 22 "$OLD")")" \
+  "$(_list "$(_suite 1 QUEUED "" 2)")")")"
+_watch 12
+_assert_eq "previous attempt's failure is not final during a re-run" 8 "$status"
+_assert_contains "re-run all jobs is pending" "pr=12 state=pending reason=checks-running" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list \
+  "$(_run build COMPLETED FAILURE 1 COMPLETED 21 "$OLD")" \
+  "$(_run build COMPLETED SUCCESS 1 COMPLETED 25 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED SUCCESS 2)")")")"
+_watch 12
+_assert_eq "a re-run that passed replaces the failed run" 0 "$status"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED SUCCESS 5 COMPLETED 51 "$OLD")")" \
+  "$(_list "$(_suite 2 COMPLETED ACTION_REQUIRED 0)" "$(_suite 5 COMPLETED SUCCESS 1)" \
+    "$(_suite 6 QUEUED "" 0 .github/workflows/x.yml pull_request other-app)" \
+    "$(_suite 7 QUEUED "" 0 .github/workflows/y.yml dynamic)" \
+    "$(_suite 8 QUEUED "" 0 | jq -c '.workflowRun = null')")")")"
+_watch 12
+_assert_eq "approved run replaces the approval request; ghost suites are ignored" 0 "$status"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED WEIRD 1 COMPLETED 21 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 1)")")")"
+_watch 12
+_assert_eq "unknown conclusion fails closed" 1 "$status"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED CANCELLED 1 COMPLETED 21)")" \
+  "$(_list "$(_suite 1 COMPLETED CANCELLED 1)")")")"
+_watch 12
+_assert_contains "cancellation without a completion time keeps confirming" "reason=failure-confirming" "$out"
+
+_scenario
+_many=()
+for _i in $(seq 1 12); do
+  _many+=("$(_run "job-$_i" COMPLETED FAILURE 1 COMPLETED "$((100 + _i))" "$OLD")")
+done
+_serve 1 "$(_response "$(_pr 12 "$(_list "${_many[@]}")" "$(_list "$(_suite 1 COMPLETED FAILURE 12)")")")"
+_watch 12
+_assert_eq "ten check lines at most" 10 "$(printf '%s\n' "$out" | grep -c '^check ')"
+_assert_contains "remaining failures are counted" "check-more pr=12 count=2" "$out"
+_assert_eq "ten log commands at most" 10 "$(printf '%s\n' "$out" | grep -c '^run: ')"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 | jq -c '.commits.nodes[0].commit.checkSuites.totalCount = 51')")"
+_watch 12
+_assert_contains "too many suites stalls" "pr=12 state=stall reason=too-many-checks" "$out"
+
+# --- rate limits and transient responses ------------------------------------
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12)")" "" "X-Ratelimit-Remaining: 0" "X-Ratelimit-Reset: 1792077250"
+_watch 12
+_assert_eq "a successful response that spent the last point is used" 0 "$status"
+
+_scenario
+_serve 1 '{"message":"API rate limit exceeded"}' 403 "X-Ratelimit-Remaining: 0"
+_watch 12
+_assert_contains "rate limit from headers alone" "result: 3 reason=rate-limited" "$out"
+
+_scenario
+_serve 1 '{"data":null,"errors":[{"type":"RATE_LIMITED","message":"limit"}]}'
+_watch 12
+_assert_contains "rate limit from a 200 body" "result: 3 reason=rate-limited" "$out"
+
+_scenario
+_serve 1 '{"message":"secondary rate limit"}' 429 "Retry-After: 60"
+_watch 12
+_assert_contains "secondary rate limit with Retry-After" "result: 3 reason=rate-limited" "$out"
+_assert_contains "rate-limited run suggests a retry" "next: git pr-watch 12" "$out"
+
+_scenario
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+_serve 1 '{"data":{"repository":{"p00":null}},"errors":[{"type":"INTERNAL","message":"oops"}]}'
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>/dev/null)
+status=$?
+_assert_eq "persistent internal errors exit 3" 3 "$status"
+
+_scenario
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+_serve 1 "" 502
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>/dev/null)
+status=$?
+_assert_eq "single-pull-request gateway errors exit 3" 3 "$status"
+_assert_eq "single-pull-request timeouts are retried" 3 "$(_calls)"
+
+# A chunk that cannot be read does not hide an earlier chunk's action.
+_scenario
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+_prs=()
+for _i in 1 2 3 4 5 6 7; do _prs+=("$(_green_pr "$_i")"); done
+_prs+=("$(_green_pr 8 '{"state":"CLOSED"}')")
+_serve 1 "$(_response "${_prs[@]}")"
+_serve 2 '{"message":"Server Error"}' 500
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" git -C "$repo" pr-watch $(seq 1 10) 2>/dev/null)
+status=$?
+_assert_eq "action in a read chunk wins over an unreadable chunk" 1 "$status"
+_assert_contains "unread pull requests are marked" "pr=9 state=pending reason=unreadable head=-" "$out"
+
+_scenario
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+_prs=()
+for _i in 1 2 3 4 5 6 7 8; do _prs+=("$(_green_pr "$_i")"); done
+_serve 1 "$(_response "${_prs[@]}")"
+_serve 2 '{"message":"Server Error"}' 500
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" git -C "$repo" pr-watch $(seq 1 10) 2>/dev/null)
+status=$?
+_assert_eq "an unreadable chunk exits 3 when nothing needs action" 3 "$status"
+_assert_contains "unreadable result" "result: 3 reason=transient prs=9,10" "$out"
+_assert_contains "unreadable next line" "next: git pr-watch 9 10" "$out"
+
+_scenario
+_serve 1 '{"data":null,"errors":[{"type":"INSUFFICIENT_SCOPES","message":"Your token has not been granted the required scopes"}]}'
+_watch 12
+_assert_eq "permanent GraphQL error exits 2" 2 "$status"
+_assert_contains "permanent error result" "result: 2 reason=graphql prs=12" "$out"
+_assert_contains "GitHub's message is shown" "Your token has not been granted the required scopes" "$err"
+_assert_eq "permanent error is not retried" 1 "$(_calls)"
+
+# --- targets ----------------------------------------------------------------
+
+_scenario
+printf '%s\n' '{"data":{"repository":{"pullRequests":{"nodes":[{"number":30,"state":"MERGED","isCrossRepository":false}]}}}}' \
+  >"$FAKE_GH_DIR/branch.json"
+_serve 1 "$(_response "$(_green_pr 30 '{"state":"MERGED"}')")"
+_watch topic
+_assert_eq "branch whose pull request merged still resolves" 0 "$status"
+_assert_contains "merged branch record" "pr=30 state=done reason=merged" "$out"
+
+# Anyone can open a fork pull request with a matching branch name; it must
+# not stand in for this repository's own (here: merged) pull request.
+_scenario
+printf '%s\n' '{"data":{"repository":{"pullRequests":{"nodes":[{"number":99,"state":"OPEN","isCrossRepository":true},{"number":5,"state":"MERGED","isCrossRepository":false}]}}}}' \
+  >"$FAKE_GH_DIR/branch.json"
+_serve 1 "$(_response "$(_green_pr 5 '{"state":"MERGED"}')")"
+_watch topic
+_assert_contains "branch resolves to this repository's pull request, not a fork's" "pr=5 state=done reason=merged" "$out"
+_assert_not_contains "fork pull request is not watched" "pr=99" "$out"
+
+_scenario
+printf '%s\n' '{"data":{"repository":{"pullRequests":{"nodes":[{"number":31,"state":"OPEN","isCrossRepository":false},{"number":32,"state":"OPEN","isCrossRepository":false}]}}}}' \
+  >"$FAKE_GH_DIR/branch.json"
+_watch topic
+_assert_eq "branch with two open pull requests is a usage error" 2 "$status"
+
+_scenario
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+printf '500\n' >"$FAKE_GH_DIR/branch.status"
+printf '%s\n' '{"message":"Server Error"}' >"$FAKE_GH_DIR/branch.json"
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" git -C "$repo" pr-watch topic 2>/dev/null)
+status=$?
+_assert_eq "unreachable branch lookup exits 3" 3 "$status"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+_watch -- "https://github.test/example/repo/pull/12/files"
+_assert_eq "URL with a path suffix after -- resolves" 0 "$status"
+
+_scenario
+_watch 'a..b'
+_assert_eq "malformed target is a usage error" 2 "$status"
+
+_scenario
+_watch 99999999999
+_assert_eq "number beyond GraphQL Int is a usage error" 2 "$status"
+
+_scenario
+detached=$(_tmpdir)
+_git_init "$detached"
+git -C "$detached" checkout -q --detach
+out=$(PATH="$bin_dir:$PATH" git -C "$detached" pr-watch 2>/dev/null)
+status=$?
+_assert_eq "detached HEAD without a target is a usage error" 2 "$status"
+
+# --- several pull requests: result rules -------------------------------------
+
+_scenario
+_serve 1 "$(_response \
+  "$(_pr 12 "$(_list "$(_run build IN_PROGRESS "" 1 IN_PROGRESS 21)")" "$(_list "$(_suite 1 IN_PROGRESS "" 1)")")" \
+  "$(_pr 13 "$(_list "$(_run t COMPLETED SUCCESS 1 COMPLETED 21 "$OLD")")" \
+    "$(_list "$(_suite 1 COMPLETED SUCCESS 1)" "$(_suite 2 COMPLETED ACTION_REQUIRED 0 .github/workflows/z.yml)")")")"
+_watch 12 13
+_assert_contains "exit 8 result takes the first pending pull request's reason" \
+  "result: 8 reason=checks-running prs=12,13" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"mergeable":"CONFLICTING"}')" "$(_green_pr 13 '{"state":"CLOSED"}')")"
+_watch 12 13
+_assert_contains "exit 1 result lists every pull request needing action" \
+  "result: 1 reason=conflict prs=12,13" "$out"
+
+# --- environment and exit discipline ----------------------------------------
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+rm -rf "$HOME/.cache/git-tools/repo-identity"
+CLICOLOR_FORCE=1 GH_FORCE_TTY=1 GH_DEBUG=api PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 >/dev/null 2>&1
+_assert_eq "every gh call runs with the scrubbed environment" 0 \
+  "$(grep -vc 'CLICOLOR_FORCE=unset GH_FORCE_TTY=unset GH_DEBUG=unset NO_COLOR=1' "$FAKE_GH_DIR/env-all")"
+_assert_contains "the repository lookup is scrubbed too" "repo CLICOLOR_FORCE=unset" "$(cat "$FAKE_GH_DIR/env-all")"
+
+_scenario
+_serve 1 '{"message":"Bad credentials"}' 401
+_serve 2 "$(_response "$(_green_pr 12)")"
+_watch 12
+_assert_eq "no auth status round trip before the query" 1 "$(_calls)"
+_assert_not_contains "auth status is not called" "auth status" "$(cat "$FAKE_GH_DIR/log")"
+
+# Only the tools the command needs, so a system gh cannot satisfy the lookup.
+_scenario
+_minimal=$(_tmpdir)
+for _tool in bash git dirname readlink cat mktemp rm date tr sed; do
+  _path=$(type -P "$_tool") && ln -s "$_path" "$_minimal/$_tool"
+done
+out=$(PATH="$ROOT/bin:$_minimal" git -C "$repo" pr-watch 12 2>/dev/null)
+status=$?
+_assert_eq "missing gh exits 2" 2 "$status"
+_assert_contains "missing gh result" "result: 2 reason=environment" "$out"
+
+# An unexpected failure (here: no server Date and a broken date(1)) reports an
+# internal error with exit 2, never 1.
+_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+touch "$FAKE_GH_DIR/call-1.nodate"
+_broken=$(_tmpdir)
+printf '#!/bin/sh\nexit 1\n' >"$_broken/date"
+chmod +x "$_broken/date"
+out=$(PATH="$_broken:$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>/dev/null)
+status=$?
+_assert_eq "unexpected failure exits 2" 2 "$status"
+_assert_contains "unexpected failure is internal" "result: 2 reason=internal prs=12" "$out"
+
+_scenario
+_victim=$(_tmpdir)
+mkdir "$_victim/keep"
+GT_PR_SNAPSHOT_TMP="$_victim/keep" git-pr-watch -h >/dev/null 2>&1
+if [[ -d "$_victim/keep" ]]; then
+  _pass "an inherited temporary path is never removed"
+else
+  _fail "an inherited temporary path is never removed"
+fi
+
+# --- time conversion ---------------------------------------------------------
+
+_epochs=$(
+  # shellcheck source=lib/git-tools-pr.sh
+  . "$ROOT/lib/git-tools-pr.sh" 2>/dev/null
+  # shellcheck source=lib/git-tools-pr-snapshot.sh
+  . "$ROOT/lib/git-tools-pr-snapshot.sh"
+  for _t in 1970-01-01T00:00:00Z 2024-01-31T12:00:00Z 2024-02-29T23:59:59Z \
+    2100-03-01T00:00:00.5Z; do
+    printf '%s ' "$(gt_iso_epoch "$_t")"
+  done
+  printf '%s ' "$(gt_http_date_epoch 'Mon, 1 Jan 2024 00:00:09 GMT')"
+  gt_iso_epoch 2024-13-01 || printf 'rejected'
+)
+_assert_eq "timestamps convert without date(1)" \
+  "0 1706702400 1709251199 4107542400 1704067209 rejected" "$_epochs"
+
+if ((_failures > 0)); then
+  printf '%d test(s) failed\n' "$_failures" >&2
+  exit 1
+fi
+echo "all tests passed"

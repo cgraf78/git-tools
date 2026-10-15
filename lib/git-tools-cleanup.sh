@@ -413,8 +413,11 @@ gt_worktree_content_state() {
     printf 'unknown\n'
   else
     while IFS= read -r entry; do
+      # `ls-files -v` tags assume-unchanged entries with a lowercase letter.
+      # [[:lower:]], not [a-z]: Bash 3.2 matches ranges by locale collation,
+      # where [a-z] also matches uppercase tags such as H (an ordinary entry).
       case "$entry" in
-        [a-z]' '* | S' '*)
+        [[:lower:]]' '* | S' '*)
           _gt_cleanup_note_path flagged flagged_count "${entry#??}"
           ;;
       esac

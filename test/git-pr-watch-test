@@ -1803,6 +1803,18 @@ _exit_epoch=""
 { read -r _ _ _ _exit_epoch <"$_state/exited/example_repo_12"; } 2>/dev/null
 _assert_eq "an exit epoch is the judging check's start, not the exit" "$_epoch" "$_exit_epoch"
 
+# A pull request still pending when another one ends the run got no final
+# result: its exit record has no epoch, while the one needing action has one.
+_state_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED FAILURE 1 COMPLETED 21 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 1)")")" "$(_running_pr 13)")"
+_wait_watch 12 13
+_assert_eq "a failure ends the run while another pull request is pending" 1 "$status"
+_assert_eq "the pull request needing action has a result epoch" "1 action failed epoch" \
+  "$(_exit_record "$_state/exited/example_repo_12")"
+_assert_eq "a pull request still pending has no result epoch" "1 pending checks-running -" \
+  "$(_exit_record "$_state/exited/example_repo_13")"
+
 # A run that could not read GitHub delivered no result: its exit records say
 # so with an epoch of `-`.
 _state_scenario

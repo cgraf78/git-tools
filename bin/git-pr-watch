@@ -1303,10 +1303,11 @@ _state_finished() {
 # exited/<key> holds "<exit status> <state> <reason> <epoch>", for every
 # target resolved by then, so a run that dies while resolving a later branch
 # target still records the earlier ones. The epoch is when the check behind
-# the reported result started, and only when the run delivered one (exit 0,
-# 1, or 8 with the pull request read): a run cut short by a signal, an
-# error, or an unreadable GitHub gets `-`, so a reader never takes it for a
-# watch of a head pushed meanwhile.
+# the reported result started, and only when the run delivered a final one
+# for that pull request (exit 0, 1, or 8 with it done, needing action, or
+# stalled). A run cut short by a signal, an error, or an unreadable GitHub,
+# and a pull request still pending when another one ended the run, get `-`:
+# a reader never takes that for a watch of a head pushed meanwhile.
 _state_finish() {
   local status="$1" i key epoch
   local -a files
@@ -1317,9 +1318,8 @@ _state_finish() {
     key=${_state_scope}_${_numbers[$i]}
     files+=("$_state_dir/watchers/$key.$$")
     epoch=-
-    case "$status:${_state[i]:-}:${_reason[i]:-}" in
-      [018]:*:unreadable | [018]::* | [018]:*:) ;;
-      [018]:*) epoch=${_state_judged_wall:--} ;;
+    case "$status:${_state[i]:-}" in
+      [018]:"done" | [018]:action | [018]:stall) epoch=${_state_judged_wall:--} ;;
     esac
     _state_write "$_state_dir/exited/$key" "$status ${_state[i]:--} ${_reason[i]:--} $epoch"
   done

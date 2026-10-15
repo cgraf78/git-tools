@@ -243,10 +243,11 @@ then, whatever its state, holding
 .RI \(dq "status state reason epoch" \(dq:
 the exit status, the state and reason last reported (or
 .B \-
-if not judged yet), and, when the run delivered a result for the pull
-request (status 0, 1, or 8 with it read), when the check behind that result
-started, in seconds since the epoch by this host's clock. A run cut short (a
-signal, an error, GitHub unreadable) writes
+if not judged yet), and, when the run delivered a final result for the pull
+request (status 0, 1, or 8, with it done, needing action, or stalled), when
+the check behind that result started, in seconds since the epoch by this
+host's clock. A run cut short (a signal, an error, GitHub unreadable), and a
+pull request still pending when the run ended, get
 .B \-
 for the epoch, to be treated as before any event. An epoch later than an
 event such as a push means the pull request was watched after it and its

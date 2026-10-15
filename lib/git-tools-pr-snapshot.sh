@@ -490,19 +490,26 @@ gt_pr_snapshot_call() {
     (
       slept=0
       sleeper=""
-      trap '[[ -z "$sleeper" ]] || kill "$sleeper" 2>/dev/null; exit 0' TERM
+      # Reap the sleep it kills, so no zombie is left where orphans go to a
+      # process that never reaps them (a container's minimal init, say).
+      trap '[[ -z "$sleeper" ]] || { kill "$sleeper" 2>/dev/null; wait "$sleeper" 2>/dev/null; }; exit 0' TERM
       while ((slept < limit)); do
+        # The `done` marker also stops the watchdog: a TERM sent before this
+        # freshly forked shell installed its trap can be lost.
+        [[ ! -e "$dir/done" ]] || exit 0
         sleep 1 &
         sleeper=$!
         wait "$sleeper" || true
         sleeper=""
         slept=$((slept + 1))
       done
+      [[ ! -e "$dir/done" ]] || exit 0
       : >"$dir/timed-out"
       kill -TERM "$gh_pid" 2>/dev/null
     ) </dev/null >/dev/null 2>&1 &
     watchdog=$!
     wait "$gh_pid" || rc=$?
+    : >"$dir/done"
     kill -TERM "$watchdog" 2>/dev/null || true
     wait "$watchdog" 2>/dev/null || true
   else

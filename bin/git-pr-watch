@@ -1086,7 +1086,10 @@ _sleep_until_next() {
     _pause "$seconds"
     return 0
   fi
-  sleep "$seconds" &
+  # Detached from the caller's output, so a sleep orphaned by a SIGKILL of
+  # this command cannot hold a `$(git pr-watch ...)` capture open.
+  # shellcheck disable=SC2217 # the redirections detach it, not feed it
+  sleep "$seconds" </dev/null >/dev/null 2>&1 &
   pid=$!
   wait "$pid" || true
 }

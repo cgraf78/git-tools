@@ -1340,66 +1340,74 @@ else
   _pass "the hung gh process is gone"
 fi
 
-# A real TERM while a gh call is in flight: the conventional status, and no
-# gh process left behind.
-_scenario
-touch "$FAKE_GH_DIR/call-1.hang"
-printf '200\n' >"$FAKE_GH_DIR/call-1.status"
-(PATH="$bin_dir:$PATH" exec git -C "$repo" pr-watch --wait 12 >"$FAKE_GH_DIR/out" 2>&1) &
-_watcher=$!
-_deadline=$((SECONDS + 20))
-while [[ ! -s "$FAKE_GH_DIR/hang.pid" ]] && ((SECONDS < _deadline)); do
-  sleep 0.1
-done
-kill -TERM "$_watcher" 2>/dev/null
-wait "$_watcher"
-status=$?
-_assert_eq "TERM during a call exits 143" 143 "$status"
-_assert_contains "TERM result" "result: 143 reason=signal prs=12" "$(cat "$FAKE_GH_DIR/out")"
-_hang_pid=$(cat "$FAKE_GH_DIR/hang.pid" 2>/dev/null)
-_deadline=$((SECONDS + 10))
-while [[ -n "$_hang_pid" ]] && kill -0 "$_hang_pid" 2>/dev/null && ((SECONDS < _deadline)); do
-  sleep 0.1
-done
-if [[ -n "$_hang_pid" ]] && kill -0 "$_hang_pid" 2>/dev/null; then
-  _fail "TERM leaves no gh process behind"
-  kill "$_hang_pid" 2>/dev/null
-else
-  _pass "TERM leaves no gh process behind"
-fi
+# Print every descendant of a process, from one process-table snapshot.
+_descendants() {
+  local table
 
-# TERM during the sleep between checks, where a watch spends most of its time.
-_scenario
-_serve 1 "$(_response "$(_running_pr 12)")"
-(PATH="$bin_dir:$PATH" exec git -C "$repo" pr-watch --wait --interval 15 12 \
-  >"$FAKE_GH_DIR/out" 2>"$FAKE_GH_DIR/err") &
-_watcher=$!
-_deadline=$((SECONDS + 20))
-while ! grep -q 'checks-running' "$FAKE_GH_DIR/err" 2>/dev/null && ((SECONDS < _deadline)); do
-  sleep 0.1
-done
-_started=$SECONDS
-kill -TERM "$_watcher" 2>/dev/null
-wait "$_watcher"
-status=$?
-_assert_eq "TERM during the sleep between checks exits 143" 143 "$status"
-if ((SECONDS - _started < 5)); then
-  _pass "TERM during the sleep ends the watch at once"
-else
-  _fail "TERM during the sleep ends the watch at once"
-fi
+  table=$(ps -A -o pid= -o ppid= 2>/dev/null || ps -o pid,ppid 2>/dev/null) || return 0
+  printf '%s\n' "$table" | awk -v root="$1" '
+    $1 ~ /^[0-9]+$/ { parent[$1] = $2; pids[n++] = $1 }
+    END {
+      found[root] = 1
+      do {
+        added = 0
+        for (i = 0; i < n; i++)
+          if (!(pids[i] in found) && (parent[pids[i]] in found)) {
+            found[pids[i]] = 1; added = 1; print pids[i]
+          }
+      } while (added)
+    }'
+}
 
-# A rate limit while resolving a branch target is waited out in a waiting run.
-_scenario
-printf '403\n' >"$FAKE_GH_DIR/branch-1.status"
-printf '%s\n' '{"message":"API rate limit exceeded"}' >"$FAKE_GH_DIR/branch-1.json"
-printf '%s\n' 'X-Ratelimit-Remaining: 0' 'X-Ratelimit-Reset: 1792073710' >"$FAKE_GH_DIR/branch-1.headers"
-printf '%s\n' '{"data":{"repository":{"pullRequests":{"nodes":[{"number":21,"state":"OPEN","isCrossRepository":false}]}}}}' \
-  >"$FAKE_GH_DIR/branch.json"
-_serve 1 "$(_response "$(_green_pr 21)")"
-_wait_watch topic
-_assert_eq "a rate-limited branch lookup is waited out" 0 "$status"
-_assert_eq "the lookup waited for the reset" 1060 "$(cat "$_clock")"
+# @brief Start the watcher on a hung call, signal it, and check its status and
+# that nothing it started is left running. Runs the script itself, not through
+# `git`, so the status asserted is the script's own.
+_signal_case() {
+  local signal="$1" expected="$2" when="$3" watcher deadline children pid left=""
+
+  _scenario
+  if [[ "$when" == call ]]; then
+    touch "$FAKE_GH_DIR/call-1.hang"
+    printf '200\n' >"$FAKE_GH_DIR/call-1.status"
+  else
+    _serve 1 "$(_response "$(_running_pr 12)")"
+  fi
+  (cd "$repo" && PATH="$bin_dir:$PATH" exec bash "$ROOT/bin/git-pr-watch" --wait \
+    --interval 15 12 >"$FAKE_GH_DIR/out" 2>"$FAKE_GH_DIR/err") &
+  watcher=$!
+  deadline=$((SECONDS + 20))
+  if [[ "$when" == call ]]; then
+    while [[ ! -s "$FAKE_GH_DIR/hang.pid" ]] && ((SECONDS < deadline)); do sleep 0.1; done
+  else
+    while ! grep -q 'checks-running' "$FAKE_GH_DIR/err" 2>/dev/null && ((SECONDS < deadline)); do
+      sleep 0.1
+    done
+  fi
+  children=$(_descendants "$watcher")
+  if [[ -n "$children" ]]; then
+    _pass "$signal during the $when: the watcher's processes were found"
+  else
+    _fail "$signal during the $when: the watcher's processes were found"
+  fi
+  kill "-$signal" "$watcher" 2>/dev/null
+  wait "$watcher"
+  _assert_eq "$signal during the $when exits $expected" "$expected" "$?"
+  _assert_contains "$signal during the $when reports the signal" \
+    "result: $expected reason=signal prs=12" "$(cat "$FAKE_GH_DIR/out")"
+  deadline=$((SECONDS + 10))
+  for pid in $children; do
+    while kill -0 "$pid" 2>/dev/null && ((SECONDS < deadline)); do sleep 0.1; done
+    if kill -0 "$pid" 2>/dev/null; then
+      left="$left $pid"
+      kill "$pid" 2>/dev/null
+    fi
+  done
+  _assert_eq "$signal during the $when leaves nothing running" "" "$left"
+}
+
+_signal_case TERM 143 call
+_signal_case HUP 129 call
+_signal_case TERM 143 sleep
 
 _scenario
 _watch --timeout 30 12

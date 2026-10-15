@@ -5602,6 +5602,13 @@ _count_gate_git() {
 
   dir="$uc_parent/count-$mode-$entries"
   repo=$(_merged_worktree_repo "uc-count-$mode-$entries" "$dir")
+  # Each fixture commit runs `git maintenance run --auto --detach`. Over
+  # hundreds of commits, Git 2.54's geometric repack can start in the
+  # background and drop a just-written commit that the reflog still names.
+  # Cleanup then can't inspect the reflog, keeps the worktree as
+  # uninspectable, and stops early, so the counts would differ by chance.
+  git -C "$repo" config maintenance.auto false
+  git -C "$repo" config gc.auto 0
   if [[ "$mode" == amend ]]; then
     for ((i = 0; i < entries; i++)); do
       git -C "$dir" commit --quiet --allow-empty --amend -m "amend $i"
@@ -5623,15 +5630,32 @@ printf x >>"$UC_COUNT_FILE"
 exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
 EOF_GIT
   chmod +x "$bin/git"
+  # The run's output is kept beside the count so a mismatch can show why one
+  # run took a different path (an early exit, say) instead of only the counts.
   (cd "$repo" && UC_COUNT_FILE="$count_file" PATH="$bin:$PATH" \
     "$ROOT/bin/git-cleanup-repo" --no-update-base \
-    --no-fetch --worktree "$dir" --porcelain >/dev/null 2>&1)
+    --no-fetch --worktree "$dir" --porcelain >"$uc_parent/count-$mode-$entries.out" 2>&1)
   wc -c <"$count_file" | tr -d ' '
 }
-_assert_eq "the worktree gate runs as many Git processes for 400 reflog entries as for 4" \
-  "$(_count_gate_git 4)" "$(_count_gate_git 400)"
-_assert_eq "the worktree gate runs as many Git processes for 20 unprovable commits as for 9" \
-  "$(_count_gate_git 9 lost)" "$(_count_gate_git 20 lost)"
+# @brief Compare two gate runs' Git process counts, showing both runs' output
+# when they differ.
+_assert_gate_counts() {
+  local name="$1" small="$2" large="$3" mode="${4:-amend}" small_count large_count
+
+  small_count=$(_count_gate_git "$small" "$mode")
+  large_count=$(_count_gate_git "$large" "$mode")
+  _assert_eq "$name" "$small_count" "$large_count"
+  if [[ "$small_count" != "$large_count" ]]; then
+    printf '  output for %s entries:\n' "$small" >&2
+    sed 's/^/    /' "$uc_parent/count-$mode-$small.out" >&2
+    printf '  output for %s entries:\n' "$large" >&2
+    sed 's/^/    /' "$uc_parent/count-$mode-$large.out" >&2
+  fi
+}
+_assert_gate_counts \
+  "the worktree gate runs as many Git processes for 400 reflog entries as for 4" 4 400
+_assert_gate_counts \
+  "the worktree gate runs as many Git processes for 20 unprovable commits as for 9" 9 20 lost
 
 # --- Hardening for unattended callers ---
 
@@ -5771,22 +5795,21 @@ if command -v jq >/dev/null 2>&1; then
     . "$ROOT/lib/git-tools-cleanup.sh"
     # Called by gt_cleanup_pr_lineage in place of the real client.
     # shellcheck disable=SC2329
+    # An if chain, not `case`: Bash 3.2 cannot parse a bare `pattern)` case
+    # arm inside a command substitution, and shfmt strips the leading-paren
+    # form that would work.
     gh() {
-      case "$*" in
-        *'/commits/'*'/pulls'*)
-          printf '%s\n' "$pulls"
-          return "${pull_error:-0}"
-          ;;
-        *'/pulls/'*'/commits'*)
-          printf '%s\n' "$mock_members"
-          return "${member_error:-0}"
-          ;;
-        *'repos/owner/repo/pulls '*)
-          printf '%s\n' "$mock_named"
-          return "${named_error:-0}"
-          ;;
-        *) return 1 ;;
-      esac
+      if [[ "$*" == *'/commits/'*'/pulls'* ]]; then
+        printf '%s\n' "$pulls"
+        return "${pull_error:-0}"
+      elif [[ "$*" == *'/pulls/'*'/commits'* ]]; then
+        printf '%s\n' "$mock_members"
+        return "${member_error:-0}"
+      elif [[ "$*" == *'repos/owner/repo/pulls '* ]]; then
+        printf '%s\n' "$mock_named"
+        return "${named_error:-0}"
+      fi
+      return 1
     }
     record() {
       pulls=$(jq -cn --arg merge "$base" \
@@ -6794,6 +6817,53 @@ fi
 _assert_contains "the moved worktree's branch is kept" \
   $'keep-branch\tfeat\tchecked-out' "$nm_out"
 _assert_contains "and still exists" feat "$(_branches "$nm_repo")"
+
+# Error handling around the git wrapper must survive Bash 3.2, which exits
+# under `set -e` when a failing `command`-prefixed call sits in `||` or `if`.
+# Runs under this shell, plus a Bash 3 when one exists (macOS /bin/bash, or
+# GIT_TOOLS_TEST_BASH3 pointing at a build).
+# shellcheck disable=SC2016 # expanded by the inner shell
+_errexit_probe='set -e; . "$1/lib/git-tools-git.sh"
+  git -C /nonexistent rev-parse >/dev/null 2>&1 || echo handled-or
+  if git -C /nonexistent rev-parse >/dev/null 2>&1; then :; else echo handled-if; fi'
+_assert_eq "a failing git call is handled under set -e" \
+  "$(printf 'handled-or\nhandled-if')" "$(bash -c "$_errexit_probe" _ "$ROOT" 2>&1)"
+_bash3=${GIT_TOOLS_TEST_BASH3:-}
+if [[ -z "$_bash3" && -x /bin/bash ]] &&
+  [[ "$(/bin/bash -c 'echo "${BASH_VERSINFO[0]}"')" == 3 ]]; then
+  _bash3=/bin/bash
+fi
+if [[ -n "$_bash3" ]]; then
+  _assert_eq "a failing git call is handled under set -e in Bash 3" \
+    "$(printf 'handled-or\nhandled-if')" "$("$_bash3" -c "$_errexit_probe" _ "$ROOT" 2>&1)"
+else
+  _pass "a failing git call is handled under set -e in Bash 3 (skipped: no Bash 3)"
+fi
+
+# Bash before 5.0 matches bracket ranges by locale collation, where [a-z] also
+# matches uppercase `ls-files -v` tags such as H (an ordinary entry). Turning
+# globasciiranges off reproduces that on a newer Bash when such a locale exists.
+_collating_locale=""
+for _candidate in en_US.UTF-8 en_US.utf8 en_US de_DE.UTF-8; do
+  if LC_ALL=$_candidate bash -c \
+    'shopt -u globasciiranges 2>/dev/null; [[ B == [a-z] ]]' 2>/dev/null; then
+    _collating_locale=$_candidate
+    break
+  fi
+done
+range_repo=$(_merged_feature_repo)
+if [[ -n "$_collating_locale" ]]; then
+  # shellcheck disable=SC2016 # expanded by the inner shell
+  range_state=$(LC_ALL=$_collating_locale bash -c '
+    shopt -u globasciiranges 2>/dev/null
+    . "$1/lib/git-tools-base.sh" || exit 1
+    . "$1/lib/git-tools-cleanup.sh" || exit 1
+    gt_worktree_content_state "$2"' _ "$ROOT" "$range_repo" 2>&1)
+  _assert_eq "ordinary index entries are not hidden content under collating ranges" \
+    clean "$range_state"
+else
+  _pass "ordinary index entries are not hidden content under collating ranges (skipped: no collating locale)"
+fi
 
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2

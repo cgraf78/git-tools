@@ -5623,15 +5623,32 @@ printf x >>"$UC_COUNT_FILE"
 exec "$GIT_TOOLS_TEST_REAL_GIT" "$@"
 EOF_GIT
   chmod +x "$bin/git"
+  # The run's output is kept beside the count so a mismatch can show why one
+  # run took a different path (an early exit, say) instead of only the counts.
   (cd "$repo" && UC_COUNT_FILE="$count_file" PATH="$bin:$PATH" \
     "$ROOT/bin/git-cleanup-repo" --no-update-base \
-    --no-fetch --worktree "$dir" --porcelain >/dev/null 2>&1)
+    --no-fetch --worktree "$dir" --porcelain >"$uc_parent/count-$mode-$entries.out" 2>&1)
   wc -c <"$count_file" | tr -d ' '
 }
-_assert_eq "the worktree gate runs as many Git processes for 400 reflog entries as for 4" \
-  "$(_count_gate_git 4)" "$(_count_gate_git 400)"
-_assert_eq "the worktree gate runs as many Git processes for 20 unprovable commits as for 9" \
-  "$(_count_gate_git 9 lost)" "$(_count_gate_git 20 lost)"
+# @brief Compare two gate runs' Git process counts, showing both runs' output
+# when they differ.
+_assert_gate_counts() {
+  local name="$1" small="$2" large="$3" mode="${4:-amend}" small_count large_count
+
+  small_count=$(_count_gate_git "$small" "$mode")
+  large_count=$(_count_gate_git "$large" "$mode")
+  _assert_eq "$name" "$small_count" "$large_count"
+  if [[ "$small_count" != "$large_count" ]]; then
+    printf '  output for %s entries:\n' "$small" >&2
+    sed 's/^/    /' "$uc_parent/count-$mode-$small.out" >&2
+    printf '  output for %s entries:\n' "$large" >&2
+    sed 's/^/    /' "$uc_parent/count-$mode-$large.out" >&2
+  fi
+}
+_assert_gate_counts \
+  "the worktree gate runs as many Git processes for 400 reflog entries as for 4" 4 400
+_assert_gate_counts \
+  "the worktree gate runs as many Git processes for 20 unprovable commits as for 9" 9 20 lost
 
 # --- Hardening for unattended callers ---
 

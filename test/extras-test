@@ -187,6 +187,9 @@ _description_for() {
     git-pr-sync-stack)
       printf '%s\n' 'restack a GitHub pull request stack'
       ;;
+    git-pr-watch)
+      printf '%s\n' 'report whether GitHub pull requests are green, merged, or need action'
+      ;;
     git-repo-state)
       printf '%s\n' 'report repository workflow state'
       ;;

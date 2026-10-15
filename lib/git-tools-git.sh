@@ -89,7 +89,30 @@ case "${GIT_CONFIG_PARAMETERS:-}" in
   *) export GIT_CONFIG_PARAMETERS="$GIT_CONFIG_PARAMETERS $GT_GIT_NO_AUTO_MAINTENANCE" ;;
 esac
 
+# A bare-name GT_GIT (no exec-path binary, or the test PATH override) is
+# resolved to an absolute path here, so the wrapper below can run it directly.
+# Only an absolute result is kept: a relative PATH entry such as `.` would
+# stop resolving after the first `cd`.
+case "$GT_GIT" in
+  */*) ;;
+  *)
+    _gt_git_found=$(type -P "$GT_GIT" 2>/dev/null) || _gt_git_found=""
+    case "$_gt_git_found" in
+      /*) GT_GIT=$_gt_git_found ;;
+    esac
+    unset _gt_git_found
+    ;;
+esac
+
 # @brief Run Git's own binary (see above) with the given arguments.
-git() {
-  command "$GT_GIT" "$@"
-}
+# Bash 3.2 exits under `set -e` when a `command`-prefixed call fails, even in a
+# `||` list or an `if` condition, so callers' error handling would never run;
+# the binary is invoked by path instead. `command` remains only for a name no
+# lookup could resolve, where calling it plainly would recurse into this
+# function. The body is chosen once, here, and stays a single simple command so
+# Bash can still exec it directly in command substitutions instead of forking
+# an extra process for every call.
+case "$GT_GIT" in
+  */*) git() { "$GT_GIT" "$@"; } ;;
+  *) git() { command "$GT_GIT" "$@"; } ;;
+esac

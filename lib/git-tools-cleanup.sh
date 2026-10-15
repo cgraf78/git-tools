@@ -195,7 +195,7 @@ gt_cleanup_load_prune_paths() {
   fi
   set -- "$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null && printf x)"
   set -- "${1//[[:space:]]/}"
-  if [[ ${#1} -ne 33 || "$1" != *x || "${1%x}" == *[!0-9a-f]* ]]; then
+  if [[ ${#1} -ne 33 || "$1" != *x || "${1%x}" == *[!0-9abcdef]* ]]; then
     GT_CLEANUP_ERROR="could not create a worktree prune path completion record"
     return 1
   fi
@@ -413,8 +413,12 @@ gt_worktree_content_state() {
     printf 'unknown\n'
   else
     while IFS= read -r entry; do
+      # `ls-files -v` tags assume-unchanged entries with a lowercase letter.
+      # [[:lower:]], not [a-z]: Bash before 5.0 matches ranges by locale
+      # collation, and in locales that interleave cases (glibc en_US.UTF-8,
+      # say) [a-z] also matches uppercase tags such as H (an ordinary entry).
       case "$entry" in
-        [a-z]' '* | S' '*)
+        [[:lower:]]' '* | S' '*)
           _gt_cleanup_note_path flagged flagged_count "${entry#??}"
           ;;
       esac

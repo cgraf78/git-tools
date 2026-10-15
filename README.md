@@ -74,6 +74,12 @@ action (failing checks and a command for each failed job's log), and a final
 `result:` line. A run takes at most 20 pull requests, all from the current
 checkout's repository. The test suite needs `jq` and skips without it.
 
+So that other tools, such as agent hooks, can tell whether a pull request is
+being watched or has finished, `git pr-watch` keeps small state files under
+`$XDG_STATE_HOME/git-tools/pr-watch/` (`~/.local/state/...` by default); their
+layout is a stable interface described in `git-pr-watch(1)` under STATE FILES.
+`GIT_PR_WATCH_STATE=0` turns them off.
+
 With `--wait`, it keeps checking (every 60 seconds by default) until a pull
 request needs action, every pull request is done, or the ones left are stalled
 on something outside the pull request, such as a required check that never

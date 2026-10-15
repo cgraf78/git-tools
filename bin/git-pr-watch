@@ -96,6 +96,8 @@ _targets=()
 _numbers=()
 _result_done=0
 _fail_reason=internal
+# Set by _state_init once state files are in use (see "state files" below).
+_state_dir=""
 
 _csv() {
   local IFS=,
@@ -108,7 +110,11 @@ _csv() {
 # action" status 1 that errexit would otherwise leak.
 # shellcheck disable=SC2329 # invoked by the EXIT trap
 _on_exit() {
+  local status=$?
+
   [[ -z "${GT_PR_SNAPSHOT_TMP:-}" ]] || rm -rf -- "$GT_PR_SNAPSHOT_TMP"
+  [[ "$_result_done" == 1 ]] || status=2
+  [[ -z "$_state_dir" ]] || _state_finish "$status"
   [[ "$_result_done" != 1 ]] || return 0
   _result_done=1
   printf 'result: 2 reason=%s prs=%s\n' "$_fail_reason" \
@@ -126,6 +132,7 @@ _on_signal() {
   # shellcheck disable=SC2086 # one pid per word
   [[ -z "$pids" ]] || kill -TERM $pids 2>/dev/null || true
   [[ -z "${GT_PR_SNAPSHOT_TMP:-}" ]] || rm -rf -- "$GT_PR_SNAPSHOT_TMP"
+  # The EXIT trap still runs after `exit` below and finishes the state files.
   _result_done=1
   printf 'result: %s reason=signal prs=%s\n' "$1" \
     "$(_csv ${_numbers[@]+"${_numbers[@]}"})"
@@ -268,6 +275,15 @@ if [[ -n "${GIT_PR_WATCH_MAX_SECONDS:-}" ]]; then
   fi
 fi
 [[ -z "$_timeout" ]] || ((10#$_timeout >= _cap)) || _cap=$((10#$_timeout))
+_state_enabled=1
+case "${GIT_PR_WATCH_STATE:-}" in
+  0) _state_enabled=0 ;;
+  "" | 1) ;;
+  *)
+    printf '%s: ignoring GIT_PR_WATCH_STATE=%s (0 turns state files off)\n' \
+      "$gt_command" "$GIT_PR_WATCH_STATE" >&2
+    ;;
+esac
 
 git rev-parse --git-dir >/dev/null 2>&1 ||
   _fail environment "not inside a git repository"
@@ -1071,6 +1087,197 @@ _report() {
   exit "$exit"
 }
 
+# --- state files -------------------------------------------------------------
+
+# Other tools (agent hooks, for example) read these files to tell whether a
+# pull request is being watched, or finished, without asking GitHub. Their
+# layout and the key and scope rules are a contract documented in
+# git-pr-watch(1) under STATE FILES; change them only together with it.
+# Every write is best-effort: state files never change what this command
+# reports or how it exits.
+
+# Characters a key or scope may contain; repository identities are lowercased.
+_state_chars='abcdefghijklmnopqrstuvwxyz0123456789._-'
+_state_scope=""
+_state_ready=0
+_state_pending=""
+_state_keys=()
+_state_done=()
+
+# @brief Choose the state directory and this repository's scope.
+# Leaves _state_dir empty (no state files) when they are turned off, when no
+# absolute XDG_STATE_HOME or HOME names a root, or when the identity does not
+# make a valid scope. Makes no directories: a one-shot run that finishes
+# nothing writes nothing.
+_state_init() {
+  local root scope
+
+  [[ "$_state_enabled" == 1 ]] || return 0
+  if [[ "${XDG_STATE_HOME:-}" == /* ]]; then
+    root=$XDG_STATE_HOME
+  elif [[ "${HOME:-}" == /* ]]; then
+    root=$HOME/.local/state
+  else
+    return 0
+  fi
+  # GT_CURRENT_REPO_IDENTITY is host/owner/repository, already lowercased.
+  # The host is left out: the same owner/repository on two hosts share keys.
+  scope=${GT_CURRENT_REPO_IDENTITY#*/}
+  scope=${scope/\//_}
+  # GitHub owners cannot contain `_`, so the first one splits owner from
+  # repository.
+  [[ "$scope" == ?*_?* && "$scope" != *[!$_state_chars]* ]] || return 0
+  _state_scope=$scope
+  _state_dir=$root/git-tools/pr-watch
+}
+
+# @brief Make the state directories (private to this user) once per run.
+_state_mkdir() {
+  [[ "$_state_ready" == 0 ]] || return "$((_state_ready == 1 ? 0 : 1))"
+  if (umask 077 && mkdir -p "$_state_dir/watchers" "$_state_dir/exited" \
+    "$_state_dir/done") 2>/dev/null; then
+    _state_ready=1
+    return 0
+  fi
+  _state_ready=2
+  return 1
+}
+
+# @brief Replace a state file atomically: readers see the old content or the
+# new, never a partial write.
+# The temporary file is <file>~<pid>.XXXXXX: `~` never appears in a key or
+# scope, so no layout name can look like one, and the pid lets a later run
+# remove it once its writer is gone.
+_state_write() {
+  local file="$1" tmp
+
+  _state_mkdir || return 0
+  tmp=$(mktemp "$file~$$.XXXXXX" 2>/dev/null) || return 0
+  if printf '%s\n' "$2" >"$tmp" 2>/dev/null && mv -f -- "$tmp" "$file" 2>/dev/null; then
+    return 0
+  fi
+  rm -f -- "$tmp" 2>/dev/null || true
+}
+
+# @brief Whether a file name is a key: <owner>_<repository>_<number>.
+_state_is_key() {
+  [[ "$1" != *[!$_state_chars]* && "$1" =~ ^[^_]+_.+_[1-9][[:digit:]]*$ ]]
+}
+
+# @brief Whether no process has this pid.
+_state_pid_dead() {
+  [[ "$1" =~ ^[1-9][[:digit:]]*$ ]] && ! kill -0 "$1" 2>/dev/null
+}
+
+# @brief Remove state left behind by earlier runs.
+# Finished and exited records go after 30 days, temporary files once their
+# writer is gone, and watcher files once their watcher is gone and a day old
+# (a watcher killed outright cannot remove its own). Only regular files whose
+# names match the layout are removed, one at a time.
+_state_prune() {
+  local file name pid
+
+  while IFS= read -r file; do
+    [[ "$file" == "$_state_dir"/*/* ]] || continue
+    name=${file##*/}
+    _state_is_key "$name" || continue
+    rm -f -- "$file" 2>/dev/null || true
+  done < <(find "$_state_dir/exited" "$_state_dir/done" -maxdepth 1 -type f \
+    -mtime +30 -print 2>/dev/null)
+  for file in "$_state_dir"/*/*~*.*; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    name=${file##*/}
+    pid=${name##*~}
+    pid=${pid%%.*}
+    _state_pid_dead "$pid" || continue
+    rm -f -- "$file" 2>/dev/null || true
+  done
+  while IFS= read -r file; do
+    [[ "$file" == "$_state_dir/watchers/"* ]] || continue
+    name=${file##*/}
+    pid=${name##*.}
+    name=${name%.*}
+    [[ "$name" != *[!$_state_chars]* ]] || continue
+    [[ "$name" == pending || "$name" == pending.?* ]] || _state_is_key "$name" || continue
+    _state_pid_dead "$pid" || continue
+    rm -f -- "$file" 2>/dev/null || true
+  done < <(find "$_state_dir/watchers" -maxdepth 1 -type f -mmin +1440 \
+    -print 2>/dev/null)
+}
+
+# @brief Announce a waiting run before its targets are known.
+# Branch lookups can take a while; the pending file covers every pull request
+# of this repository until the watcher files below replace it.
+_state_start() {
+  [[ -n "$_state_dir" ]] || return 0
+  _state_mkdir || return 0
+  _state_prune
+  _state_pending=$_state_dir/watchers/pending.$_state_scope.$$
+  _state_write "$_state_pending" "$$"
+}
+
+# @brief Record the resolved targets' keys and, for a waiting run, their
+# watcher files. Watcher files are written before the pending file goes, so a
+# reader never sees neither.
+_state_targets() {
+  local number
+
+  [[ -n "$_state_dir" ]] || return 0
+  for number in ${_numbers[@]+"${_numbers[@]}"}; do
+    _state_keys+=("${_state_scope}_$number")
+    [[ "$_wait" == 0 ]] || _state_write "$_state_dir/watchers/${_state_scope}_$number.$$" "$$"
+  done
+  if [[ -n "$_state_pending" ]]; then
+    rm -f -- "$_state_pending" 2>/dev/null || true
+    _state_pending=""
+  fi
+}
+
+# @brief Record pull requests this check found finished.
+# done/<key> holds "<head commit> <green|merged|closed>". A green record is
+# only written for a judgment of the current head, and it is rewritten only
+# when it changes.
+_state_finished() {
+  local i head word
+
+  [[ -n "$_state_dir" ]] || return 0
+  for ((i = 0; i < ${#_state_keys[@]}; i++)); do
+    case "${_state[i]:-}:${_reason[i]:-}" in
+      "done":merged) word=merged ;;
+      "done":*) word=green ;;
+      action:closed) word=closed ;;
+      *) continue ;;
+    esac
+    head=${_pr_head[i]:--}
+    [[ "$head" =~ ^[0123456789abcdef]{40}([0123456789abcdef]{24})?$ ]] || head=-
+    [[ "${_state_done[i]:-}" != "$head $word" ]] || continue
+    _state_done[i]="$head $word"
+    _state_write "$_state_dir/done/${_state_keys[$i]}" "$head $word"
+  done
+}
+
+# @brief Record a waiting run's exit and remove its watcher files.
+# exited/<key> holds "<exit status> <state> <reason>" (informational). A pull
+# request in a named stall gets none: it waits on something outside it, and
+# watching again would not change that.
+_state_finish() {
+  local status="$1" i
+  local -a files
+
+  [[ "$_wait" == 1 ]] || return 0
+  for ((i = 0; i < ${#_state_keys[@]}; i++)); do
+    [[ "${_state[i]:-}" != stall ]] || continue
+    _state_write "$_state_dir/exited/${_state_keys[$i]}" \
+      "$status ${_state[i]:--} ${_reason[i]:--}"
+  done
+  files=()
+  for ((i = 0; i < ${#_state_keys[@]}; i++)); do
+    files+=("$_state_dir/watchers/${_state_keys[$i]}.$$")
+  done
+  [[ -z "$_state_pending" ]] || files+=("$_state_pending")
+  ((${#files[@]} == 0)) || rm -f -- "${files[@]}" 2>/dev/null || true
+}
+
 # --- main --------------------------------------------------------------------
 
 # @brief Sleep up to $1 seconds, never past the deadline.
@@ -1119,13 +1326,17 @@ _deadline=$((_started + _cap))
 _failed_checks=0
 _rate_reset=""
 _rate_date=""
+_state_init
+[[ "$_wait" == 0 ]] || _state_start
 _resolve_targets
+_state_targets
 while :; do
   _reset_tick
   _check_now=$(_now)
   _snapshot_all
   [[ -n "$_server_now" ]] || _server_now=$_check_now
   _judge_all
+  _state_finished
   [[ "$_wait" == 0 ]] || _progress
   _status=$(_decide)
   # A one-shot run reports what it saw. A waiting run stops as soon as a pull

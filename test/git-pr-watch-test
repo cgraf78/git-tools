@@ -1461,6 +1461,185 @@ out=$(GIT_PR_WATCH_MAX_SECONDS=soon PATH="$bin_dir:$PATH" git -C "$repo" pr-watc
 _assert_contains "a bad GIT_PR_WATCH_MAX_SECONDS is reported and ignored" \
   "ignoring GIT_PR_WATCH_MAX_SECONDS=soon" "$out"
 
+# --- state files -------------------------------------------------------------
+
+# Each state case gets its own state root. _state is the tool's directory in it.
+_state_scenario() {
+  _scenario
+  XDG_STATE_HOME=$(_tmpdir)
+  export XDG_STATE_HOME
+  _state=$XDG_STATE_HOME/git-tools/pr-watch
+}
+
+# List a state directory's entries, one per line, sorted.
+_state_ls() {
+  local file
+
+  for file in "$_state/$1"/* "$_state/$1"/.[!.]*; do
+    [[ ! -e "$file" ]] || printf '%s\n' "${file##*/}"
+  done | LC_ALL=C sort
+}
+
+# A pid no process has: a finished child's.
+_dead_pid() {
+  sh -c 'exit 0' &
+  local pid=$!
+  wait "$pid"
+  printf '%s\n' "$pid"
+}
+
+_state_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+_watch 12
+_assert_eq "a one-shot green run exits zero" 0 "$status"
+_assert_eq "a green pull request is recorded as done" "$HEAD green" "$(cat "$_state/done/example_repo_12" 2>/dev/null)"
+_assert_eq "a one-shot run writes no watcher files" "" "$(_state_ls watchers)"
+_assert_eq "a one-shot run writes no exit records" "" "$(_state_ls exited)"
+_assert_eq "the state directory is private" "$_state" "$(find "$_state" -prune -perm 700 -print)"
+
+_state_scenario
+_serve 1 "$(_response "$(_running_pr 12)")"
+_watch 12
+_assert_eq "a one-shot pending run exits 8" 8 "$status"
+if [[ ! -e "$XDG_STATE_HOME/git-tools" ]]; then
+  _pass "a run that finishes nothing creates no state directory"
+else
+  _fail "a run that finishes nothing creates no state directory"
+fi
+
+_state_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"state":"MERGED","mergeable":"UNKNOWN"}')" \
+  "$(_green_pr 13 '{"state":"CLOSED"}')" "$(_running_pr 14)")"
+_watch 12 13 14
+_assert_eq "a merged pull request is recorded" "$HEAD merged" "$(cat "$_state/done/example_repo_12" 2>/dev/null)"
+_assert_eq "a closed pull request is recorded" "$HEAD closed" "$(cat "$_state/done/example_repo_13" 2>/dev/null)"
+_assert_eq "only finished pull requests are recorded" "example_repo_12
+example_repo_13" "$(_state_ls "done")"
+
+# A waiting run that ends green: an exit record, no watcher files left, and no
+# temporary files.
+_state_scenario
+_serve 1 "$(_response "$(_running_pr 12)")"
+_serve 2 "$(_response "$(_green_pr 12)")"
+_wait_watch 12
+_assert_eq "a waiting run to green exits zero" 0 "$status"
+_assert_eq "the exit is recorded" "0 done green" "$(cat "$_state/exited/example_repo_12" 2>/dev/null)"
+_assert_eq "the finish is recorded" "$HEAD green" "$(cat "$_state/done/example_repo_12" 2>/dev/null)"
+_assert_eq "the watcher files are removed at exit" "" "$(_state_ls watchers)"
+_assert_eq "no temporary files are left" "" "$(cd "$_state" && find . -name '*~*' -print)"
+
+# A pull request in a named stall gets no exit record; the others do.
+_state_scenario
+_approval_pr=$(_pr 12 "$(_list "$(_run t COMPLETED SUCCESS 1 COMPLETED 21 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED SUCCESS 1)" "$(_suite 2 COMPLETED ACTION_REQUIRED 0 .github/workflows/z.yml)")")
+_serve 1 "$(_response "$_approval_pr" "$(_running_pr 13)")"
+_serve 2 "$(_response "$_approval_pr" "$(_green_pr 13)")"
+_wait_watch 12 13
+_assert_contains "the first pull request stalls" "pr=12 state=stall" "$out"
+_assert_eq "a stalled pull request gets no exit record" "example_repo_13" "$(_state_ls exited)"
+_assert_eq "the other pull request's exit is recorded" "8 done green" "$(cat "$_state/exited/example_repo_13" 2>/dev/null)"
+
+# While a waiting run is in a call, its watcher file names it and the pending
+# file is gone; a signal records the exit and removes the watcher file.
+_state_scenario
+touch "$FAKE_GH_DIR/call-1.hang"
+printf '200\n' >"$FAKE_GH_DIR/call-1.status"
+(cd "$repo" && PATH="$bin_dir:$PATH" exec bash "$ROOT/bin/git-pr-watch" --wait \
+  12 >"$FAKE_GH_DIR/out" 2>"$FAKE_GH_DIR/err") &
+_watcher=$!
+_deadline=$((SECONDS + 20))
+while [[ ! -s "$FAKE_GH_DIR/hang.pid" ]] && ((SECONDS < _deadline)); do sleep 0.1; done
+_assert_eq "a waiting run has a watcher file" "example_repo_12.$_watcher" "$(_state_ls watchers)"
+_assert_eq "the watcher file holds the watcher's pid" "$_watcher" "$(cat "$_state/watchers/example_repo_12.$_watcher" 2>/dev/null)"
+kill -TERM "$_watcher" 2>/dev/null
+wait "$_watcher"
+_assert_eq "a signalled watcher records its exit" "143 - -" "$(cat "$_state/exited/example_repo_12" 2>/dev/null)"
+_assert_eq "a signalled watcher removes its watcher file" "" "$(_state_ls watchers)"
+
+# While a branch lookup runs, a pending file for the repository stands in for
+# the keys not known yet.
+_state_scenario
+touch "$FAKE_GH_DIR/branch-1.hang"
+printf '200\n' >"$FAKE_GH_DIR/branch-1.status"
+(cd "$repo" && PATH="$bin_dir:$PATH" exec bash "$ROOT/bin/git-pr-watch" --wait \
+  topic >"$FAKE_GH_DIR/out" 2>"$FAKE_GH_DIR/err") &
+_watcher=$!
+_deadline=$((SECONDS + 20))
+while [[ ! -s "$FAKE_GH_DIR/hang.pid" ]] && ((SECONDS < _deadline)); do sleep 0.1; done
+_assert_eq "a branch lookup has a pending file" "pending.example_repo.$_watcher" "$(_state_ls watchers)"
+_assert_eq "the pending file holds the watcher's pid" "$_watcher" \
+  "$(cat "$_state/watchers/pending.example_repo.$_watcher" 2>/dev/null)"
+kill -TERM "$_watcher" 2>/dev/null
+wait "$_watcher"
+_assert_eq "the pending file is removed at exit" "" "$(_state_ls watchers)"
+_assert_eq "a run with no resolved targets records no exit" "" "$(_state_ls exited)"
+
+# Turned off, nothing is written; any other value warns and keeps them on.
+_state_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+out=$(GIT_PR_WATCH_STATE=0 PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>&1)
+if [[ ! -e "$XDG_STATE_HOME/git-tools" ]]; then
+  _pass "GIT_PR_WATCH_STATE=0 turns state files off"
+else
+  _fail "GIT_PR_WATCH_STATE=0 turns state files off"
+fi
+_assert_not_contains "GIT_PR_WATCH_STATE=0 is not warned about" "ignoring" "$out"
+_state_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+out=$(GIT_PR_WATCH_STATE=no PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>&1)
+_assert_contains "a bad GIT_PR_WATCH_STATE is reported" "ignoring GIT_PR_WATCH_STATE=no" "$out"
+_assert_eq "a bad GIT_PR_WATCH_STATE keeps state files on" "$HEAD green" "$(cat "$_state/done/example_repo_12" 2>/dev/null)"
+
+# A relative XDG_STATE_HOME is ignored for HOME's default; with no absolute
+# root there are no state files.
+_state_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+_home=$(_tmpdir)
+out=$(XDG_STATE_HOME=relative HOME="$_home" PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>/dev/null)
+_assert_eq "a relative XDG_STATE_HOME falls back to HOME" "$HEAD green" \
+  "$(cat "$_home/.local/state/git-tools/pr-watch/done/example_repo_12" 2>/dev/null)"
+if [[ ! -e "$repo/relative" ]]; then
+  _pass "a relative XDG_STATE_HOME is never used"
+else
+  _fail "a relative XDG_STATE_HOME is never used"
+fi
+
+# State that cannot be written never changes the report or the exit.
+_state_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+printf 'not a directory\n' >"$XDG_STATE_HOME/git-tools"
+_watch 12
+_assert_eq "an unwritable state root does not change the exit" 0 "$status"
+_assert_eq "an unwritable state root prints nothing" "" "$err"
+
+# Pruning at the start of a waiting run.
+_state_scenario
+mkdir -p "$_state/done" "$_state/exited" "$_state/watchers"
+_dead=$(_dead_pid)
+_old=200001010000
+for _f in done/example_repo_1 exited/example_repo_1 done/notes \
+  "done/example_repo_2~$_dead.AbC123" "done/example_repo_3~$$.AbC123" \
+  "watchers/example_repo_4.$_dead" "watchers/example_repo_5.$$" \
+  "watchers/pending.example_repo.$_dead" "watchers/stray.$_dead"; do
+  printf 'x\n' >"$_state/$_f"
+  touch -t "$_old" "$_state/$_f"
+done
+printf 'x\n' >"$_state/done/example_repo_6"
+printf 'x\n' >"$_state/watchers/example_repo_7.$_dead"
+mkdir "$_state/done/example_repo_8"
+touch -t "$_old" "$_state/done/example_repo_8"
+_serve 1 "$(_response "$(_green_pr 12)")"
+_wait_watch 12
+_assert_eq "pruning keeps live, recent, and foreign entries" "example_repo_12
+example_repo_3~$$.AbC123
+example_repo_6
+example_repo_8
+notes" "$(_state_ls "done")"
+_assert_eq "pruning removes old exit records" "example_repo_12" "$(_state_ls exited)"
+_assert_eq "pruning removes only old watcher files of gone watchers" "example_repo_5.$$
+example_repo_7.$_dead
+stray.$_dead" "$(_state_ls watchers)"
+
 # --- time conversion ---------------------------------------------------------
 
 _epochs=$(

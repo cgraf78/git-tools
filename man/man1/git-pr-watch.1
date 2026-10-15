@@ -180,11 +180,124 @@ be read, the ones not read are reported as
 with reason
 .BR unreadable ,
 and a pull request already read that needs action still decides status 1.
+.SH STATE FILES
+So that other tools (agent hooks, for example) can tell whether a pull request
+is being watched or has finished without asking GitHub,
+.B git pr-watch
+keeps small files under
+.IR $XDG_STATE_HOME/git-tools/pr-watch/ ,
+or
+.I ~/.local/state/git-tools/pr-watch/
+when
+.B XDG_STATE_HOME
+is unset or not an absolute path. With neither an absolute
+.B XDG_STATE_HOME
+nor an absolute
+.BR HOME ,
+there are none. This layout and its naming rules are a stable interface.
+.PP
+A pull request's
+.I key
+is
+.IB owner _ repository _ number
+and its repository's
+.I scope
+is
+.IB owner _ repository ,
+taken from the pull request's URL path
+.RI ( /owner/repository/pull/number )
+and lowercased, so they hold only lowercase letters, digits,
+.BR . ,
+.BR _ ,
+and
+.BR \- .
+Compare keys and scopes whole rather than splitting them: a repository name
+can contain underscores and dots, and some owner names (enterprise-managed
+accounts) contain an underscore too. The host is not part of either: the same
+owner, repository, and number on two GitHub hosts share a key, and so (very
+rarely) do two repositories whose names differ only in where an underscore
+splits owner from repository.
+.TP
+.BI watchers/ key . pid
+Exists while a waiting run with that process id watches the pull request, and
+holds the pid. The pid is the last
+.BR . -separated
+field and is all digits. A run killed outright leaves its file behind, so a
+reader should also check that the process is alive and is
+.B git-pr-watch
+(the basename of its first or second argument, since it may run as
+.BR "bash git-pr-watch" ).
+.TP
+.BI watchers/pending. scope . pid
+Exists while a waiting run is still resolving its targets (branch names), and
+stands for every pull request of that repository. The watcher files are
+written before it is removed.
+.TP
+.BI exited/ key
+Written when a waiting run ends, for each pull request it had resolved by
+then, except one last reported in a named stall (with an
+.B action:
+line), which waits on something outside the pull request. Its content,
+.RI \(dq "status state reason" \(dq
+(the exit status, then
+.B \-
+for a state or reason not judged yet), is informational; its modification
+time is when the watch ended. It is written before the watcher files are
+removed.
+.TP
+.BI done/ key
+Written by any run that finds the pull request finished, holding
+.RI \(dq "commit word epoch" \(dq:
+the head commit judged (or
+.B \-
+if GitHub gave none),
+.BR green ,
+.BR merged ,
+or
+.BR closed ,
+and when the check that judged it started, in seconds since the epoch by
+this host's clock (or
+.BR \- ,
+to be treated as before any event).
+Compare that time, not the file's modification time, with the time of a
+later event such as a push: a check that started before the event cannot have
+seen it.
+.B green
+is only written for checks judged on the pull request's current head. A run
+rewrites the record only when its commit or word changes.
+.PP
+Names containing
+.B ~
+are temporary files (written as
+.IB name ~ pid .XXXXXX
+and renamed into place); readers ignore them. Files are replaced atomically,
+and directories are created private to the user. Writing is best-effort: a
+failure never changes the report or the exit status. A waiting run removes,
+at its start, exit and done records older than 30 days, temporary files older
+than an hour whose writer is gone, and watcher files older than a day whose
+watcher is gone.
+.PP
+A reader that wants to know whether a pull request is watched should list
+.I watchers/
+before reading
+.I exited/
+or
+.IR done/ ,
+and list it once more if it finds nothing: a single directory listing can
+miss both files while one replaces the other.
 .SH ENVIRONMENT
 .TP
 .B GIT_PR_WATCH_MAX_SECONDS
 Upper limit, in seconds, on a waiting run (default 21600, six hours). A value
 that is not a positive number is reported and ignored.
+.TP
+.B GIT_PR_WATCH_STATE
+Set to 0 to keep no state files. Any value other than 0 or 1 is reported and
+ignored.
+.TP
+.B XDG_STATE_HOME
+Where state files go; see
+.BR "STATE FILES" .
 .SH SEE ALSO
 .BR git-pr-checks (1),
 .BR git-pr-ready (1)

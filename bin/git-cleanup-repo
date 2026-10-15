@@ -259,7 +259,7 @@ _count() {
 
 _validate_native_oid() {
   local oid="$1"
-  [[ "${#oid}" == "$_oid_width" && "$oid" != *[!0-9a-f]* ]]
+  [[ "${#oid}" == "$_oid_width" && "$oid" != *[!0-9abcdef]* ]]
 }
 
 _default_branch() {
@@ -1450,7 +1450,7 @@ case "${#_native_empty_oid}" in
   40 | 64) _oid_width=${#_native_empty_oid} ;;
   *) _die "unsupported repository object format" ;;
 esac
-[[ "$_native_empty_oid" != *[!0-9a-f]* ]] ||
+[[ "$_native_empty_oid" != *[!0-9abcdef]* ]] ||
   _die "unsupported repository object format"
 
 _base=$(_default_branch)

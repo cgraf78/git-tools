@@ -91,9 +91,17 @@ esac
 
 # A bare-name GT_GIT (no exec-path binary, or the test PATH override) is
 # resolved to an absolute path here, so the wrapper below can run it directly.
+# Only an absolute result is kept: a relative PATH entry such as `.` would
+# stop resolving after the first `cd`.
 case "$GT_GIT" in
   */*) ;;
-  *) GT_GIT=$(type -P "$GT_GIT" 2>/dev/null) || GT_GIT=git ;;
+  *)
+    _gt_git_found=$(type -P "$GT_GIT" 2>/dev/null) || _gt_git_found=""
+    case "$_gt_git_found" in
+      /*) GT_GIT=$_gt_git_found ;;
+    esac
+    unset _gt_git_found
+    ;;
 esac
 
 # @brief Run Git's own binary (see above) with the given arguments.

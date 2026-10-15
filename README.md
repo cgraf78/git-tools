@@ -55,6 +55,7 @@ merged), need action, or are still pending, with one exit status for the set.
 git pr-watch
 git pr-watch 123 124 125
 git pr-watch feature/my-branch
+git pr-watch --wait 123 124
 ```
 
 Each pull request is judged on its current head commit. The newest run of each
@@ -73,9 +74,17 @@ action (failing checks and a command for each failed job's log), and a final
 `result:` line. A run takes at most 20 pull requests, all from the current
 checkout's repository. The test suite needs `jq` and skips without it.
 
+With `--wait`, it keeps checking (every 60 seconds by default) until a pull
+request needs action, every pull request is done, or the ones left are stalled
+on something outside the pull request, such as a required check that never
+reported or a workflow awaiting approval. A failure ends the wait at once, a
+new head is followed, and the wait stops after six hours (`--timeout` sets a
+shorter limit). Run it in the background.
+
 The command returns `0` when every pull request is done, `1` when one needs
-action, `8` while one is pending, `3` when GitHub could not be read, and `2`
-for usage, not-found, authentication, environment, and internal errors.
+action, `8` while one is pending or stalled, `3` when GitHub could not be
+read, and `2` for usage, not-found, authentication, environment, and internal
+errors.
 
 ### `git pr-open`
 

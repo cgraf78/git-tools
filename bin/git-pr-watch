@@ -33,7 +33,13 @@ Without a target, uses the pull request for the current branch. Every target
 must belong to the current checkout's repository; at most 20 per run.
 
 Options:
-  -h, --help    Show this help.
+  -w, --wait            Keep checking until a pull request needs action, every
+                        pull request is done, or the rest are stalled.
+      --timeout <sec>   With --wait, stop after this long (default: 6 hours,
+                        or GIT_PR_WATCH_MAX_SECONDS).
+      --interval <sec>  With --wait, seconds between checks (default: 60,
+                        at least 15).
+  -h, --help            Show this help.
 
 Exit status:
   0  Every pull request is done (checks green, or merged).
@@ -55,9 +61,29 @@ _confirm_window=150
 # Seconds after a push during which a different head on GitHub is treated as
 # GitHub catching up rather than as the head to judge.
 _push_grace=60
-# Attempts per call for transient failures. This is a one-shot command: a rate
-# limit is reported (exit 3) rather than slept through.
+# Attempts per call for transient failures within one check. A one-shot run
+# reports a rate limit (exit 3); a waiting run sleeps until it lifts.
 _call_attempts=3
+# A waiting run past grace windows (since the watch started, or since the
+# pull request's head last changed) calls a still-unsettled state a stall.
+_head_grace=300
+_no_checks_grace=300
+_merge_grace=600
+# Consecutive checks a BLOCKED merge state or a dropped auto-merge must hold
+# before it is reported, so one stale read cannot decide it.
+_confirm_checks=2
+_interval=60
+_min_interval=15
+_jitter_max=10
+# Per-call time limit for a waiting run, clamped to the time left, with a floor
+# so the last call before the deadline still has a chance to answer.
+_call_timeout=60
+_call_floor=10
+# Consecutive checks that could not be read (other than rate limits) before a
+# waiting run gives up with exit 3.
+_failed_check_limit=10
+# Default cap on a waiting run: GitHub-hosted jobs run at most six hours.
+_cap_default=21600
 _max_targets=20
 _max_check_lines=10
 # GraphQL Int is 32-bit signed; a larger number is never a pull request.
@@ -91,7 +117,13 @@ _on_exit() {
 
 # shellcheck disable=SC2329 # invoked by signal traps
 _on_signal() {
+  local pids
+
   trap '' INT TERM HUP
+  # Background jobs: a gh call, its watchdog, or the sleep between checks.
+  pids=$(jobs -p 2>/dev/null) || pids=""
+  # shellcheck disable=SC2086 # one pid per word
+  [[ -z "$pids" ]] || kill -TERM $pids 2>/dev/null || true
   [[ -z "${GT_PR_SNAPSHOT_TMP:-}" ]] || rm -rf -- "$GT_PR_SNAPSHOT_TMP"
   _result_done=1
   printf 'result: %s reason=signal prs=%s\n' "$1" \
@@ -120,7 +152,7 @@ _unreadable_exit() {
   _result_done=1
   printf '%s: %s\n' "$gt_command" "$2" >&2
   [[ "$_resolved_all" != 1 ]] || ((${#_numbers[@]} == 0)) ||
-    printf 'next: git pr-watch %s\n' "${_numbers[*]}"
+    printf 'next: git pr-watch --wait %s\n' "${_numbers[*]}"
   printf 'result: 3 reason=%s prs=%s\n' "$1" \
     "$(_csv ${_numbers[@]+"${_numbers[@]}"})"
   exit 3
@@ -166,12 +198,42 @@ _pause() {
 
 # --- arguments and environment ----------------------------------------------
 
+_wait=0
+_timeout=""
+_interval_set=0
+
+# @brief Validate a seconds value for an option.
+_seconds_arg() {
+  [[ "$2" =~ ^[0-9]{1,9}$ ]] || gt_usage_error "$1 must be a number of seconds"
+}
+
 while (($#)); do
   case "$1" in
     -h | --help)
       _result_done=1
       _usage
       exit 0
+      ;;
+    -w | --wait)
+      _wait=1
+      shift
+      ;;
+    --timeout | --interval)
+      (($# > 1)) || gt_usage_error "$1 requires a value"
+      _seconds_arg "$1" "$2"
+      if [[ "$1" == --timeout ]]; then _timeout=$2; else _interval=$2 _interval_set=1; fi
+      shift 2
+      ;;
+    --timeout=*)
+      _timeout=${1#--timeout=}
+      _seconds_arg --timeout "$_timeout"
+      shift
+      ;;
+    --interval=*)
+      _interval=${1#--interval=}
+      _seconds_arg --interval "$_interval"
+      _interval_set=1
+      shift
       ;;
     --)
       shift
@@ -187,6 +249,24 @@ while (($#)); do
       ;;
   esac
 done
+
+if [[ "$_wait" == 0 ]]; then
+  [[ -z "$_timeout" && "$_interval_set" == 0 ]] ||
+    gt_usage_error "--timeout and --interval need --wait"
+fi
+((10#$_interval >= _min_interval)) ||
+  gt_usage_error "--interval must be at least $_min_interval seconds"
+_interval=$((10#$_interval))
+_cap=$_cap_default
+if [[ -n "${GIT_PR_WATCH_MAX_SECONDS:-}" ]]; then
+  if [[ "$GIT_PR_WATCH_MAX_SECONDS" =~ ^[1-9][0-9]{0,8}$ ]]; then
+    _cap=$GIT_PR_WATCH_MAX_SECONDS
+  else
+    printf '%s: ignoring GIT_PR_WATCH_MAX_SECONDS=%s (not a number of seconds)\n' \
+      "$gt_command" "$GIT_PR_WATCH_MAX_SECONDS" >&2
+  fi
+fi
+[[ -z "$_timeout" ]] || ((10#$_timeout >= _cap)) || _cap=$((10#$_timeout))
 
 git rev-parse --git-dir >/dev/null 2>&1 ||
   _fail environment "not inside a git repository"
@@ -448,17 +528,45 @@ _store_records() {
   done <<<"$body"
 }
 
+# Pull requests per query. It starts at the library's chunk size and only
+# shrinks: a size GitHub timed out on once is not tried again in this run.
+_chunk=$GT_PR_SNAPSHOT_CHUNK
+
+# @brief Set the per-call time limit for a waiting run.
+# GT_PR_CALL_TIMEOUT is read by gt_pr_snapshot_call in the shared library.
+# The limit is clamped to the time left before the deadline, with a floor so
+# the last call still has a chance to answer. A one-shot run sets none.
+# GIT_TOOLS_TEST_PR_WATCH_CALL_TIMEOUT (test-only) sets the limit directly.
+# shellcheck disable=SC2034 # GT_PR_CALL_TIMEOUT is read by the library
+_set_call_timeout() {
+  local left
+
+  if [[ "$_wait" == 0 ]]; then
+    GT_PR_CALL_TIMEOUT=0
+    return
+  fi
+  if [[ "${GIT_TOOLS_TEST_PR_WATCH_CALL_TIMEOUT:-}" =~ ^[1-9][0-9]*$ ]]; then
+    GT_PR_CALL_TIMEOUT=$GIT_TOOLS_TEST_PR_WATCH_CALL_TIMEOUT
+    return
+  fi
+  left=$((_deadline - $(_now)))
+  ((left <= _call_timeout)) || left=$_call_timeout
+  ((left >= _call_floor)) || left=$_call_floor
+  GT_PR_CALL_TIMEOUT=$left
+}
+
 # @brief Snapshot every target, halving a chunk whenever GitHub times out.
 # Stops at the first chunk that cannot be read and records why in
 # _snapshot_class; _read_upto marks how many targets were read before it.
 _snapshot_all() {
-  local chunk=$GT_PR_SNAPSHOT_CHUNK count attempt=0 alias
+  local count attempt=0 alias
   local -a slice=() missing=()
 
   while ((_read_upto < ${#_numbers[@]})); do
     count=$((${#_numbers[@]} - _read_upto))
-    ((count <= chunk)) || count=$chunk
+    ((count <= _chunk)) || count=$_chunk
     slice=("${_numbers[@]:_read_upto:count}")
+    _set_call_timeout
     gt_pr_snapshot "$GT_PR_CHECKS_JQ" "${slice[@]}" ||
       _fail environment "could not create a temporary file"
     _fail_on_class
@@ -482,12 +590,14 @@ _snapshot_all() {
         ;;
       rate-limited)
         _snapshot_class=rate-limited
+        _rate_reset=$GT_PR_RESPONSE_RESET
+        _rate_date=$GT_PR_RESPONSE_DATE
         return 0
         ;;
       timeout)
         # Query time grows with the checks returned; split until it fits.
         if ((count > 1)); then
-          chunk=$(((count + 1) / 2))
+          _chunk=$(((count + 1) / 2))
           continue
         fi
         ;;
@@ -586,12 +696,49 @@ _confirmed_failure() {
   printf '%s' "$result"
 }
 
+# Judgment state that carries across checks, indexed like _numbers: when the
+# pull request's current grace windows started (watch start, or its last head
+# change), the head last seen, whether auto-merge has ever been seen enabled,
+# consecutive-check counters, when it started waiting to merge, and the state
+# last printed as progress.
+_since=()
+_last_head=()
+_latched=()
+_blocked_count=()
+_amoff_count=()
+_merge_since=()
+_shown=()
+
+# @brief Elapsed seconds since this pull request's grace windows started.
+_elapsed() {
+  printf '%s\n' $((_check_now - ${_since[$1]:-$_check_now}))
+}
+
+# @brief Start this pull request's grace windows over (watch start or a new
+# head) and forget counters that only make sense for one head.
+_restart() {
+  _since[$1]=$_check_now
+  _blocked_count[$1]=0
+  _amoff_count[$1]=0
+  _merge_since[$1]=""
+}
+
 # @brief Judge one pull request into a state and reason.
-# One-shot runs see a single moment, so anything that needs time to settle (a
-# push GitHub has not caught up with, a grace window, a second confirming look)
-# is reported as pending.
+# A one-shot run is a single check at elapsed time zero, so anything that
+# needs time to settle (a grace window, a second confirming check) reports as
+# pending; a waiting run sees those windows pass.
 _judge() {
-  local index="$1" confirmed reason goal=green
+  local index="$1" confirmed reason goal=green head
+
+  head=${_pr_head[index]:--}
+  if [[ -z "${_since[index]:-}" ]]; then
+    _restart "$index"
+  elif [[ "$head" != - && -n "${_last_head[index]:-}" && "$head" != "${_last_head[index]}" ]]; then
+    printf '[%s] pr=%s new head %s\n' "$(_clock_label)" "${_numbers[$index]}" "${head:0:12}" >&2
+    _restart "$index"
+  fi
+  [[ "$head" == - ]] || _last_head[index]=$head
+  [[ "${_pr_am[index]:-false}" != true ]] || _latched[index]=1
 
   case "${_pr_state[index]:-}" in
     MERGED)
@@ -604,7 +751,11 @@ _judge() {
       ;;
   esac
   if [[ "${_pr_headmatch[index]:-no}" != yes ]]; then
-    _set "$index" pending head-settling
+    if (($(_elapsed "$index") >= _head_grace)); then
+      _set "$index" stall head-mismatch
+    else
+      _set "$index" pending head-settling
+    fi
     return
   fi
   if _push_race "$index"; then
@@ -651,14 +802,31 @@ _judge() {
       ;;
   esac
   if [[ "${_pr_checks[index]:-none}" == none ]]; then
-    _set "$index" pending no-checks-grace
+    if (($(_elapsed "$index") >= _no_checks_grace)); then
+      _set "$index" stall no-checks
+    else
+      _set "$index" pending no-checks-grace
+    fi
     return
   fi
   if [[ "${_pr_mergeable[index]:-}" != MERGEABLE ]]; then
     _set "$index" pending mergeable-unknown
     return
   fi
-  [[ "${_pr_am[index]:-false}" != true ]] || goal=merged
+  # Once auto-merge has been seen enabled, done means merged. If it is then
+  # off while the pull request is open (a push by someone without write
+  # access disables it, for example), nothing will merge it.
+  [[ "${_latched[index]:-}" != 1 ]] || goal=merged
+  if [[ "$goal" == merged && "${_pr_am[index]:-false}" != true ]]; then
+    _amoff_count[index]=$((${_amoff_count[index]:-0} + 1))
+    if ((_amoff_count[index] >= _confirm_checks)); then
+      _set "$index" action auto-merge-off
+    else
+      _set "$index" pending confirming
+    fi
+    return
+  fi
+  _amoff_count[index]=0
   case "$goal:${_pr_mss[index]:-}" in
     merged:BEHIND)
       _set "$index" action behind
@@ -671,8 +839,14 @@ _judge() {
       esac
       if [[ -z "$reason" ]]; then
         # BLOCKED with every check finished usually means a required check
-        # never reported; it takes a second look to call that a stall.
-        _set "$index" pending confirming
+        # never reported; it takes a second check to call that a stall.
+        _blocked_count[index]=$((${_blocked_count[index]:-0} + 1))
+        if ((_blocked_count[index] >= _confirm_checks)); then
+          _set "$index" stall blocked
+        else
+          _set "$index" pending confirming
+        fi
+        return
       elif [[ "$goal" == green ]]; then
         _set "$index" "done" "$reason"
       else
@@ -680,12 +854,18 @@ _judge() {
       fi
       ;;
     merged:*)
-      _set "$index" pending merge-waiting
+      [[ -n "${_merge_since[index]:-}" ]] || _merge_since[index]=$_check_now
+      if ((_check_now - _merge_since[index] >= _merge_grace)); then
+        _set "$index" stall merge-pending
+      else
+        _set "$index" pending merge-waiting
+      fi
       ;;
     *)
       _set "$index" "done" green
       ;;
   esac
+  [[ "${_reason[index]}" == confirming ]] || _blocked_count[index]=0
 }
 
 # @brief Judge every read target; targets past _read_upto were not read.
@@ -707,6 +887,23 @@ _judge_all() {
 
 # --- report ------------------------------------------------------------------
 
+# @brief A wall-clock label for progress lines.
+_clock_label() {
+  date +%H:%M:%S 2>/dev/null || printf '%s' "$_check_now"
+}
+
+# @brief Print a progress line for each pull request whose state changed.
+_progress() {
+  local i now_shown
+
+  for ((i = 0; i < ${#_numbers[@]}; i++)); do
+    now_shown="${_state[i]}/${_reason[i]}"
+    [[ "${_shown[i]:-}" != "$now_shown" ]] || continue
+    _shown[i]=$now_shown
+    printf '[%s] pr=%s %s\n' "$(_clock_label)" "${_numbers[$i]}" "$now_shown" >&2
+  done
+}
+
 _stall_hint() {
   case "$1" in
     approval-required) printf 'a workflow is waiting for a maintainer to approve it' ;;
@@ -715,7 +912,6 @@ _stall_hint() {
     changes-requested) printf 'auto-merge is waiting because a reviewer requested changes' ;;
   esac
 }
-
 _report_action() {
   local i="$1" j shown=0 more=0 job
 
@@ -748,13 +944,10 @@ _report_action() {
   done
 }
 
-# @brief Print the report and exit with the decided status.
-# Precedence across pull requests: needs action (1) > unreadable (3) > pending
-# or stalled (8) > done (0). The result names the pull requests that decided
-# the status, in target order, and the first one's reason.
-_report() {
-  local i exit=0 head result_reason=""
-  local -a unfinished=() result_prs=()
+# @brief The exit status the current judgments decide.
+# Needs action (1) > unreadable (3) > pending or stalled (8) > done (0).
+_decide() {
+  local i exit=0
 
   for ((i = 0; i < ${#_numbers[@]}; i++)); do
     case "${_state[i]}:${_reason[i]}" in
@@ -762,6 +955,31 @@ _report() {
       pending:unreadable) [[ "$exit" == 1 ]] || exit=3 ;;
       pending:* | stall:*) [[ "$exit" == 1 || "$exit" == 3 ]] || exit=8 ;;
     esac
+  done
+  printf '%s\n' "$exit"
+}
+
+# @brief Whether any pull request can still change state on a later check.
+# A stalled pull request waits on something outside it; when only stalls (and
+# finished pull requests) remain, waiting longer cannot change the outcome.
+_still_moving() {
+  local i
+
+  for ((i = 0; i < ${#_numbers[@]}; i++)); do
+    [[ "${_state[i]}" != pending ]] || return 0
+  done
+  return 1
+}
+
+# @brief Print the report and exit with the decided status.
+# The result names the pull requests that decided the status, in target order,
+# and the first one's reason.
+_report() {
+  local i exit head result_reason=""
+  local -a unfinished=() result_prs=()
+
+  exit=$(_decide)
+  for ((i = 0; i < ${#_numbers[@]}; i++)); do
     # A closed pull request is final; watching it again cannot change it.
     case "${_state[i]}:${_reason[i]}" in
       "done":* | action:closed) ;;
@@ -782,7 +1000,7 @@ _report() {
     esac
   done
   if [[ "$exit" != 0 ]] && ((${#unfinished[@]} > 0)); then
-    printf 'next: git pr-watch %s\n' "${unfinished[*]}"
+    printf 'next: git pr-watch --wait %s\n' "${unfinished[*]}"
   fi
 
   for ((i = 0; i < ${#_numbers[@]}; i++)); do
@@ -804,9 +1022,76 @@ _report() {
 
 # --- main --------------------------------------------------------------------
 
+# @brief Sleep up to $1 seconds, never past the deadline.
+# The sleep is a background job so a signal handler runs at once (and kills
+# it) instead of after the sleep ends. The test clock skips the sleep.
+_sleep_until_next() {
+  local seconds="$1" left pid
+
+  left=$((_deadline - $(_now)))
+  ((seconds <= left)) || seconds=$left
+  ((seconds > 0)) || return 0
+  if _test_clock >/dev/null; then
+    _pause "$seconds"
+    return 0
+  fi
+  sleep "$seconds" &
+  pid=$!
+  wait "$pid" || true
+}
+
+# @brief Seconds to wait for a rate limit to lift, with jitter so several
+# watchers do not all retry at the same moment.
+_rate_wait() {
+  local wait=60
+
+  if [[ "${_rate_reset:-}" =~ ^[0-9]+$ && "${_rate_date:-}" =~ ^[0-9]+$ ]]; then
+    wait=$((_rate_reset - _rate_date))
+    ((wait > 0)) || wait=1
+  fi
+  printf '%s\n' $((wait + $(_jitter)))
+}
+
+_jitter() {
+  if _test_clock >/dev/null; then
+    printf '0\n'
+  else
+    printf '%s\n' $((RANDOM % (_jitter_max + 1)))
+  fi
+}
+
 _resolve_targets
-_reset_tick
-_snapshot_all
-[[ -n "$_server_now" ]] || _server_now=$(_now)
-_judge_all
-_report
+_started=$(_now)
+_deadline=$((_started + _cap))
+_failed_checks=0
+_rate_reset=""
+_rate_date=""
+while :; do
+  _reset_tick
+  _check_now=$(_now)
+  _snapshot_all
+  [[ -n "$_server_now" ]] || _server_now=$_check_now
+  _judge_all
+  [[ "$_wait" == 0 ]] || _progress
+  _status=$(_decide)
+  # A one-shot run reports what it saw. A waiting run stops as soon as a pull
+  # request needs action (even if others could not be read), when everything
+  # is done, when only stalls remain, or at the deadline.
+  [[ "$_wait" == 1 && "$_status" != 1 && "$_status" != 0 ]] || _report
+  if [[ "$_snapshot_class" == ok ]]; then
+    _failed_checks=0
+    _still_moving || _report
+    (($(_now) < _deadline)) || _report
+    _sleep_until_next $((_interval + $(_jitter)))
+  elif [[ "$_snapshot_class" == rate-limited ]]; then
+    (($(_now) < _deadline)) || _report
+    _sleep_until_next "$(_rate_wait)"
+  else
+    _failed_checks=$((_failed_checks + 1))
+    ((_failed_checks < _failed_check_limit)) || _report
+    (($(_now) < _deadline)) || _report
+    _sleep_until_next $((_interval + $(_jitter)))
+  fi
+  # The sleep never passes the deadline, so the next check is the last one
+  # when it reaches it, and the report reflects the latest state.
+done

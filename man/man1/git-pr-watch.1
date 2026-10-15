@@ -45,8 +45,51 @@ When auto-merge is enabled, done means merged; a pull request that falls behind
 its base then needs action, since auto-merge waits for it to be updated.
 .SH OPTIONS
 .TP
+.BR \-w ", " \-\-wait
+Keep checking until a pull request needs action, every pull request is done,
+or the ones left are stalled (waiting on something outside the pull request).
+A failure ends the wait at once. Progress lines go to standard error as states
+change. Run it in the background: a foreground run can take hours.
+.TP
+.BI "\-\-timeout " seconds
+With
+.BR \-\-wait ,
+stop after this long and report what is still pending. The default, and the
+upper limit, is six hours (the longest a GitHub-hosted job runs), or
+GIT_PR_WATCH_MAX_SECONDS.
+.TP
+.BI "\-\-interval " seconds
+With
+.BR \-\-wait ,
+seconds between checks, plus a few seconds of random jitter. The default is
+60 and the minimum 15.
+.TP
 .BR \-h ", " \-\-help
 Show help.
+.SH WAITING
+A one-shot run judges a single moment, so anything that needs time to settle
+reports as pending. With
+.BR \-\-wait ,
+those windows pass: a pull request with no checks five minutes after the watch
+started (or after its head last changed) stalls as
+.BR no-checks ;
+checks for another head for five minutes stall as
+.BR head-mismatch ;
+a merge state still BLOCKED on a second check, with every check finished,
+stalls as
+.BR blocked ;
+a pull request that auto-merge should have merged but has not after ten
+minutes stalls as
+.BR merge-pending .
+Once auto-merge has been seen enabled, a second check that finds it off while
+the pull request is open needs action
+.RB ( auto-merge-off ).
+A new head mid-watch is followed: the watch announces it and starts that pull
+request's windows over.
+.PP
+A rate limit is waited out. Each GitHub call is cut off after 60 seconds (less
+near the deadline) and counts as a timeout; ten checks in a row that cannot be
+read end the wait with status 3.
 .SH OUTPUT
 Standard output holds these lines, in this order:
 .TP
@@ -71,7 +114,7 @@ A command that prints a failed job's log.
 .B action: pr=\fIn\fP \fItext\fP
 What a stalled pull request is waiting for.
 .TP
-.B next: git pr-watch \fIn\fP...
+.B next: git pr-watch \-\-wait \fIn\fP...
 The command to repeat for unfinished pull requests (exit statuses 1, 3, and 8).
 .TP
 .B result: \fIstatus\fP reason=\fIreason\fP prs=\fIn\fP,...
@@ -92,14 +135,15 @@ Pull request reasons:
 green, merged, review-required, changes-requested
 .TP
 .B action
-failed, cancelled, conflict, behind, closed
+failed, cancelled, conflict, behind, closed, auto-merge-off
 .TP
 .B pending
 checks-running, failure-confirming, push-grace, head-settling,
 mergeable-unknown, merge-waiting, no-checks-grace, confirming, unreadable
 .TP
 .B stall
-approval-required, too-many-checks, review-required, changes-requested
+approval-required, too-many-checks, review-required, changes-requested,
+no-checks, head-mismatch, blocked, merge-pending
 .PP
 Error reasons in the
 .B result:
@@ -135,6 +179,11 @@ be read, the ones not read are reported as
 with reason
 .BR unreadable ,
 and a pull request already read that needs action still decides status 1.
+.SH ENVIRONMENT
+.TP
+.B GIT_PR_WATCH_MAX_SECONDS
+Upper limit, in seconds, on a waiting run (default 21600, six hours). A value
+that is not a positive number is reported and ignored.
 .SH SEE ALSO
 .BR git-pr-checks (1),
 .BR git-pr-ready (1)

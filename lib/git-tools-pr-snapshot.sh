@@ -14,6 +14,8 @@ GT_PR_SNAPSHOT_CHUNK=8
 
 # Never trust an inherited value: callers remove this path on exit.
 GT_PR_SNAPSHOT_TMP=""
+# Per-call time limit in seconds for gt_pr_snapshot_call; 0 means none.
+GT_PR_CALL_TIMEOUT=0
 
 # @brief Run gh with color and debug output forced off.
 # Forced color (CLICOLOR_FORCE, GH_FORCE_TTY) wraps `gh api -i` header names in
@@ -461,21 +463,61 @@ gt_pr_snapshot_vars() {
 # The response and gh's diagnostics go through a private temporary directory
 # whose path is published in GT_PR_SNAPSHOT_TMP for the duration of the call,
 # so a caller's signal handler can remove it.
+#
+# With GT_PR_CALL_TIMEOUT set to a positive number of seconds, gh runs in the
+# background under a watchdog that kills it when the time is up; a call ended
+# that way classifies as `timeout`. The watchdog kills gh itself, so it works
+# even if the caller dies first. It sleeps in one-second slices so a
+# termination that arrives before its first sleep starts leaves at most a
+# one-second orphan. Callers that trap signals should kill their background
+# jobs (`jobs -p`) in the handler.
 gt_pr_snapshot_call() {
-  local rc=0 errors=""
+  local rc=0 errors="" dir gh_pid watchdog limit=${GT_PR_CALL_TIMEOUT:-0}
 
   GT_PR_SNAPSHOT_TMP=$(mktemp -d "${TMPDIR:-/tmp}/git-pr-snapshot.XXXXXX") || {
     GT_PR_SNAPSHOT_TMP=""
     GT_PR_RESPONSE_CLASS=transient
     return 1
   }
-  (
-    unset GH_HOST GH_REPO
-    gt_pr_gh "${GT_PR_GH_ARGV[@]}"
-  ) >"$GT_PR_SNAPSHOT_TMP/out" 2>"$GT_PR_SNAPSHOT_TMP/err" || rc=$?
-  errors=$(cat "$GT_PR_SNAPSHOT_TMP/err" 2>/dev/null) || errors=""
-  gt_pr_classify_response "$GT_PR_SNAPSHOT_TMP/out" "$rc" "$errors"
-  rm -rf -- "$GT_PR_SNAPSHOT_TMP"
+  dir=$GT_PR_SNAPSHOT_TMP
+  if [[ "$limit" =~ ^[1-9][0-9]*$ ]]; then
+    # env replaces itself with gh, so the job's pid is gh's own and killing
+    # it cannot leave gh running behind a wrapper shell. Same scrub as
+    # gt_pr_gh.
+    env -u GH_HOST -u GH_REPO -u CLICOLOR_FORCE -u GH_FORCE_TTY -u GH_DEBUG \
+      NO_COLOR=1 gh "${GT_PR_GH_ARGV[@]}" >"$dir/out" 2>"$dir/err" &
+    gh_pid=$!
+    (
+      slept=0
+      sleeper=""
+      trap '[[ -z "$sleeper" ]] || kill "$sleeper" 2>/dev/null; exit 0' TERM
+      while ((slept < limit)); do
+        sleep 1 &
+        sleeper=$!
+        wait "$sleeper" || true
+        sleeper=""
+        slept=$((slept + 1))
+      done
+      : >"$dir/timed-out"
+      kill -TERM "$gh_pid" 2>/dev/null
+    ) </dev/null >/dev/null 2>&1 &
+    watchdog=$!
+    wait "$gh_pid" || rc=$?
+    kill -TERM "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+  else
+    (
+      unset GH_HOST GH_REPO
+      gt_pr_gh "${GT_PR_GH_ARGV[@]}"
+    ) >"$dir/out" 2>"$dir/err" || rc=$?
+  fi
+  errors=$(cat "$dir/err" 2>/dev/null) || errors=""
+  gt_pr_classify_response "$dir/out" "$rc" "$errors"
+  if [[ -e "$dir/timed-out" ]]; then
+    GT_PR_RESPONSE_CLASS=timeout
+    GT_PR_RESPONSE_MESSAGE="gh did not answer within $limit seconds"
+  fi
+  rm -rf -- "$dir"
   GT_PR_SNAPSHOT_TMP=""
 }
 

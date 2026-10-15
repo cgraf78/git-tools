@@ -385,8 +385,8 @@ GT_REPO_IDENTITY_CACHE_TTL=3600
 
 # @brief Load the gh-resolved repository identity with an XDG file cache.
 # @param repo_root Absolute worktree root identifying this checkout.
-# Read-only callers (repo-state) only. Mutation paths keep resolving live so a
-# stale rename can never redirect a push or a PR operation.
+# Read-only callers (repo-state, pr-watch) only. Mutation paths keep resolving
+# live so a stale rename can never redirect a push or a PR operation.
 # The cache key binds the absolute repo root plus the normalized `git remote
 # -v` output, so editing remotes or renaming the checkout misses; the key
 # material is stored in the entry and re-verified on read, so even a cksum

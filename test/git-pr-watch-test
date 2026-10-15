@@ -153,7 +153,11 @@ status=200
 if [[ "$include" == 1 ]]; then
   printf 'HTTP/2.0 %s X\n' "$status"
   printf 'Access-Control-Expose-Headers: ETag, Retry-After, X-RateLimit-Remaining, X-RateLimit-Reset, X-GitHub-SSO\r\n'
-  [[ -f "$base.nodate" ]] || printf 'Date: Thu, 15 Oct 2026 14:14:10 GMT\r\n'
+  if [[ -f "$base.date" ]]; then
+    printf 'Date: %s\r\n' "$(cat "$base.date")"
+  elif [[ ! -f "$base.nodate" ]]; then
+    printf 'Date: Thu, 15 Oct 2026 14:14:10 GMT\r\n'
+  fi
   if [[ -f "$base.headers" ]]; then
     while IFS= read -r header; do
       printf '%s\r\n' "$header"
@@ -1155,6 +1159,7 @@ _wait_watch 12
 _assert_eq "no checks past the grace stalls" 8 "$status"
 _assert_contains "no-checks stall" "pr=12 state=stall reason=no-checks" "$out"
 _assert_eq "checked until the grace passed" 6 "$(_calls)"
+_assert_contains "no-checks hint" "action: pr=12 no checks reported" "$out"
 
 _scenario
 _serve 1 "$(_response "$(_green_pr 12 '{"mergeStateStatus":"BLOCKED"}')")"
@@ -1162,6 +1167,18 @@ _wait_watch 12
 _assert_eq "blocked twice in a row stalls" 8 "$status"
 _assert_contains "blocked stall" "pr=12 state=stall reason=blocked" "$out"
 _assert_eq "blocked needs two checks" 2 "$(_calls)"
+_assert_contains "blocked hint" "action: pr=12 merge is blocked with every check finished" "$out"
+
+# The confirmation counts consecutive checks: a check in another state in
+# between starts it over.
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"mergeStateStatus":"BLOCKED"}')")"
+_serve 2 "$(_response "$(_running_pr 12)")"
+_serve 3 "$(_response "$(_green_pr 12 '{"mergeStateStatus":"BLOCKED"}')")"
+_serve 4 "$(_response "$(_green_pr 12)")"
+_wait_watch 12
+_assert_eq "blocked checks separated by another state do not stall" 0 "$status"
+_assert_eq "it took four checks" 4 "$(_calls)"
 
 _scenario
 _serve 1 "$(_response "$(_running_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
@@ -1170,6 +1187,15 @@ _wait_watch 12
 _assert_eq "auto-merge turned off while open needs action" 1 "$status"
 _assert_contains "auto-merge-off record" "pr=12 state=action reason=auto-merge-off" "$out"
 _assert_eq "auto-merge-off needs two checks" 3 "$(_calls)"
+
+_scenario
+_serve 1 "$(_response "$(_running_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
+_serve 2 "$(_response "$(_green_pr 12)")"
+_serve 3 "$(_response "$(_running_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
+_serve 4 "$(_response "$(_green_pr 12)")"
+_serve 5 "$(_response "$(_green_pr 12 '{"state":"MERGED"}')")"
+_wait_watch 12
+_assert_eq "auto-merge briefly off, back on, then merged is done" 0 "$status"
 
 _scenario
 _serve 1 "$(_response "$(_running_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
@@ -1184,6 +1210,19 @@ _wait_watch 12
 _assert_eq "mergeable but never merged stalls after the grace" 8 "$status"
 _assert_contains "merge-pending stall" "pr=12 state=stall reason=merge-pending" "$out"
 _assert_eq "checked until the merge grace passed" 11 "$(_calls)"
+_assert_contains "merge-pending hint" "action: pr=12 auto-merge is enabled and the pull request is mergeable" "$out"
+
+# The merge wait starts over when the pull request leaves it: twelve minutes
+# of running checks in between do not count toward it.
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
+for _n in 2 3 4 5 6 7 8 9 10 11 12 13; do
+  _serve "$_n" "$(_response "$(_running_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
+done
+_serve 14 "$(_response "$(_green_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
+_serve 15 "$(_response "$(_green_pr 12 '{"state":"MERGED","autoMergeRequest":{"enabledAt":"x"}}')")"
+_wait_watch 12
+_assert_eq "the merge grace restarts after leaving merge-waiting" 0 "$status"
 
 _scenario
 _serve 1 "$(_response "$(_running_pr 12)")"
@@ -1198,6 +1237,20 @@ _serve 1 "$(_response "$(_green_pr 12 "{\"headRefOid\":\"$OTHER\"}")")"
 _wait_watch 12
 _assert_eq "checks for another head past the grace stall" 8 "$status"
 _assert_contains "head-mismatch stall" "pr=12 state=stall reason=head-mismatch" "$out"
+_assert_contains "head-mismatch hint" "action: pr=12 GitHub's checks are for a different commit" "$out"
+
+# A cancelled check with no completion time is confirmed from when it was
+# first seen, on GitHub's clock.
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED CANCELLED 1 COMPLETED 21)")" \
+  "$(_list "$(_suite 1 COMPLETED CANCELLED 1)")")")"
+_serve 2 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED CANCELLED 1 COMPLETED 21)")" \
+  "$(_list "$(_suite 1 COMPLETED CANCELLED 1)")")")"
+printf 'Thu, 15 Oct 2026 14:17:30 GMT\n' >"$FAKE_GH_DIR/call-2.date"
+_wait_watch 12
+_assert_eq "a cancellation without a completion time resolves" 1 "$status"
+_assert_contains "resolved as cancelled" "pr=12 state=action reason=cancelled" "$out"
+_assert_eq "resolved on the second check" 2 "$(_calls)"
 
 _scenario
 _serve 1 "$(_response \

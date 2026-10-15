@@ -669,9 +669,31 @@ _push_race() {
   ((now - updated <= _push_grace))
 }
 
+# First sighting, on GitHub's clock, of failing checks GitHub gave no
+# completion time (a run cancelled before it started): the confirmation window
+# runs from then instead. Keys are "<pull request number>:<check id>".
+_first_seen_key=()
+_first_seen_at=()
+
+# @brief The server epoch when this failing check was first seen.
+_first_seen() {
+  local key="$1" i
+
+  for ((i = 0; i < ${#_first_seen_key[@]}; i++)); do
+    if [[ "${_first_seen_key[$i]}" == "$key" ]]; then
+      printf '%s\n' "${_first_seen_at[$i]}"
+      return
+    fi
+  done
+  _first_seen_key+=("$key")
+  _first_seen_at+=("$_server_now")
+  printf '%s\n' "$_server_now"
+}
+
 # @brief Judge whether this PR's failures are final.
-# Prints failed, cancelled, or nothing while every failure is still inside the
-# confirmation window.
+# Sets _confirmed to failed, cancelled, or empty while every failure is still
+# inside the confirmation window. It sets a global rather than printing so the
+# first-sighting record survives (a command substitution would discard it).
 _confirmed_failure() {
   local index="$1" i epoch class result=""
 
@@ -684,7 +706,13 @@ _confirmed_failure() {
       result=failed
       break
     fi
-    epoch=$(gt_iso_epoch "${_chk_done[$i]}" 2>/dev/null) || continue
+    if [[ "${_chk_done[$i]}" == - ]]; then
+      [[ "${_chk_id[$i]}" =~ ^[0-9]+$ ]] || continue
+      _first_seen "${_numbers[$index]}:${_chk_id[$i]}" >/dev/null
+      epoch=$(_first_seen "${_numbers[$index]}:${_chk_id[$i]}")
+    else
+      epoch=$(gt_iso_epoch "${_chk_done[$i]}" 2>/dev/null) || continue
+    fi
     ((_server_now - epoch >= _confirm_window)) || continue
     # A confirmed failure outranks a confirmed cancellation.
     if [[ "$class" == fail ]]; then
@@ -693,7 +721,7 @@ _confirmed_failure() {
     fi
     result=cancelled
   done
-  printf '%s' "$result"
+  _confirmed=$result
 }
 
 # Judgment state that carries across checks, indexed like _numbers: when the
@@ -728,7 +756,7 @@ _restart() {
 # needs time to settle (a grace window, a second confirming check) reports as
 # pending; a waiting run sees those windows pass.
 _judge() {
-  local index="$1" confirmed reason goal=green head
+  local index="$1" reason goal=green head prior_blocked prior_amoff prior_merge
 
   head=${_pr_head[index]:--}
   if [[ -z "${_since[index]:-}" ]]; then
@@ -739,6 +767,15 @@ _judge() {
   fi
   [[ "$head" == - ]] || _last_head[index]=$head
   [[ "${_pr_am[index]:-false}" != true ]] || _latched[index]=1
+  # The confirmation counters and the merge wait count consecutive checks in
+  # the same condition: every check starts them over unless its own path
+  # carries them forward.
+  prior_blocked=${_blocked_count[index]:-0}
+  prior_amoff=${_amoff_count[index]:-0}
+  prior_merge=${_merge_since[index]:-}
+  _blocked_count[index]=0
+  _amoff_count[index]=0
+  _merge_since[index]=""
 
   case "${_pr_state[index]:-}" in
     MERGED)
@@ -772,9 +809,9 @@ _judge() {
   fi
   case "${_pr_checks[index]:-none}" in
     fail-running | fail-completed)
-      confirmed=$(_confirmed_failure "$index")
-      if [[ -n "$confirmed" ]]; then
-        _set "$index" action "$confirmed"
+      _confirmed_failure "$index"
+      if [[ -n "$_confirmed" ]]; then
+        _set "$index" action "$_confirmed"
       else
         _set "$index" pending failure-confirming
       fi
@@ -818,7 +855,7 @@ _judge() {
   # access disables it, for example), nothing will merge it.
   [[ "${_latched[index]:-}" != 1 ]] || goal=merged
   if [[ "$goal" == merged && "${_pr_am[index]:-false}" != true ]]; then
-    _amoff_count[index]=$((${_amoff_count[index]:-0} + 1))
+    _amoff_count[index]=$((prior_amoff + 1))
     if ((_amoff_count[index] >= _confirm_checks)); then
       _set "$index" action auto-merge-off
     else
@@ -826,7 +863,6 @@ _judge() {
     fi
     return
   fi
-  _amoff_count[index]=0
   case "$goal:${_pr_mss[index]:-}" in
     merged:BEHIND)
       _set "$index" action behind
@@ -840,7 +876,7 @@ _judge() {
       if [[ -z "$reason" ]]; then
         # BLOCKED with every check finished usually means a required check
         # never reported; it takes a second check to call that a stall.
-        _blocked_count[index]=$((${_blocked_count[index]:-0} + 1))
+        _blocked_count[index]=$((prior_blocked + 1))
         if ((_blocked_count[index] >= _confirm_checks)); then
           _set "$index" stall blocked
         else
@@ -854,7 +890,7 @@ _judge() {
       fi
       ;;
     merged:*)
-      [[ -n "${_merge_since[index]:-}" ]] || _merge_since[index]=$_check_now
+      _merge_since[index]=${prior_merge:-$_check_now}
       if ((_check_now - _merge_since[index] >= _merge_grace)); then
         _set "$index" stall merge-pending
       else
@@ -865,7 +901,6 @@ _judge() {
       _set "$index" "done" green
       ;;
   esac
-  [[ "${_reason[index]}" == confirming ]] || _blocked_count[index]=0
 }
 
 # @brief Judge every read target; targets past _read_upto were not read.
@@ -910,6 +945,10 @@ _stall_hint() {
     too-many-checks) printf 'more checks than one query can judge; inspect the pull request directly' ;;
     review-required) printf 'auto-merge is waiting for a required review' ;;
     changes-requested) printf 'auto-merge is waiting because a reviewer requested changes' ;;
+    no-checks) printf 'no checks reported; confirm a workflow runs for this branch' ;;
+    head-mismatch) printf "GitHub's checks are for a different commit than the pull request head" ;;
+    blocked) printf 'merge is blocked with every check finished; a required check may never have reported' ;;
+    merge-pending) printf 'auto-merge is enabled and the pull request is mergeable but has not merged' ;;
   esac
 }
 _report_action() {
@@ -1047,7 +1086,7 @@ _rate_wait() {
 
   if [[ "${_rate_reset:-}" =~ ^[0-9]+$ && "${_rate_date:-}" =~ ^[0-9]+$ ]]; then
     wait=$((_rate_reset - _rate_date))
-    ((wait > 0)) || wait=1
+    ((wait >= _min_interval)) || wait=$_min_interval
   fi
   printf '%s\n' $((wait + $(_jitter)))
 }

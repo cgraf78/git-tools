@@ -127,9 +127,13 @@ for arg in "$@"; do
   prev=$arg
 done
 
-# Branch lookups have their own fixture so snapshot calls number from 1.
+# Branch lookups have their own fixtures so snapshot calls number from 1:
+# branch-<m> for the m-th lookup when present, else branch.
 if [[ "$query" == *PrWatchBranch* ]]; then
+  m=$(($(cat "$dir/bn" 2>/dev/null || printf 0) + 1))
+  printf '%s\n' "$m" >"$dir/bn"
   base="$dir/branch"
+  [[ ! -e "$dir/branch-$m.json" && ! -e "$dir/branch-$m.status" ]] || base="$dir/branch-$m"
 else
   n=$(($(cat "$dir/n" 2>/dev/null || printf 0) + 1))
   printf '%s\n' "$n" >"$dir/n"
@@ -142,12 +146,22 @@ else
   fi
 fi
 
+# A hanging call: record this process for the leftover-process check, then
+# stay silent until killed.
+if [[ -f "$base.hang" ]]; then
+  printf '%s\n' "$$" >"$dir/hang.pid"
+  exec sleep 30
+fi
 status=200
 [[ ! -f "$base.status" ]] || status=$(cat "$base.status")
 if [[ "$include" == 1 ]]; then
   printf 'HTTP/2.0 %s X\n' "$status"
   printf 'Access-Control-Expose-Headers: ETag, Retry-After, X-RateLimit-Remaining, X-RateLimit-Reset, X-GitHub-SSO\r\n'
-  [[ -f "$base.nodate" ]] || printf 'Date: Thu, 15 Oct 2026 14:14:10 GMT\r\n'
+  if [[ -f "$base.date" ]]; then
+    printf 'Date: %s\r\n' "$(cat "$base.date")"
+  elif [[ ! -f "$base.nodate" ]]; then
+    printf 'Date: Thu, 15 Oct 2026 14:14:10 GMT\r\n'
+  fi
   if [[ -f "$base.headers" ]]; then
     while IFS= read -r header; do
       printf '%s\r\n' "$header"
@@ -332,7 +346,7 @@ _assert_contains "fail-fast record" "pr=12 state=action reason=failed" "$out"
 _assert_contains "failing check line" 'check pr=12 required=yes job=21 name="build"' "$out"
 _assert_contains "log command pins the repository" \
   "run: gh run view --job 21 --log-failed -R github.test/example/repo" "$out"
-_assert_contains "next line on action" "next: git pr-watch 12" "$out"
+_assert_contains "next line on action" "next: git pr-watch --wait 12" "$out"
 _assert_contains "action result" "result: 1 reason=failed prs=12" "$out"
 
 _scenario
@@ -341,7 +355,7 @@ _serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED FAILURE 1 COMPL
 _watch 12
 _assert_eq "finished failure inside the window is pending" 8 "$status"
 _assert_contains "confirming record" "pr=12 state=pending reason=failure-confirming" "$out"
-_assert_contains "pending next line" "next: git pr-watch 12" "$out"
+_assert_contains "pending next line" "next: git pr-watch --wait 12" "$out"
 
 _scenario
 _serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED FAILURE 1 COMPLETED 21 "$OLD")")" \
@@ -531,7 +545,7 @@ _assert_eq "any pull request needing action decides the exit" 1 "$status"
 _assert_contains "first record" "pr=12 state=done reason=green" "$out"
 _assert_contains "second record" "pr=13 state=pending reason=checks-running" "$out"
 _assert_contains "third record" "pr=14 state=action reason=closed" "$out"
-_assert_contains "next names unfinished pull requests but not closed ones" "next: git pr-watch 13
+_assert_contains "next names unfinished pull requests but not closed ones" "next: git pr-watch --wait 13
 " "$out"
 _assert_contains "result names the deciding pull requests" "result: 1 reason=closed prs=14" "$out"
 
@@ -920,7 +934,7 @@ _scenario
 _serve 1 '{"message":"secondary rate limit"}' 429 "Retry-After: 60"
 _watch 12
 _assert_contains "secondary rate limit with Retry-After" "result: 3 reason=rate-limited" "$out"
-_assert_contains "rate-limited run suggests a retry" "next: git pr-watch 12" "$out"
+_assert_contains "rate-limited run suggests a retry" "next: git pr-watch --wait 12" "$out"
 
 _scenario
 _clock=$(_tmpdir)/clock
@@ -964,7 +978,7 @@ out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" git -C "$rep
 status=$?
 _assert_eq "an unreadable chunk exits 3 when nothing needs action" 3 "$status"
 _assert_contains "unreadable result" "result: 3 reason=transient prs=9,10" "$out"
-_assert_contains "unreadable next line" "next: git pr-watch 9 10" "$out"
+_assert_contains "unreadable next line" "next: git pr-watch --wait 9 10" "$out"
 
 _scenario
 _serve 1 '{"data":null,"errors":[{"type":"INSUFFICIENT_SCOPES","message":"Your token has not been granted the required scopes"}]}'
@@ -1086,7 +1100,7 @@ chmod +x "$_broken/date"
 out=$(PATH="$_broken:$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>/dev/null)
 status=$?
 _assert_eq "unexpected failure exits 2" 2 "$status"
-_assert_contains "unexpected failure is internal" "result: 2 reason=internal prs=12" "$out"
+_assert_contains "unexpected failure is internal" "result: 2 reason=internal" "$out"
 
 _scenario
 _victim=$(_tmpdir)
@@ -1106,6 +1120,365 @@ _serve 1 "$(jq -cn --argjson pr "$(_pr 12 "$(_list "$(_run 'secondary rate limit
   '{data: {repository: {p00: $pr, p01: null}}, errors: [{type: "NOT_FOUND", path: ["repository", "p01"], message: "Could not resolve"}]}')"
 _watch 12 13
 _assert_contains "check text cannot mask a missing pull request" "result: 2 reason=not-found" "$out"
+
+# --- waiting -----------------------------------------------------------------
+
+# Run `git pr-watch --wait` on the test clock, so the sleeps between checks
+# advance the clock instead of taking real time.
+_wait_watch() {
+  _clock=$(_tmpdir)/clock
+  printf '1000\n' >"$_clock"
+  out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" \
+    git -C "$repo" pr-watch --wait "$@" 2>"$FAKE_GH_DIR/stderr")
+  status=$?
+  err=$(cat "$FAKE_GH_DIR/stderr")
+}
+
+_running_pr() {
+  _pr "$1" "$(_list "$(_run build IN_PROGRESS "" 1 IN_PROGRESS 21)")" \
+    "$(_list "$(_suite 1 IN_PROGRESS "" 1)")" "${2:-}"
+}
+
+_scenario
+_serve 1 "$(_response "$(_running_pr 12)")"
+_serve 2 "$(_response "$(_green_pr 12)")"
+_wait_watch 12
+_assert_eq "waiting until checks pass exits zero" 0 "$status"
+_assert_eq "two checks were made" 2 "$(_calls)"
+_assert_eq "the wait between checks used the interval" 1060 "$(cat "$_clock")"
+_assert_contains "progress shows the pending state" "pr=12 pending/checks-running" "$err"
+_assert_contains "progress shows the final state" "pr=12 done/green" "$err"
+
+_scenario
+_serve 1 "$(_response "$(_running_pr 12)")"
+_serve 2 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED FAILURE 1 IN_PROGRESS 21 "$RECENT")" \
+  "$(_run test IN_PROGRESS "" 1 IN_PROGRESS 20)")" "$(_list "$(_suite 1 IN_PROGRESS "" 2)")")")"
+_wait_watch 12
+_assert_eq "a failure ends the wait at once" 1 "$status"
+_assert_contains "waiting failure next line" "next: git pr-watch --wait 12" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "[]" "[]")")"
+_wait_watch 12
+_assert_eq "no checks past the grace stalls" 8 "$status"
+_assert_contains "no-checks stall" "pr=12 state=stall reason=no-checks" "$out"
+_assert_eq "checked until the grace passed" 6 "$(_calls)"
+_assert_contains "no-checks hint" "action: pr=12 no checks reported" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"mergeStateStatus":"BLOCKED"}')")"
+_wait_watch 12
+_assert_eq "blocked twice in a row stalls" 8 "$status"
+_assert_contains "blocked stall" "pr=12 state=stall reason=blocked" "$out"
+_assert_eq "blocked needs two checks" 2 "$(_calls)"
+_assert_contains "blocked hint" "action: pr=12 merge is blocked with every check finished" "$out"
+
+# The confirmation counts consecutive checks: a check in another state in
+# between starts it over.
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"mergeStateStatus":"BLOCKED"}')")"
+_serve 2 "$(_response "$(_running_pr 12)")"
+_serve 3 "$(_response "$(_green_pr 12 '{"mergeStateStatus":"BLOCKED"}')")"
+_serve 4 "$(_response "$(_green_pr 12)")"
+_wait_watch 12
+_assert_eq "blocked checks separated by another state do not stall" 0 "$status"
+_assert_eq "it took four checks" 4 "$(_calls)"
+
+_scenario
+_serve 1 "$(_response "$(_running_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
+_serve 2 "$(_response "$(_green_pr 12)")"
+_wait_watch 12
+_assert_eq "auto-merge turned off while open needs action" 1 "$status"
+_assert_contains "auto-merge-off record" "pr=12 state=action reason=auto-merge-off" "$out"
+_assert_eq "auto-merge-off needs two checks" 3 "$(_calls)"
+
+_scenario
+_serve 1 "$(_response "$(_running_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
+_serve 2 "$(_response "$(_green_pr 12)")"
+_serve 3 "$(_response "$(_running_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
+_serve 4 "$(_response "$(_green_pr 12)")"
+_serve 5 "$(_response "$(_green_pr 12 '{"state":"MERGED"}')")"
+_wait_watch 12
+_assert_eq "auto-merge briefly off, back on, then merged is done" 0 "$status"
+
+_scenario
+_serve 1 "$(_response "$(_running_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
+_serve 2 "$(_response "$(_green_pr 12 '{"state":"MERGED","autoMergeRequest":{"enabledAt":"x"}}')")"
+_wait_watch 12
+_assert_eq "auto-merge landing ends the wait" 0 "$status"
+_assert_contains "merged after waiting" "pr=12 state=done reason=merged" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
+_wait_watch 12
+_assert_eq "mergeable but never merged stalls after the grace" 8 "$status"
+_assert_contains "merge-pending stall" "pr=12 state=stall reason=merge-pending" "$out"
+_assert_eq "checked until the merge grace passed" 11 "$(_calls)"
+_assert_contains "merge-pending hint" "action: pr=12 auto-merge is enabled and the pull request is mergeable" "$out"
+
+# The merge wait starts over when the pull request leaves it: twelve minutes
+# of running checks in between do not count toward it.
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
+for _n in 2 3 4 5 6 7 8 9 10 11 12 13; do
+  _serve "$_n" "$(_response "$(_running_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
+done
+_serve 14 "$(_response "$(_green_pr 12 '{"autoMergeRequest":{"enabledAt":"x"}}')")"
+_serve 15 "$(_response "$(_green_pr 12 '{"state":"MERGED","autoMergeRequest":{"enabledAt":"x"}}')")"
+_wait_watch 12
+_assert_eq "the merge grace restarts after leaving merge-waiting" 0 "$status"
+
+_scenario
+_serve 1 "$(_response "$(_running_pr 12)")"
+_serve 2 "$(_response "$(_running_pr 12 | jq -c --arg h "$OTHER" '.headRefOid = $h | .commits.nodes[0].commit.oid = $h')")"
+_serve 3 "$(_response "$(_green_pr 12 | jq -c --arg h "$OTHER" '.headRefOid = $h | .commits.nodes[0].commit.oid = $h')")"
+_wait_watch 12
+_assert_eq "a new head mid-watch is followed" 0 "$status"
+_assert_contains "new head is announced" "pr=12 new head bbbbbbbbbbbb" "$err"
+
+# A new head starts its grace windows over: no checks on it stall five
+# minutes after it appeared (1060 + 300), not after the watch started.
+_scenario
+_serve 1 "$(_response "$(_running_pr 12)")"
+_serve 2 "$(_response "$(_pr 12 "[]" "[]" | jq -c --arg h "$OTHER" '.headRefOid = $h | .commits.nodes[0].commit.oid = $h')")"
+_wait_watch 12
+_assert_contains "no checks on a new head stalls" "pr=12 state=stall reason=no-checks" "$out"
+_assert_eq "the new head's grace ran from when it appeared" 1360 "$(cat "$_clock")"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 "{\"headRefOid\":\"$OTHER\"}")")"
+_wait_watch 12
+_assert_eq "checks for another head past the grace stall" 8 "$status"
+_assert_contains "head-mismatch stall" "pr=12 state=stall reason=head-mismatch" "$out"
+_assert_contains "head-mismatch hint" "action: pr=12 GitHub's checks are for a different commit" "$out"
+
+# A cancelled check with no completion time is confirmed from when it was
+# first seen, on GitHub's clock.
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED CANCELLED 1 COMPLETED 21)")" \
+  "$(_list "$(_suite 1 COMPLETED CANCELLED 1)")")")"
+_serve 2 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED CANCELLED 1 COMPLETED 21)")" \
+  "$(_list "$(_suite 1 COMPLETED CANCELLED 1)")")")"
+printf 'Thu, 15 Oct 2026 14:17:30 GMT\n' >"$FAKE_GH_DIR/call-2.date"
+_wait_watch 12
+_assert_eq "a cancellation without a completion time resolves" 1 "$status"
+_assert_contains "resolved as cancelled" "pr=12 state=action reason=cancelled" "$out"
+_assert_eq "resolved on the second check" 2 "$(_calls)"
+
+_scenario
+_serve 1 "$(_response \
+  "$(_pr 12 "$(_list "$(_run t COMPLETED SUCCESS 1 COMPLETED 21 "$OLD")")" \
+    "$(_list "$(_suite 1 COMPLETED SUCCESS 1)" "$(_suite 2 COMPLETED ACTION_REQUIRED 0 .github/workflows/z.yml)")")" \
+  "$(_running_pr 13)")"
+_serve 2 "$(_response \
+  "$(_pr 12 "$(_list "$(_run t COMPLETED SUCCESS 1 COMPLETED 21 "$OLD")")" \
+    "$(_list "$(_suite 1 COMPLETED SUCCESS 1)" "$(_suite 2 COMPLETED ACTION_REQUIRED 0 .github/workflows/z.yml)")")" \
+  "$(_green_pr 13)")"
+_wait_watch 12 13
+_assert_eq "only a stall left ends the wait" 8 "$status"
+_assert_contains "the stall decides the result" "result: 8 reason=approval-required prs=12" "$out"
+_assert_contains "the other pull request finished" "pr=13 state=done reason=green" "$out"
+
+# A deadline that falls between checks cuts the last sleep short.
+_scenario
+_serve 1 "$(_response "$(_running_pr 12)")"
+_wait_watch --timeout 100 12
+_assert_eq "timeout while pending exits 8" 8 "$status"
+_assert_eq "checks at start, after one interval, and at the deadline" 3 "$(_calls)"
+_assert_eq "the deadline caps the wait" 1100 "$(cat "$_clock")"
+
+_scenario
+_serve 1 "$(_response "$(_running_pr 12)")"
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+out=$(GIT_PR_WATCH_MAX_SECONDS=50 GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-watch --wait 12 2>/dev/null)
+status=$?
+_assert_eq "GIT_PR_WATCH_MAX_SECONDS ends the wait" 8 "$status"
+_assert_eq "GIT_PR_WATCH_MAX_SECONDS caps the wait" 1050 "$(cat "$_clock")"
+_assert_eq "GIT_PR_WATCH_MAX_SECONDS checks at start and at the cap" 2 "$(_calls)"
+
+_scenario
+_serve 1 '{"message":"Server Error"}' 500
+_wait_watch 12
+_assert_eq "checks that keep failing exit 3" 3 "$status"
+_assert_contains "failing checks result" "result: 3 reason=transient prs=12" "$out"
+_assert_eq "ten failed checks of three attempts each" 30 "$(_calls)"
+
+_scenario
+_serve 1 '{"message":"API rate limit exceeded"}' 403 "X-Ratelimit-Remaining: 0" "X-Ratelimit-Reset: 1792073770"
+_serve 2 "$(_response "$(_green_pr 12)")"
+_wait_watch 12
+_assert_eq "a rate limit is waited out" 0 "$status"
+_assert_eq "the wait matched the reset" 1120 "$(cat "$_clock")"
+
+_scenario
+touch "$FAKE_GH_DIR/call-1.hang"
+printf '200\n' >"$FAKE_GH_DIR/call-1.status"
+_serve 2 "$(_response "$(_green_pr 12)")"
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+_started=$SECONDS
+out=$(GIT_TOOLS_TEST_PR_WATCH_CALL_TIMEOUT=1 GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" \
+  CLICOLOR_FORCE=1 GH_FORCE_TTY=1 GH_DEBUG=api \
+  PATH="$bin_dir:$PATH" git -C "$repo" pr-watch --wait 12 2>/dev/null)
+status=$?
+# The fake's hang lasts 30 seconds; the watchdog must cut it off well before.
+if ((SECONDS - _started < 15)); then
+  _pass "the watchdog cut the hung call off"
+else
+  _fail "the watchdog cut the hung call off"
+fi
+_assert_eq "a call that hangs is cut off and retried" 0 "$status"
+_assert_eq "the watchdog path scrubs gh's environment" 0 \
+  "$(grep -vc 'CLICOLOR_FORCE=unset GH_FORCE_TTY=unset GH_DEBUG=unset NO_COLOR=1' "$FAKE_GH_DIR/env-all")"
+_hang_pid=$(cat "$FAKE_GH_DIR/hang.pid" 2>/dev/null)
+if [[ -n "$_hang_pid" ]] && kill -0 "$_hang_pid" 2>/dev/null; then
+  _fail "the hung gh process is gone"
+  kill "$_hang_pid" 2>/dev/null
+else
+  _pass "the hung gh process is gone"
+fi
+
+# Print "<pid> <ppid>" for every process. Minimal Linux container images ship
+# without ps, so read /proc there.
+_process_table() {
+  local stat line rest ppid
+
+  if command -v ps >/dev/null 2>&1; then
+    ps -A -o pid= -o ppid= 2>/dev/null || ps -o pid,ppid 2>/dev/null
+    return
+  fi
+  for stat in /proc/[0-9]*/stat; do
+    { read -r line <"$stat"; } 2>/dev/null || continue
+    # The command name in parentheses can hold spaces; fields follow its
+    # last ") ".
+    rest=${line##*) }
+    read -r _ ppid _ <<<"$rest"
+    printf '%s %s\n' "${stat//[!0-9]/}" "$ppid"
+  done
+}
+
+# Print every descendant of a process, from one process-table snapshot.
+_descendants() {
+  local table
+
+  table=$(_process_table) || return 0
+  printf '%s\n' "$table" | awk -v root="$1" '
+    $1 ~ /^[0-9]+$/ { parent[$1] = $2; pids[n++] = $1 }
+    END {
+      found[root] = 1
+      do {
+        added = 0
+        for (i = 0; i < n; i++)
+          if (!(pids[i] in found) && (parent[pids[i]] in found)) {
+            found[pids[i]] = 1; added = 1; print pids[i]
+          }
+      } while (added)
+    }'
+}
+
+# @brief Start the watcher on a hung call, signal it, and check its status and
+# that nothing it started is left running. Runs the script itself, not through
+# `git`, so the status asserted is the script's own.
+_signal_case() {
+  local signal="$1" expected="$2" when="$3" watcher deadline children pid left=""
+
+  _scenario
+  if [[ "$when" == call ]]; then
+    touch "$FAKE_GH_DIR/call-1.hang"
+    printf '200\n' >"$FAKE_GH_DIR/call-1.status"
+  else
+    _serve 1 "$(_response "$(_running_pr 12)")"
+  fi
+  (cd "$repo" && PATH="$bin_dir:$PATH" exec bash "$ROOT/bin/git-pr-watch" --wait \
+    --interval 15 12 >"$FAKE_GH_DIR/out" 2>"$FAKE_GH_DIR/err") &
+  watcher=$!
+  deadline=$((SECONDS + 20))
+  if [[ "$when" == call ]]; then
+    while [[ ! -s "$FAKE_GH_DIR/hang.pid" ]] && ((SECONDS < deadline)); do sleep 0.1; done
+  else
+    while ! grep -q 'checks-running' "$FAKE_GH_DIR/err" 2>/dev/null && ((SECONDS < deadline)); do
+      sleep 0.1
+    done
+  fi
+  # Wait until the watcher has started its child (the hung call, or the
+  # sleep between checks) so the leftover check has something to check.
+  children=$(_descendants "$watcher")
+  while [[ -z "$children" ]] && ((SECONDS < deadline)); do
+    sleep 0.1
+    children=$(_descendants "$watcher")
+  done
+  if [[ -n "$children" ]]; then
+    _pass "$signal during the $when: the watcher's processes were found"
+  else
+    _fail "$signal during the $when: the watcher's processes were found"
+  fi
+  kill "-$signal" "$watcher" 2>/dev/null
+  wait "$watcher"
+  _assert_eq "$signal during the $when exits $expected" "$expected" "$?"
+  _assert_contains "$signal during the $when reports the signal" \
+    "result: $expected reason=signal prs=12" "$(cat "$FAKE_GH_DIR/out")"
+  deadline=$((SECONDS + 10))
+  for pid in $children; do
+    while kill -0 "$pid" 2>/dev/null && ((SECONDS < deadline)); do sleep 0.1; done
+    if kill -0 "$pid" 2>/dev/null; then
+      left="$left $pid"
+      kill "$pid" 2>/dev/null
+    fi
+  done
+  _assert_eq "$signal during the $when leaves nothing running" "" "$left"
+}
+
+_signal_case TERM 143 call
+_signal_case HUP 129 call
+_signal_case TERM 143 sleep
+
+# A rate limit while resolving a branch target is waited out in a waiting run.
+_scenario
+printf '403\n' >"$FAKE_GH_DIR/branch-1.status"
+printf '%s\n' '{"message":"API rate limit exceeded"}' >"$FAKE_GH_DIR/branch-1.json"
+printf '%s\n' 'X-Ratelimit-Remaining: 0' 'X-Ratelimit-Reset: 1792073710' >"$FAKE_GH_DIR/branch-1.headers"
+printf '%s\n' '{"data":{"repository":{"pullRequests":{"nodes":[{"number":21,"state":"OPEN","isCrossRepository":false}]}}}}' \
+  >"$FAKE_GH_DIR/branch.json"
+_serve 1 "$(_response "$(_green_pr 21)")"
+_wait_watch topic
+_assert_eq "a rate-limited branch lookup is waited out" 0 "$status"
+_assert_eq "the lookup waited for the reset" 1060 "$(cat "$_clock")"
+
+# A branch lookup that hangs is cut off by the watchdog and retried.
+_scenario
+touch "$FAKE_GH_DIR/branch-1.hang"
+printf '200\n' >"$FAKE_GH_DIR/branch-1.status"
+printf '%s\n' '{"data":{"repository":{"pullRequests":{"nodes":[{"number":21,"state":"OPEN","isCrossRepository":false}]}}}}' \
+  >"$FAKE_GH_DIR/branch.json"
+_serve 1 "$(_response "$(_green_pr 21)")"
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+_started=$SECONDS
+out=$(GIT_TOOLS_TEST_PR_WATCH_CALL_TIMEOUT=1 GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" \
+  PATH="$bin_dir:$PATH" git -C "$repo" pr-watch --wait topic 2>/dev/null)
+status=$?
+_assert_eq "a hung branch lookup is cut off and retried" 0 "$status"
+if ((SECONDS - _started < 15)); then
+  _pass "the watchdog cut the hung branch lookup off"
+else
+  _fail "the watchdog cut the hung branch lookup off"
+fi
+
+_scenario
+_watch --timeout 30 12
+_assert_eq "--timeout needs --wait" 2 "$status"
+
+_scenario
+_watch --wait --interval 5 12
+_assert_eq "--interval below the minimum is a usage error" 2 "$status"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+out=$(GIT_PR_WATCH_MAX_SECONDS=soon PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>&1)
+_assert_contains "a bad GIT_PR_WATCH_MAX_SECONDS is reported and ignored" \
+  "ignoring GIT_PR_WATCH_MAX_SECONDS=soon" "$out"
 
 # --- time conversion ---------------------------------------------------------
 

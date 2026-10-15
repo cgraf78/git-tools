@@ -11,7 +11,7 @@ _git_pr_watch() {
   cur="${COMP_WORDS[COMP_CWORD]}"
 
   if [[ "$cur" == -* ]]; then
-    COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
+    COMPREPLY=($(compgen -W "-w --wait --timeout --interval -h --help" -- "$cur"))
     return
   fi
 

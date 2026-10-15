@@ -214,7 +214,9 @@ and
 Compare keys and scopes whole rather than splitting them: a repository name
 can contain underscores and dots, and some owner names (enterprise-managed
 accounts) contain an underscore too. The host is not part of either: the same
-owner, repository, and number on two GitHub hosts share a key.
+owner, repository, and number on two GitHub hosts share a key, and so (very
+rarely) do two repositories whose names differ only in where an underscore
+splits owner from repository.
 .TP
 .BI watchers/ key . pid
 Exists while a waiting run with that process id watches the pull request, and
@@ -253,9 +255,10 @@ if GitHub gave none),
 .BR merged ,
 or
 .BR closed ,
-and the local time, in seconds since the epoch, when the check that judged it
-started (or
-.BR \- ).
+and when the check that judged it started, in seconds since the epoch by
+this host's clock (or
+.BR \- ,
+to be treated as before any event).
 Compare that time, not the file's modification time, with the time of a
 later event such as a push: a check that started before the event cannot have
 seen it.
@@ -270,8 +273,9 @@ are temporary files (written as
 and renamed into place); readers ignore them. Files are replaced atomically,
 and directories are created private to the user. Writing is best-effort: a
 failure never changes the report or the exit status. A waiting run removes,
-at its start, exit and done records older than 30 days, temporary files whose
-writer is gone, and watcher files older than a day whose watcher is gone.
+at its start, exit and done records older than 30 days, temporary files older
+than an hour whose writer is gone, and watcher files older than a day whose
+watcher is gone.
 .PP
 A reader that wants to know whether a pull request is watched should list
 .I watchers/

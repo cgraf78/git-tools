@@ -1246,7 +1246,7 @@ _state_targets() {
   local number
 
   [[ -n "$_state_dir" && "$_wait" == 1 ]] || return 0
-  for number in "${_numbers[@]}"; do
+  for number in ${_numbers[@]+"${_numbers[@]}"}; do
     _state_write "$_state_dir/watchers/${_state_scope}_$number.$$" "$$"
   done
   if [[ -n "$_state_pending" ]]; then
@@ -1255,7 +1255,8 @@ _state_targets() {
   fi
 }
 
-# @brief Note the wall-clock time a check starts (no process is started).
+# @brief Note the wall-clock time a check starts. Only the first call starts
+# a process (date); later ones add the shell's elapsed SECONDS.
 _state_check_start() {
   [[ -n "$_state_dir" ]] || return 0
   if [[ -z "$_state_wall_base" ]]; then

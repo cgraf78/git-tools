@@ -1575,6 +1575,7 @@ _wait_watch 12 13
 _assert_contains "the first pull request stalls" "pr=12 state=stall" "$out"
 _assert_eq "a stalled pull request gets no exit record" "example_repo_13" "$(_state_ls exited)"
 _assert_eq "the other pull request's exit is recorded" "8 done green" "$(cat "$_state/exited/example_repo_13" 2>/dev/null)"
+_assert_eq "a stalled pull request's watcher file is removed too" "" "$(_state_ls watchers)"
 
 # While a waiting run is in a call, its watcher file names it and the pending
 # file is gone; a signal records the exit and removes the watcher file.
@@ -1707,6 +1708,81 @@ else
   cat "$SHIM_LOG" >&2
 fi
 unset SHIM_LOG
+
+# A run rewrites a done record only when its commit or word changes: PR 12 is
+# merged on every check, PR 13 finishes on the third.
+_state_scenario
+SHIM_LOG=$FAKE_GH_DIR/shim.log
+export SHIM_LOG
+_merged_pr=$(_green_pr 12 '{"state":"MERGED","mergeable":"UNKNOWN"}')
+_serve 1 "$(_response "$_merged_pr" "$(_running_pr 13)")"
+_serve 2 "$(_response "$_merged_pr" "$(_running_pr 13)")"
+_serve 3 "$(_response "$_merged_pr" "$(_green_pr 13)")"
+printf '1000\n' >"$_clock"
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$_shim_dir:$bin_dir:$PATH" \
+  git -C "$repo" pr-watch --wait 12 13 2>/dev/null)
+_assert_eq "each done record is written once per run" 2 "$(grep -c '/done ->' "$SHIM_LOG")"
+unset SHIM_LOG
+
+# The exit record lands while the watcher file still exists.
+_shim_exit=$(_tmpdir)
+cat >"$_shim_exit/mv" <<EOF
+#!/bin/sh
+for last; do :; done
+case "\$last" in
+  */git-tools/pr-watch/exited/*)
+    for entry in "\${last%/exited/*}/watchers"/*; do
+      [ ! -e "\$entry" ] || printf '%s\n' "\${entry##*/}" >>"\$SHIM_LOG"
+    done
+    ;;
+esac
+exec "$_real_mv" "\$@"
+EOF
+chmod +x "$_shim_exit/mv"
+_state_scenario
+SHIM_LOG=$FAKE_GH_DIR/shim.log
+export SHIM_LOG
+_serve 1 "$(_response "$(_running_pr 12)")"
+_serve 2 "$(_response "$(_green_pr 12)")"
+printf '1000\n' >"$_clock"
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$_shim_exit:$bin_dir:$PATH" \
+  git -C "$repo" pr-watch --wait 12 2>/dev/null)
+_assert_contains "the watcher file exists when the exit record lands" "example_repo_12." \
+  "$(cat "$SHIM_LOG" 2>/dev/null)"
+unset SHIM_LOG
+
+# A done record's epoch is when the judging check started: after the first
+# check's call ended and before the second's began (each call takes 2 seconds).
+_delay=$(_tmpdir)
+cat >"$_delay/gh" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1 \${2:-}" == "api graphql" && "\$*" != *PrWatchBranch* ]]; then
+  k=\$((\$(cat "\$FAKE_GH_DIR/dk" 2>/dev/null || printf 0) + 1))
+  printf '%s\n' "\$k" >"\$FAKE_GH_DIR/dk"
+  date +%s >"\$FAKE_GH_DIR/t-start-\$k"
+  sleep 2
+  date +%s >"\$FAKE_GH_DIR/t-end-\$k"
+fi
+exec "$bin_dir/gh" "\$@"
+EOF
+chmod +x "$_delay/gh"
+_state_scenario
+_serve 1 "$(_response "$(_running_pr 12)")"
+_serve 2 "$(_response "$(_green_pr 12)")"
+printf '1000\n' >"$_clock"
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$_delay:$bin_dir:$PATH" \
+  git -C "$repo" pr-watch --wait 12 2>/dev/null)
+_epoch=""
+{ read -r _ _ _epoch <"$_state/done/example_repo_12"; } 2>/dev/null
+_end1=$(cat "$FAKE_GH_DIR/t-end-1" 2>/dev/null)
+_start2=$(cat "$FAKE_GH_DIR/t-start-2" 2>/dev/null)
+if [[ "$_epoch" =~ ^[0-9]+$ && "$_end1" =~ ^[0-9]+$ && "$_start2" =~ ^[0-9]+$ ]] &&
+  ((_epoch >= _end1 && _epoch <= _start2)); then
+  _pass "a done epoch is the judging check's start"
+else
+  _fail "a done epoch is the judging check's start"
+  printf '  epoch %s, first call ended %s, second began %s\n' "$_epoch" "$_end1" "$_start2" >&2
+fi
 
 # A failed temporary file or rename never changes the exit status.
 for _mode in SHIM_MKTEMP_FAIL SHIM_MV_FAIL; do

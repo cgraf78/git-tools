@@ -5602,10 +5602,11 @@ _count_gate_git() {
 
   dir="$uc_parent/count-$mode-$entries"
   repo=$(_merged_worktree_repo "uc-count-$mode-$entries" "$dir")
-  # Each fixture commit runs `git maintenance run --auto --detach`. Hundreds of
-  # them can start detached maintenance whose working directory is the
-  # worktree; while it runs, cleanup rightly reads the worktree as in use and
-  # stops early, so the counts would depend on that process's timing.
+  # Each fixture commit runs `git maintenance run --auto --detach`. Over
+  # hundreds of commits, Git 2.54's geometric repack can start in the
+  # background and drop a just-written commit that the reflog still names.
+  # Cleanup then can't inspect the reflog, keeps the worktree as
+  # uninspectable, and stops early, so the counts would differ by chance.
   git -C "$repo" config maintenance.auto false
   git -C "$repo" config gc.auto 0
   if [[ "$mode" == amend ]]; then

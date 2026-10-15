@@ -127,9 +127,13 @@ for arg in "$@"; do
   prev=$arg
 done
 
-# Branch lookups have their own fixture so snapshot calls number from 1.
+# Branch lookups have their own fixtures so snapshot calls number from 1:
+# branch-<m> for the m-th lookup when present, else branch.
 if [[ "$query" == *PrWatchBranch* ]]; then
+  m=$(($(cat "$dir/bn" 2>/dev/null || printf 0) + 1))
+  printf '%s\n' "$m" >"$dir/bn"
   base="$dir/branch"
+  [[ ! -e "$dir/branch-$m.json" && ! -e "$dir/branch-$m.status" ]] || base="$dir/branch-$m"
 else
   n=$(($(cat "$dir/n" 2>/dev/null || printf 0) + 1))
   printf '%s\n' "$n" >"$dir/n"
@@ -1096,7 +1100,7 @@ chmod +x "$_broken/date"
 out=$(PATH="$_broken:$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>/dev/null)
 status=$?
 _assert_eq "unexpected failure exits 2" 2 "$status"
-_assert_contains "unexpected failure is internal" "result: 2 reason=internal prs=12" "$out"
+_assert_contains "unexpected failure is internal" "result: 2 reason=internal" "$out"
 
 _scenario
 _victim=$(_tmpdir)
@@ -1232,6 +1236,15 @@ _wait_watch 12
 _assert_eq "a new head mid-watch is followed" 0 "$status"
 _assert_contains "new head is announced" "pr=12 new head bbbbbbbbbbbb" "$err"
 
+# A new head starts its grace windows over: no checks on it stall five
+# minutes after it appeared (1060 + 300), not after the watch started.
+_scenario
+_serve 1 "$(_response "$(_running_pr 12)")"
+_serve 2 "$(_response "$(_pr 12 "[]" "[]" | jq -c --arg h "$OTHER" '.headRefOid = $h | .commits.nodes[0].commit.oid = $h')")"
+_wait_watch 12
+_assert_contains "no checks on a new head stalls" "pr=12 state=stall reason=no-checks" "$out"
+_assert_eq "the new head's grace ran from when it appeared" 1360 "$(cat "$_clock")"
+
 _scenario
 _serve 1 "$(_response "$(_green_pr 12 "{\"headRefOid\":\"$OTHER\"}")")"
 _wait_watch 12
@@ -1266,27 +1279,31 @@ _assert_eq "only a stall left ends the wait" 8 "$status"
 _assert_contains "the stall decides the result" "result: 8 reason=approval-required prs=12" "$out"
 _assert_contains "the other pull request finished" "pr=13 state=done reason=green" "$out"
 
+# A deadline that falls between checks cuts the last sleep short.
 _scenario
 _serve 1 "$(_response "$(_running_pr 12)")"
-_wait_watch --timeout 120 12
+_wait_watch --timeout 100 12
 _assert_eq "timeout while pending exits 8" 8 "$status"
 _assert_eq "checks at start, after one interval, and at the deadline" 3 "$(_calls)"
-_assert_eq "the deadline caps the wait" 1120 "$(cat "$_clock")"
+_assert_eq "the deadline caps the wait" 1100 "$(cat "$_clock")"
 
 _scenario
-printf 'x\n' >/dev/null
 _serve 1 "$(_response "$(_running_pr 12)")"
 _clock=$(_tmpdir)/clock
 printf '1000\n' >"$_clock"
-out=$(GIT_PR_WATCH_MAX_SECONDS=60 GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" \
+out=$(GIT_PR_WATCH_MAX_SECONDS=50 GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" \
   git -C "$repo" pr-watch --wait 12 2>/dev/null)
-_assert_eq "GIT_PR_WATCH_MAX_SECONDS caps the wait" 1060 "$(cat "$_clock")"
+status=$?
+_assert_eq "GIT_PR_WATCH_MAX_SECONDS ends the wait" 8 "$status"
+_assert_eq "GIT_PR_WATCH_MAX_SECONDS caps the wait" 1050 "$(cat "$_clock")"
+_assert_eq "GIT_PR_WATCH_MAX_SECONDS checks at start and at the cap" 2 "$(_calls)"
 
 _scenario
 _serve 1 '{"message":"Server Error"}' 500
 _wait_watch 12
 _assert_eq "checks that keep failing exit 3" 3 "$status"
 _assert_contains "failing checks result" "result: 3 reason=transient prs=12" "$out"
+_assert_eq "ten failed checks of three attempts each" 30 "$(_calls)"
 
 _scenario
 _serve 1 '{"message":"API rate limit exceeded"}' 403 "X-Ratelimit-Remaining: 0" "X-Ratelimit-Reset: 1792073770"
@@ -1301,10 +1318,20 @@ printf '200\n' >"$FAKE_GH_DIR/call-1.status"
 _serve 2 "$(_response "$(_green_pr 12)")"
 _clock=$(_tmpdir)/clock
 printf '1000\n' >"$_clock"
+_started=$SECONDS
 out=$(GIT_TOOLS_TEST_PR_WATCH_CALL_TIMEOUT=1 GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" \
+  CLICOLOR_FORCE=1 GH_FORCE_TTY=1 GH_DEBUG=api \
   PATH="$bin_dir:$PATH" git -C "$repo" pr-watch --wait 12 2>/dev/null)
 status=$?
+# The fake's hang lasts 30 seconds; the watchdog must cut it off well before.
+if ((SECONDS - _started < 15)); then
+  _pass "the watchdog cut the hung call off"
+else
+  _fail "the watchdog cut the hung call off"
+fi
 _assert_eq "a call that hangs is cut off and retried" 0 "$status"
+_assert_eq "the watchdog path scrubs gh's environment" 0 \
+  "$(grep -vc 'CLICOLOR_FORCE=unset GH_FORCE_TTY=unset GH_DEBUG=unset NO_COLOR=1' "$FAKE_GH_DIR/env-all")"
 _hang_pid=$(cat "$FAKE_GH_DIR/hang.pid" 2>/dev/null)
 if [[ -n "$_hang_pid" ]] && kill -0 "$_hang_pid" 2>/dev/null; then
   _fail "the hung gh process is gone"
@@ -1340,6 +1367,39 @@ if [[ -n "$_hang_pid" ]] && kill -0 "$_hang_pid" 2>/dev/null; then
 else
   _pass "TERM leaves no gh process behind"
 fi
+
+# TERM during the sleep between checks, where a watch spends most of its time.
+_scenario
+_serve 1 "$(_response "$(_running_pr 12)")"
+(PATH="$bin_dir:$PATH" exec git -C "$repo" pr-watch --wait --interval 15 12 \
+  >"$FAKE_GH_DIR/out" 2>"$FAKE_GH_DIR/err") &
+_watcher=$!
+_deadline=$((SECONDS + 20))
+while ! grep -q 'checks-running' "$FAKE_GH_DIR/err" 2>/dev/null && ((SECONDS < _deadline)); do
+  sleep 0.1
+done
+_started=$SECONDS
+kill -TERM "$_watcher" 2>/dev/null
+wait "$_watcher"
+status=$?
+_assert_eq "TERM during the sleep between checks exits 143" 143 "$status"
+if ((SECONDS - _started < 5)); then
+  _pass "TERM during the sleep ends the watch at once"
+else
+  _fail "TERM during the sleep ends the watch at once"
+fi
+
+# A rate limit while resolving a branch target is waited out in a waiting run.
+_scenario
+printf '403\n' >"$FAKE_GH_DIR/branch-1.status"
+printf '%s\n' '{"message":"API rate limit exceeded"}' >"$FAKE_GH_DIR/branch-1.json"
+printf '%s\n' 'X-Ratelimit-Remaining: 0' 'X-Ratelimit-Reset: 1792073710' >"$FAKE_GH_DIR/branch-1.headers"
+printf '%s\n' '{"data":{"repository":{"pullRequests":{"nodes":[{"number":21,"state":"OPEN","isCrossRepository":false}]}}}}' \
+  >"$FAKE_GH_DIR/branch.json"
+_serve 1 "$(_response "$(_green_pr 21)")"
+_wait_watch topic
+_assert_eq "a rate-limited branch lookup is waited out" 0 "$status"
+_assert_eq "the lookup waited for the reset" 1060 "$(cat "$_clock")"
 
 _scenario
 _watch --timeout 30 12

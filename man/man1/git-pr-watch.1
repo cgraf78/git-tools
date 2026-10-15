@@ -46,10 +46,11 @@ its base then needs action, since auto-merge waits for it to be updated.
 .SH OPTIONS
 .TP
 .BR \-w ", " \-\-wait
-Keep checking until a pull request needs action, every pull request is done,
-or the ones left are stalled (waiting on something outside the pull request).
-A failure ends the wait at once. Progress lines go to standard error as states
-change. Run it in the background: a foreground run can take hours.
+Keep checking until a pull request needs action, every pull request is done, or
+the ones left are stalled (waiting on something outside the pull request). A
+failure ends the wait as soon as it is final (see DESCRIPTION). Progress lines
+go to standard error as states change. Run it in the background: a foreground
+run can take hours.
 .TP
 .BI "\-\-timeout " seconds
 With

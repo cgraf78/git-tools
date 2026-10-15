@@ -77,9 +77,9 @@ checkout's repository. The test suite needs `jq` and skips without it.
 With `--wait`, it keeps checking (every 60 seconds by default) until a pull
 request needs action, every pull request is done, or the ones left are stalled
 on something outside the pull request, such as a required check that never
-reported or a workflow awaiting approval. A failure ends the wait at once, a
-new head is followed, and the wait stops after six hours (`--timeout` sets a
-shorter limit). Run it in the background.
+reported or a workflow awaiting approval. A failure ends the wait as soon as it
+is final, a new head is followed, and the wait stops after six hours
+(`--timeout` sets a shorter limit). Run it in the background.
 
 The command returns `0` when every pull request is done, `1` when one needs
 action, `8` while one is pending or stalled, `3` when GitHub could not be

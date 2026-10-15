@@ -44,7 +44,8 @@ Options:
 Exit status:
   0  Every pull request is done (checks green, or merged).
   1  A pull request needs action (failed or cancelled check, merge conflict,
-     closed, or behind its base while auto-merge waits).
+     closed, behind its base while auto-merge waits, or auto-merge turned
+     off).
   2  Usage, not found, authentication, environment, or internal error.
   3  GitHub could not be read (transient failures or rate limit).
   8  Still pending, or waiting on something outside the pull request.
@@ -314,6 +315,7 @@ _resolve_branch() {
   for ((attempt = 1; attempt <= _call_attempts; attempt++)); do
     gt_pr_snapshot_argv "$(gt_pr_branch_query)" "$GT_PR_BRANCH_JQ" \
       -f "head=$branch"
+    _set_call_timeout
     gt_pr_snapshot_call ||
       _fail environment "could not create a temporary file"
     _fail_on_class
@@ -329,7 +331,18 @@ _resolve_branch() {
         return 0
         ;;
       not-found) _fail not-found "repository not found: $GT_CURRENT_REPO_SPEC" ;;
-      rate-limited) _unreadable_exit rate-limited "GitHub rate limit reached" ;;
+      rate-limited)
+        # A waiting run waits a rate limit out here too (it does not count as
+        # an attempt); a one-shot run, or one out of time, reports it.
+        if [[ "$_wait" == 1 ]] && (($(_now) < _deadline)); then
+          _rate_reset=$GT_PR_RESPONSE_RESET
+          _rate_date=$GT_PR_RESPONSE_DATE
+          _sleep_until_next "$(_rate_wait)"
+          attempt=$((attempt - 1))
+          continue
+        fi
+        _unreadable_exit rate-limited "GitHub rate limit reached"
+        ;;
     esac
     ((attempt == _call_attempts)) || _pause "$attempt"
   done
@@ -642,7 +655,7 @@ _load_fetch_remote() {
 # ancestor of the new one. Local commits that were never pushed leave the
 # tracking ref alone and do not hold the watch.
 _push_race() {
-  local index="$1" ref tracking pushed entry updated now name value
+  local index="$1" ref tracking pushed entry updated name value
 
   ref=${_pr_ref[index]:--}
   [[ "$ref" != - && "${_pr_cross[index]:-}" == false ]] || return 1
@@ -665,8 +678,7 @@ _push_race() {
   entry=$(git reflog -1 --date=unix --format=%gd "$tracking" -- 2>/dev/null) || return 1
   [[ "$entry" =~ @\{([0-9]+)\}$ ]] || return 1
   updated=${BASH_REMATCH[1]}
-  now=$(_now)
-  ((now - updated <= _push_grace))
+  ((_check_now - updated <= _push_grace))
 }
 
 # First sighting, on GitHub's clock, of failing checks GitHub gave no
@@ -1099,12 +1111,12 @@ _jitter() {
   fi
 }
 
-_resolve_targets
 _started=$(_now)
 _deadline=$((_started + _cap))
 _failed_checks=0
 _rate_reset=""
 _rate_date=""
+_resolve_targets
 while :; do
   _reset_tick
   _check_now=$(_now)

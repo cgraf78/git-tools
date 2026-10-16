@@ -1505,6 +1505,19 @@ _done_record() {
   fi
 }
 
+# Print an exit record with its epoch shown as "epoch" when it is when this
+# case ran, or as written otherwise (`-` for a run that delivered no result).
+_exit_record() {
+  local status state reason epoch now
+
+  { read -r status state reason epoch <"$1"; } 2>/dev/null || return 0
+  now=$(date +%s)
+  if [[ "$epoch" =~ ^[0-9]+$ ]] && ((epoch >= _state_t0 && epoch <= now)); then
+    epoch=epoch
+  fi
+  printf '%s %s %s %s\n' "$status" "$state" "$reason" "$epoch"
+}
+
 # List a state directory's entries, one per line, sorted.
 _state_ls() {
   local file
@@ -1560,12 +1573,12 @@ _serve 1 "$(_response "$(_running_pr 12)")"
 _serve 2 "$(_response "$(_green_pr 12)")"
 _wait_watch 12
 _assert_eq "a waiting run to green exits zero" 0 "$status"
-_assert_eq "the exit is recorded" "0 done green" "$(cat "$_state/exited/example_repo_12" 2>/dev/null)"
+_assert_eq "the exit is recorded" "0 done green epoch" "$(_exit_record "$_state/exited/example_repo_12")"
 _assert_eq "the finish is recorded" "$HEAD green" "$(_done_record "$_state/done/example_repo_12")"
 _assert_eq "the watcher files are removed at exit" "" "$(_state_ls watchers)"
 _assert_eq "no temporary files are left" "" "$(cd "$_state" && find . -name '*~*' -print)"
 
-# A pull request in a named stall gets no exit record; the others do.
+# A pull request in a named stall gets an exit record like the others.
 _state_scenario
 _approval_pr=$(_pr 12 "$(_list "$(_run t COMPLETED SUCCESS 1 COMPLETED 21 "$OLD")")" \
   "$(_list "$(_suite 1 COMPLETED SUCCESS 1)" "$(_suite 2 COMPLETED ACTION_REQUIRED 0 .github/workflows/z.yml)")")
@@ -1573,8 +1586,11 @@ _serve 1 "$(_response "$_approval_pr" "$(_running_pr 13)")"
 _serve 2 "$(_response "$_approval_pr" "$(_green_pr 13)")"
 _wait_watch 12 13
 _assert_contains "the first pull request stalls" "pr=12 state=stall" "$out"
-_assert_eq "a stalled pull request gets no exit record" "example_repo_13" "$(_state_ls exited)"
-_assert_eq "the other pull request's exit is recorded" "8 done green" "$(cat "$_state/exited/example_repo_13" 2>/dev/null)"
+_assert_eq "both pull requests get an exit record" "example_repo_12
+example_repo_13" "$(_state_ls exited)"
+_assert_eq "a stalled pull request gets an exit record" "8 stall approval-required epoch" \
+  "$(_exit_record "$_state/exited/example_repo_12")"
+_assert_eq "the other pull request's exit is recorded" "8 done green epoch" "$(_exit_record "$_state/exited/example_repo_13")"
 _assert_eq "a stalled pull request's watcher file is removed too" "" "$(_state_ls watchers)"
 
 # While a waiting run is in a call, its watcher file names it and the pending
@@ -1591,7 +1607,7 @@ _assert_eq "a waiting run has a watcher file" "example_repo_12.$_watcher" "$(_st
 _assert_eq "the watcher file holds the watcher's pid" "$_watcher" "$(cat "$_state/watchers/example_repo_12.$_watcher" 2>/dev/null)"
 kill -TERM "$_watcher" 2>/dev/null
 wait "$_watcher"
-_assert_eq "a signalled watcher records its exit" "143 - -" "$(cat "$_state/exited/example_repo_12" 2>/dev/null)"
+_assert_eq "a signalled watcher records its exit" "143 - - -" "$(_exit_record "$_state/exited/example_repo_12")"
 _assert_eq "a signalled watcher removes its watcher file" "" "$(_state_ls watchers)"
 
 # While a branch lookup runs, a pending file for the repository stands in for
@@ -1624,8 +1640,8 @@ _deadline=$((SECONDS + 20))
 while [[ ! -s "$FAKE_GH_DIR/hang.pid" ]] && ((SECONDS < _deadline)); do sleep 0.1; done
 kill -TERM "$_watcher" 2>/dev/null
 wait "$_watcher"
-_assert_eq "a target resolved before the exit is recorded" "143 - -" \
-  "$(cat "$_state/exited/example_repo_12" 2>/dev/null)"
+_assert_eq "a target resolved before the exit is recorded" "143 - - -" \
+  "$(_exit_record "$_state/exited/example_repo_12")"
 _assert_eq "nothing is left in watchers after an exit while resolving" "" "$(_state_ls watchers)"
 
 # A signal that arrives while the exit records are written changes neither the
@@ -1653,8 +1669,8 @@ wait "$_watcher"
 _assert_eq "a signal during the exit keeps the status" 0 "$?"
 _assert_eq "a signal during the exit adds no second result" 1 \
   "$(grep -c '^result:' "$FAKE_GH_DIR/out")"
-_assert_eq "a signal during the exit still records it" "0 done green" \
-  "$(cat "$_state/exited/example_repo_12" 2>/dev/null)"
+_assert_eq "a signal during the exit still records it" "0 done green epoch" \
+  "$(_exit_record "$_state/exited/example_repo_12")"
 _assert_eq "a signal during the exit still removes the watcher file" "" "$(_state_ls watchers)"
 
 # Stand-ins for mv and mktemp that log state writes and can fail them, for
@@ -1783,6 +1799,30 @@ else
   _fail "a done epoch is the judging check's start"
   printf '  epoch %s, first call ended %s, second began %s\n' "$_epoch" "$_end1" "$_start2" >&2
 fi
+_exit_epoch=""
+{ read -r _ _ _ _exit_epoch <"$_state/exited/example_repo_12"; } 2>/dev/null
+_assert_eq "an exit epoch is the judging check's start, not the exit" "$_epoch" "$_exit_epoch"
+
+# A pull request still pending when another one ends the run got no final
+# result: its exit record has no epoch, while the one needing action has one.
+_state_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED FAILURE 1 COMPLETED 21 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 1)")")" "$(_running_pr 13)")"
+_wait_watch 12 13
+_assert_eq "a failure ends the run while another pull request is pending" 1 "$status"
+_assert_eq "the pull request needing action has a result epoch" "1 action failed epoch" \
+  "$(_exit_record "$_state/exited/example_repo_12")"
+_assert_eq "a pull request still pending has no result epoch" "1 pending checks-running -" \
+  "$(_exit_record "$_state/exited/example_repo_13")"
+
+# A run that could not read GitHub delivered no result: its exit records say
+# so with an epoch of `-`.
+_state_scenario
+_serve 1 '{"message":"Server Error"}' 500
+_wait_watch 12
+_assert_eq "an unreadable waiting run exits 3" 3 "$status"
+_assert_eq "an unreadable run's exit record has no epoch" "3 pending unreadable -" \
+  "$(_exit_record "$_state/exited/example_repo_12")"
 
 # A failed temporary file or rename never changes the exit status.
 for _mode in SHIM_MKTEMP_FAIL SHIM_MV_FAIL; do
@@ -1824,7 +1864,7 @@ _state_scenario
 _serve 1 "$(_response)"
 out=$(PATH="$bin_dir:$PATH" git -C "$repo" pr-watch --wait 12 2>/dev/null)
 _assert_contains "an internal error in a waiting run is reported" "result: 2 reason=internal" "$out"
-_assert_eq "an internal error records the exit" "2 - -" "$(cat "$_state/exited/example_repo_12" 2>/dev/null)"
+_assert_eq "an internal error records the exit" "2 - - -" "$(_exit_record "$_state/exited/example_repo_12")"
 
 # Turned off, nothing is written; any other value warns and keeps them on.
 _state_scenario

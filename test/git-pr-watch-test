@@ -1662,6 +1662,17 @@ _assert_eq "a finished run with no output reader keeps its status" 0 "${PIPESTAT
 _assert_eq "a finished run with no output reader records its exit" "0 done green epoch" \
   "$(_exit_record "$_state/exited/example_repo_12")"
 
+# With SIGPIPE inherited as ignored, a failed final write is an EPIPE error
+# rather than a signal: it must not turn the decided exit into errexit's 1.
+_state_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+(trap '' PIPE && cd "$repo" && PATH="$bin_dir:$PATH" exec bash "$ROOT/bin/git-pr-watch" 12 2>/dev/null) |
+  (
+    exec 0<&-
+    sleep 1
+  )
+_assert_eq "an ignored SIGPIPE does not turn a green exit into 1" 0 "${PIPESTATUS[0]}"
+
 # A run that dies while resolving a later branch target still records the
 # targets resolved before it.
 _state_scenario

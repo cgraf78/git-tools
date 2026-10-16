@@ -4,7 +4,7 @@
 
 Git subcommands for a GitHub pull-request workflow and proof-based branch
 cleanup, one Bash script per command. The man pages hold the detail; keep
-README sections short.
+new README command sections short, and don't trim the existing reference.
 
 ## Layout
 
@@ -29,8 +29,10 @@ A new `bin/git-<name>` needs all of these, or `test/run` or CI fails:
 - an entry in the `_description_for` table in `test/extras-test`;
 - `test/git-<name>-test`;
 - rows in `.github/shellcheck-files.txt` for the bin file, the `.bash`
-  completion, and the test;
-- a README section and a row in the README command table.
+  completion, and the test.
+
+No test checks the README, but each command also gets a README section and
+a row in its command table.
 
 ## Invariants
 
@@ -44,20 +46,22 @@ A new `bin/git-<name>` needs all of these, or `test/run` or CI fails:
 
 ## Testing
 
-- Local: `test/run`. It runs 4 suites in parallel (`GIT_TOOLS_TEST_JOBS=1`
-  for serial), checks the launcher bootstrap blocks, and runs ShellCheck over
-  the inventory's listed programs when `shellcheck` is installed.
-- Focused: run a suite directly, for example `test/git-pr-land-test`.
+- Local: `test/run`, or one suite directly (`test/git-pr-land-test`).
+  `test/run` runs 4 suites in parallel (`GIT_TOOLS_TEST_JOBS=1` for
+  serial), checks the launcher bootstrap blocks, and runs ShellCheck over the
+  inventory's listed programs when `shellcheck` is installed.
 - CI: `GIT_TOOLS_SKIP_SHELLCHECK=1 test/run` on the shared shell matrix
   (Linux distros, macOS, WSL, Termux; profiles `base,jq`), plus a separate
-  ShellCheck job. CI has no zsh, fish, or `git-absorb`, so completion syntax
-  checks for those shells and the absorb rewrite cases run only locally.
+  ShellCheck job. CI has no fish or `git-absorb`, and zsh only on macOS, so
+  those completion syntax checks and the absorb rewrite cases mostly run
+  locally.
 
 ## Test isolation
 
-- Suites call `gt_test_git_isolate` from `test/lib/hermetic-git.sh`: HOME
-  and XDG directories move under the suite root, with `GIT_CONFIG_NOSYSTEM=1`
-  and a private `GIT_CONFIG_GLOBAL`.
+- Command suites use `test/lib/test-temp.sh` for temp dirs and
+  `gt_test_git_isolate` (`test/lib/hermetic-git.sh`) to move HOME and XDG
+  under the suite root, with `GIT_CONFIG_NOSYSTEM=1` and a private
+  `GIT_CONFIG_GLOBAL`. A few suites set the same variables inline.
 - `GIT_TOOLS_TEST_PATH_GIT=1` makes the commands use the fake `git` on
   `PATH` instead of Git's exec-path binary. Suites put a fake `gh` on `PATH`;
   never let a test reach GitHub.

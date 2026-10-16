@@ -14,9 +14,9 @@ only when their work provably landed.
   it parent to child and rebases each child onto the base as it goes, so
   squash-merged parents don't conflict. There is no stack metadata, no commit
   trailers, and no server: it works from what Git and GitHub already show.
-- **Cleanup that won't eat work.** `git cleanup-repo` deletes squash-,
-  rebase-, and cherry-pick-merged branches only with exact proof that their
-  work landed on the base branch. With `--remove-worktrees` it also removes
+- **Cleanup that won't eat work.** By default, `git cleanup-repo` deletes
+  squash-, rebase-, and cherry-pick-merged branches only with exact proof that
+  their work landed on the base branch. With `--remove-worktrees` it also removes
   their linked worktrees, but only clean ones whose commits are reachable
   elsewhere.
 - **Built for scripts and agents.** `git pr-checks` and `git pr-ready` have

@@ -114,7 +114,8 @@ _on_exit() {
 
   # The exit is decided; a signal now must not report a second result or cut
   # the state files short. What is left is bounded and makes no network call.
-  trap '' INT TERM HUP
+  trap '' INT TERM HUP PIPE
+  set +e
   [[ -z "${GT_PR_SNAPSHOT_TMP:-}" ]] || rm -rf -- "$GT_PR_SNAPSHOT_TMP"
   [[ "$_result_done" == 1 ]] || status=2
   [[ -z "$_state_dir" ]] || _state_finish "$status"
@@ -129,7 +130,12 @@ _on_exit() {
 _on_signal() {
   local pids
 
-  trap '' INT TERM HUP
+  # PIPE too: with the output's reader gone, printing the result line would
+  # otherwise kill the shell with SIGPIPE, losing the signal's exit status
+  # (and the one the exit records carry).
+  trap '' INT TERM HUP PIPE
+  # A failed write (EPIPE) must not end the handler early under errexit.
+  set +e
   # Background jobs: a gh call, its watchdog, or the sleep between checks.
   pids=$(jobs -p 2>/dev/null) || pids=""
   # shellcheck disable=SC2086 # one pid per word
@@ -160,6 +166,10 @@ _fail() {
 # would stop watching the targets not resolved yet.
 _resolved_all=0
 _unreadable_exit() {
+  # The exit is decided: a reader that has gone away must not turn it into a
+  # SIGPIPE death, nor a failed write an errexit one (see _on_signal).
+  trap '' PIPE
+  set +e
   _result_done=1
   printf '%s: %s\n' "$gt_command" "$2" >&2
   [[ "$_resolved_all" != 1 ]] || ((${#_numbers[@]} == 0)) ||
@@ -1049,6 +1059,10 @@ _report() {
   local -a unfinished=() result_prs=()
 
   exit=$(_decide)
+  # The exit is decided: a reader that has gone away must not turn it into a
+  # SIGPIPE death, nor a failed write an errexit one (see _on_signal).
+  trap '' PIPE
+  set +e
   for ((i = 0; i < ${#_numbers[@]}; i++)); do
     # A closed pull request is final; watching it again cannot change it.
     case "${_state[i]}:${_reason[i]}" in

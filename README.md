@@ -1,9 +1,9 @@
 # git-tools
 
-![Tests](https://github.com/cgraf78/git-tools/actions/workflows/test.yml/badge.svg?branch=main)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Bash Version](https://img.shields.io/badge/bash-%3E%3D3.2-blue.svg)](https://www.gnu.org/software/bash/)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#requirements)
+[![Tests](https://github.com/cgraf78/git-tools/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/cgraf78/git-tools/actions/workflows/test.yml?query=branch%3Amain)
+[![License](https://img.shields.io/badge/license-MIT-67ac09)](LICENSE)
+[![Bash](https://img.shields.io/badge/bash-%3E%3D3.2%20%283.2%20not%20CI--tested%29-blue)](#install)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL%20%7C%20Termux-lightgrey)](#install)
 
 Plain-Git subcommands for a GitHub pull-request workflow. Open, watch,
 restack, and land pull requests and PR stacks, then clean up local branches

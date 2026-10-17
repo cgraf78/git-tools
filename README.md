@@ -3,12 +3,88 @@
 ![Tests](https://github.com/cgraf78/git-tools/actions/workflows/test.yml/badge.svg?branch=main)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bash Version](https://img.shields.io/badge/bash-%3E%3D3.2-blue.svg)](https://www.gnu.org/software/bash/)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#requirements)
 
-Small Git workflow tools. Runtime support requires Bash 3.2 or newer and Git
-2.29 or newer.
+Plain-Git subcommands for a GitHub pull-request workflow. Open, watch,
+restack, and land pull requests and PR stacks, then clean up local branches
+only when their work provably landed.
+
+- **Stacks without a new model.** A stack is ordinary branches and ordinary
+  pull requests, each based on its parent's branch. `git pr-land-stack` lands
+  it parent to child and rebases each child onto the base as it goes, so
+  squash-merged parents don't conflict. There is no stack metadata, no commit
+  trailers, and no server: it works from what Git and GitHub already show.
+- **Cleanup that won't eat work.** By default, `git cleanup-repo` deletes
+  squash-, rebase-, and cherry-pick-merged branches only with exact proof that
+  their work landed on the base branch. With `--remove-worktrees` it also removes
+  their linked worktrees, but only clean ones whose commits are reachable
+  elsewhere.
+- **Built for scripts and agents.** `git pr-checks` and `git pr-ready` have
+  stable `--porcelain` output, and `git pr-checks` and `git pr-watch` exit 8
+  while checks are pending, so a caller can tell pending from failed without
+  parsing prose.
+
+Runtime support requires Bash 3.2 or newer and Git 2.29 or newer. The
+`git pr-*` commands also need an authenticated [`gh`](https://cli.github.com/);
+see [Requirements](#requirements) for the rest.
+
+## Quick start
+
+Install the commands into `~/.local/bin` (which must be on `PATH`), along with
+their man pages and shell completions:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/cgraf78/git-tools/main/install.sh | bash
+```
+
+Then, from a branch with commits in a GitHub repository:
+
+```sh
+git pr-open --fill          # push the branch and open a pull request
+git pr-watch --wait         # wait until checks are green or need action
+git pr-land 123             # merge pull request #123 and sync the local base
+git cleanup-repo --dry-run  # preview which merged local branches would go
+```
+
+`git pr-watch` prints one line per pull request and a result line, and its
+exit status says the same thing. For two merged pull requests:
+
+```text
+$ git pr-watch 100 99
+pr=100 state=done reason=merged head=895f32b3cf1c
+pr=99 state=done reason=merged head=d8ffcd30d49b
+result: 0 reason=merged prs=100,99
+```
+
+[Install](#install) covers clone-based installs and custom destinations.
+Every command has `-h` usage text and a man page (`git pr-land --help`).
 
 ## Commands
+
+| Group | Command | What it does |
+|---|---|---|
+| Pull requests | [`git pr-open`](#git-pr-open) | Push the current branch and create a pull request without prompts |
+| | [`git pr-submit`](#git-pr-submit) | Turn commits made on the default branch into a pull request with auto-merge queued |
+| | [`git pr-checks`](#git-pr-checks) | Summarize a pull request's checks |
+| | [`git pr-ready`](#git-pr-ready) | Check whether a pull request is open, non-draft, conflict-free, and green |
+| | [`git pr-watch`](#git-pr-watch) | Report whether pull requests are done, need action, or are pending; optionally wait |
+| | [`git pr-land`](#git-pr-land) | Verify and merge one ready pull request, then sync the local base |
+| Stacks | [`git pr-stack`](#git-pr-stack) | Discover the linear stack connected to a pull request |
+| | [`git pr-sync-stack`](#git-pr-sync-stack) | Restack every pull request in a stack without merging |
+| | [`git pr-restack`](#git-pr-restack) | Rebase one pull request's branch onto a base and push it |
+| | [`git pr-land-stack`](#git-pr-land-stack) | Land a ready stack parent to child |
+| Repo hygiene | [`git cleanup-repo`](#git-cleanup-repo) | Update the base and delete local branches proven merged |
+| | [`git branch-audit`](#git-branch-audit) | List local branches with merge state, age, and pull request |
+| | [`git worktree-audit`](#git-worktree-audit) | Report every worktree's branch, dirty state, and pull request |
+| | [`git stash-audit`](#git-stash-audit) | List, show, or drop stashes, including ones whose branch is gone |
+| Other | [`git repo-state`](#git-repo-state) | Print a read-only report of branch, upstream, worktree, and pull request state |
+| | [`git resolve-base`](#git-resolve-base) | Print the point the current branch diverged from |
+| | [`git absorb-and-rebase`](#git-absorb-and-rebase) | Fold staged fixes into earlier commits with `git-absorb` |
+
+A sourceable [shell integration](#interactive-shell-workflows) adds fzf
+pickers and worktree helpers for Bash and zsh.
+
+The sections below are the full reference for each command.
 
 ### `git pr-ready`
 
@@ -1015,10 +1091,7 @@ share/fish/vendor_completions.d/
 
 Override `MAN_DIR`, `BASH_COMPLETION_DIR`, `ZSH_COMPLETION_DIR`, or
 `FISH_COMPLETION_DIR` when a shell expects a different local directory. Set
-`SHELL_INTEGRATION_DIR` to install the sourceable integration elsewhere. The
-repo also keeps the source files in the shdeps-discoverable layout:
-`share/git-tools/shell.sh`, `man/man1/*.1`, and
-`completions/*.{bash,zsh,fish}`.
+`SHELL_INTEGRATION_DIR` to install the sourceable integration elsewhere.
 
 ## Test
 
@@ -1047,3 +1120,7 @@ Suites inject failures with fake `git` programs on `PATH`. `test/run` and the
 shared `test/lib/test-temp.sh` therefore export `GIT_TOOLS_TEST_PATH_GIT=1`, a
 test-only override that makes the commands use `git` from `PATH`; cases that
 test the exec-path lookup unset it.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

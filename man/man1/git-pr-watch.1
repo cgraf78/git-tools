@@ -21,6 +21,13 @@ values are ignored.
 All targets are read in batched GraphQL queries, at most eight pull requests
 per query. When GitHub times out a query, it is split in half and retried.
 .PP
+When the token may read the pull requests but not their checks (for example,
+a fine-grained personal access token on a private repository, which GitHub
+does not currently let you grant read access to checks), a note goes to standard error and the pull
+requests are read again without their checks. Merged and closed pull requests
+are then reported as usual; an open one cannot be judged and stalls with
+reason checks-unreadable.
+.PP
 A pull request is judged on its current head commit, and only that commit's
 checks count:
 .IP \(bu 2
@@ -144,7 +151,7 @@ mergeable-unknown, merge-waiting, no-checks-grace, confirming, unreadable
 .TP
 .B stall
 approval-required, too-many-checks, review-required, changes-requested,
-no-checks, head-mismatch, blocked, merge-pending
+no-checks, head-mismatch, blocked, merge-pending, checks-unreadable
 .PP
 Error reasons in the
 .B result:

@@ -573,6 +573,10 @@ _store_records() {
 # Pull requests per query. It starts at the library's chunk size and only
 # shrinks: a size GitHub timed out on once is not tried again in this run.
 _chunk=$GT_PR_SNAPSHOT_CHUNK
+# Cleared once GitHub refuses this token the repository's checks; later
+# queries in the run then read pull request fields only, and _judge stalls
+# every pull request that is neither merged nor closed.
+_checks_readable=1
 
 # @brief Set the per-call time limit for a waiting run.
 # GT_PR_CALL_TIMEOUT is read by gt_pr_snapshot_call in the shared library.
@@ -609,6 +613,8 @@ _snapshot_all() {
     ((count <= _chunk)) || count=$_chunk
     slice=("${_numbers[@]:_read_upto:count}")
     _set_call_timeout
+    # shellcheck disable=SC2034 # read by the library's query builder
+    GT_PR_SNAPSHOT_CHECKS=$_checks_readable
     gt_pr_snapshot "$GT_PR_CHECKS_JQ" "${slice[@]}" ||
       _fail environment "could not create a temporary file"
     _fail_on_class
@@ -629,6 +635,16 @@ _snapshot_all() {
         ((${#missing[@]} > 0)) ||
           _fail not-found "repository not found: $GT_CURRENT_REPO_SPEC"
         _fail not-found "pull request not found: $(_csv "${missing[@]}")"
+        ;;
+      checks-forbidden)
+        # A query without checks cannot be refused its checks; failing here
+        # keeps a misclassification from looping.
+        [[ "$_checks_readable" == 1 ]] ||
+          _fail graphql "GitHub refused the query: ${GT_PR_RESPONSE_MESSAGE:-no message}"
+        _checks_readable=0
+        printf '%s: checks unreadable with this token (%s); judging pull requests by state only\n' \
+          "$gt_command" "${GT_PR_RESPONSE_MESSAGE:-no message}" >&2
+        continue
         ;;
       rate-limited)
         _snapshot_class=rate-limited
@@ -828,7 +844,8 @@ _judge() {
       return
       ;;
   esac
-  if [[ "${_pr_headmatch[index]:-no}" != yes ]]; then
+  # A checks-free read has no head commit to match.
+  if [[ "$_checks_readable" == 1 && "${_pr_headmatch[index]:-no}" != yes ]]; then
     if (($(_elapsed "$index") >= _head_grace)); then
       _set "$index" stall head-mismatch
     else
@@ -842,6 +859,12 @@ _judge() {
   fi
   if [[ "${_pr_mergeable[index]:-}" == CONFLICTING ]]; then
     _set "$index" action conflict
+    return
+  fi
+  # A conflict is a pull request field, so it is still reported above; the
+  # judgments below all need the checks.
+  if [[ "$_checks_readable" == 0 ]]; then
+    _set "$index" stall checks-unreadable
     return
   fi
   if [[ "${_pr_zero[index]:-}" == fail ]]; then
@@ -990,6 +1013,7 @@ _stall_hint() {
     head-mismatch) printf "GitHub's checks are for a different commit than the pull request head" ;;
     blocked) printf 'merge is blocked with every check finished; a required check may never have reported' ;;
     merge-pending) printf 'auto-merge is enabled and the pull request is mergeable but has not merged' ;;
+    checks-unreadable) printf "this token cannot read the repository's checks; watch them another way, or grant check read access" ;;
   esac
 }
 _report_action() {

@@ -988,6 +988,113 @@ _assert_contains "permanent error result" "result: 2 reason=graphql prs=12" "$ou
 _assert_contains "GitHub's message is shown" "Your token has not been granted the required scopes" "$err"
 _assert_eq "permanent error is not retried" 1 "$(_calls)"
 
+# A token that may read pull requests but not their checks (a fine-grained
+# token on a private repository): GitHub answers 200 with the checks nulled
+# and a FORBIDDEN error for each. Args: pr-json [more errors-json].
+_checks_forbidden() {
+  jq -cn --argjson pr "$1" --argjson more "${2:-[]}" '
+    {data: {repository: {p00: ($pr | .commits.nodes[0].commit.checkSuites.nodes = [null])}},
+     errors: ([{type: "FORBIDDEN",
+       path: ["repository", "p00", "commits", "nodes", 0, "commit", "checkSuites", "nodes", 0],
+       extensions: {saml_failure: false, ip_allow_list_failure: false},
+       message: "Resource not accessible by personal access token"}] + $more)}'
+}
+
+_scenario
+_serve 1 "$(_checks_forbidden "$(_green_pr 12 '{"state":"MERGED"}')")"
+_serve 2 "$(_response "$(_green_pr 12 '{"state":"MERGED"}')")"
+_watch 12
+_assert_eq "merged pull request with unreadable checks exits zero" 0 "$status"
+_assert_contains "merged record despite unreadable checks" "pr=12 state=done reason=merged" "$out"
+_assert_contains "unreadable checks are reported" "checks unreadable with this token (Resource not accessible by personal access token)" "$err"
+_assert_eq "checks-free retry is a second call" 2 "$(_calls)"
+# The log holds each call's multi-line query, so count queries, not lines.
+_assert_eq "only the first query asks for the commits" "2 1" \
+  "$(grep -c 'query PrWatchSnapshot' "$FAKE_GH_DIR/log") $(grep -c 'commits(last: 1)' "$FAKE_GH_DIR/log")"
+
+_scenario
+_serve 1 "$(_checks_forbidden "$(_green_pr 12 '{"state":"CLOSED"}')")"
+_serve 2 "$(_response "$(_green_pr 12 '{"state":"CLOSED"}')")"
+_watch 12
+_assert_eq "closed pull request with unreadable checks needs action" 1 "$status"
+_assert_contains "closed record despite unreadable checks" "pr=12 state=action reason=closed" "$out"
+
+_scenario
+_serve 1 "$(_checks_forbidden "$(_green_pr 12)")"
+_serve 2 "$(_response "$(_green_pr 12)")"
+_watch 12
+_assert_eq "open pull request with unreadable checks stalls" 8 "$status"
+_assert_contains "open pull request with unreadable checks record" "pr=12 state=stall reason=checks-unreadable" "$out"
+_assert_contains "open pull request stall says why" "action: pr=12 this token cannot read the repository's checks" "$out"
+_assert_not_contains "open pull request is not judged green" "reason=green" "$out"
+
+_scenario
+_serve 1 "$(_checks_forbidden "$(_green_pr 12 '{"mergeable":"CONFLICTING"}')")"
+_serve 2 "$(_response "$(_green_pr 12 '{"mergeable":"CONFLICTING"}')")"
+_watch 12
+_assert_eq "a conflict is reported without readable checks" 1 "$status"
+_assert_contains "conflict record without readable checks" "pr=12 state=action reason=conflict" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"state":"MERGED"}')" "$(_green_pr 13)" |
+  jq -c '.errors = [range(2) | {type: "FORBIDDEN",
+    path: ["repository", "p0\(.)", "commits", "nodes", 0, "commit", "checkSuites", "nodes", 0],
+    message: "Resource not accessible by personal access token"}]')"
+_serve 2 "$(_response "$(_green_pr 12 '{"state":"MERGED"}')" "$(_green_pr 13)")"
+_watch 12 13
+_assert_eq "an open pull request beside a merged one stalls" 8 "$status"
+_assert_contains "the merged pull request is still recorded" "pr=12 state=done reason=merged" "$out"
+_assert_contains "only the open pull request stalls" "pr=13 state=stall reason=checks-unreadable" "$out"
+
+_scenario
+_prs=()
+for _i in 1 2 3 4 5 6 7 8; do _prs+=("$(_green_pr "$_i" '{"state":"MERGED"}')"); done
+_serve 1 "$(_response "${_prs[@]}" | jq -c '.errors = [range(8) | {type: "FORBIDDEN",
+  path: ["repository", "p0\(.)", "commits", "nodes", 0, "commit", "statusCheckRollup", "contexts", "nodes", 0],
+  message: "Resource not accessible by personal access token"}]')"
+_serve 2 "$(_response "${_prs[@]}")"
+_serve 3 "$(_response "$(_green_pr 9 '{"state":"MERGED"}')")"
+_watch $(seq 1 9)
+_assert_eq "later chunks are read without checks" 0 "$status"
+_assert_contains "every chunk's merged pull requests are recorded" "result: 0 reason=merged prs=1,2,3,4,5,6,7,8,9" "$out"
+# The refused query asks once per alias; neither retry asks at all.
+_assert_eq "only the refused query asks for the commits" "3 8" \
+  "$(grep -c 'query PrWatchSnapshot' "$FAKE_GH_DIR/log") $(grep -c 'commits(last: 1)' "$FAKE_GH_DIR/log")"
+
+_scenario
+_serve 1 "$(_checks_forbidden "$(_green_pr 12 '{"state":"MERGED"}')" \
+  '[{"type":"FORBIDDEN","path":["repository","p00","baseRefName"],"message":"Resource not accessible by personal access token"}]')"
+_watch 12
+_assert_contains "a refusal outside the checks stays permanent" "result: 2 reason=graphql prs=12" "$out"
+_assert_eq "a refusal outside the checks is not retried" 1 "$(_calls)"
+
+_scenario
+_serve 1 "$(_checks_forbidden "$(_green_pr 12 '{"state":"MERGED"}')" \
+  '[{"type":"INSUFFICIENT_SCOPES","path":["repository","p00","commits","nodes",0],"message":"Your token has not been granted the required scopes"}]')"
+_watch 12
+_assert_contains "another error type beside forbidden checks stays permanent" "result: 2 reason=graphql prs=12" "$out"
+_assert_eq "another error type beside forbidden checks is not retried" 1 "$(_calls)"
+
+_scenario
+_serve 1 "$(_checks_forbidden "$(_green_pr 12 '{"state":"MERGED"}')" \
+  '[{"message":"Something went wrong while executing your query."}]')"
+_watch 12
+_assert_contains "an untyped error beside forbidden checks stays permanent" "result: 2 reason=graphql prs=12" "$out"
+_assert_eq "an untyped error beside forbidden checks is not retried" 1 "$(_calls)"
+
+_scenario
+_serve 1 "$(_checks_forbidden "$(_green_pr 12 '{"state":"MERGED"}')" | sed 's/"saml_failure":false/"saml_failure":true/')"
+_watch 12
+_assert_contains "a SAML refusal is not taken for unreadable checks" "result: 2 reason=graphql prs=12" "$out"
+_assert_eq "a SAML refusal is not retried" 1 "$(_calls)"
+
+_scenario
+_serve 1 "$(_checks_forbidden "$(_green_pr 12 '{"state":"MERGED"}')")"
+_serve 2 "$(_checks_forbidden "$(_green_pr 12 '{"state":"MERGED"}')")"
+_watch 12
+_assert_contains "a refused checks-free query does not loop" "result: 2 reason=graphql prs=12" "$out"
+_assert_eq "a refused checks-free query stops after two calls" 2 "$(_calls)"
+
 # --- targets ----------------------------------------------------------------
 
 _scenario

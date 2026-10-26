@@ -16,6 +16,9 @@ GT_PR_SNAPSHOT_CHUNK=8
 GT_PR_SNAPSHOT_TMP=""
 # Per-call time limit in seconds for gt_pr_snapshot_call; 0 means none.
 GT_PR_CALL_TIMEOUT=0
+# 0 leaves the head commit and its checks out of snapshot queries, for a token
+# that may read the repository's pull requests but not its checks.
+GT_PR_SNAPSHOT_CHECKS=1
 
 # @brief Run gh with color and debug output forced off.
 # Forced color (CLICOLOR_FORCE, GH_FORCE_TTY) wraps `gh api -i` header names in
@@ -32,6 +35,8 @@ gt_pr_gh() {
 
 # @brief Print the snapshot GraphQL query for one chunk of pull requests.
 # @param $1 Number of pull requests in the chunk.
+# With GT_PR_SNAPSHOT_CHECKS=0 the query reads only pull request fields; the
+# checks classifier then reports no head commit and no checks.
 # Aliases are zero-padded (p00, p01, ...) because gh's jq sorts object keys.
 # Each alias takes its own integer variable so no number is interpolated into
 # the query text.
@@ -52,6 +57,8 @@ gt_pr_snapshot_query() {
       number url state isDraft mergeable mergeStateStatus reviewDecision
       baseRefName headRefName headRefOid isCrossRepository
       autoMergeRequest { enabledAt }
+EOF
+    [[ "$GT_PR_SNAPSHOT_CHECKS" == 0 ]] || cat <<EOF
       commits(last: 1) { nodes { commit {
         oid
         statusCheckRollup { contexts(first: 100) { totalCount nodes {
@@ -74,8 +81,8 @@ gt_pr_snapshot_query() {
           workflowRun { event file { path } }
         } }
       } } }
-    }
 EOF
+    printf '    }\n'
   done
   printf '  }\n}\n'
 }
@@ -292,11 +299,12 @@ gt_http_date_epoch() {
 # @param $2 gh's exit status.
 # @param $3 gh's stderr, if captured.
 # Sets GT_PR_RESPONSE_CLASS to one of ok, rate-limited, auth, sso, not-found,
-# timeout, transient, error (a permanent failure); GT_PR_RESPONSE_BODY (jq
-# output on success, raw body otherwise); GT_PR_RESPONSE_DATE (server epoch
-# from the Date header, or empty); GT_PR_RESPONSE_RESET (epoch when a rate
-# limit lifts, or empty); GT_PR_RESPONSE_MESSAGE (a sanitized diagnostic for
-# error and transient classes, or empty).
+# checks-forbidden (see _gt_pr_checks_forbidden), timeout, transient, error (a
+# permanent failure); GT_PR_RESPONSE_BODY (jq output on success, raw body
+# otherwise); GT_PR_RESPONSE_DATE (server epoch from the Date header, or
+# empty); GT_PR_RESPONSE_RESET (epoch when a rate limit lifts, or empty);
+# GT_PR_RESPONSE_MESSAGE (a sanitized diagnostic for error and transient
+# classes, or empty).
 #
 # gh applies --jq only to a successful response. On GraphQL errors (also on
 # HTTP 200) it prints the raw body and exits 1; on a body that is not JSON
@@ -397,6 +405,13 @@ gt_pr_classify_response() {
         GT_PR_RESPONSE_MESSAGE=$(_gt_pr_first_line "$errors")
         ;;
     esac
+  elif [[ "$status" == 200 ]] && _gt_pr_checks_forbidden "$body"; then
+    # The token may read pull requests but not their checks: a fine-grained
+    # personal access token on a private repository, say, which GitHub does
+    # not currently let you grant read access to checks. The pull requests'
+    # own fields are still readable, so callers can retry without the checks.
+    GT_PR_RESPONSE_CLASS=checks-forbidden
+    GT_PR_RESPONSE_MESSAGE=$(_gt_pr_error_message "$body")
   elif [[ "$status" == 4?? || "$body" == *'"type":"FORBIDDEN"'* ||
     "$body" == *'"type":"INSUFFICIENT_SCOPES"'* ||
     "$body" == *'"code":"undefinedField"'* ||
@@ -428,6 +443,38 @@ _gt_pr_error_message() {
   if [[ "$body" =~ \"message\":\"([^\"]{1,200}) ]]; then
     _gt_pr_first_line "${BASH_REMATCH[1]}"
   fi
+}
+
+# @brief Succeed when every error in a body is FORBIDDEN under a pull
+# request's head commit, which is where the checks are read.
+# Error objects are counted rather than parsed: unescaped quotes cannot occur
+# inside GitHub's compact JSON strings, so check names a pull request author
+# writes cannot fake a `"type":"`, `"message":"`, or `"path":[` key. The
+# snapshot query reads no field named `type`, `message`, or `path` as a list;
+# adding one would make every response fail this test (back to `error`, safe
+# but no longer recognized). Every error has a message, so an untyped one
+# shows up as an extra message. A SAML or IP allow-list failure is a different
+# refusal and does not match.
+#
+# One awk pass does the counting: a chunk can carry about a thousand errors,
+# and Bash 3.2's own pattern substitution is quadratic in the body's length.
+_gt_pr_checks_forbidden() {
+  local body="$1" counts
+
+  [[ "$body" == *'"type":"FORBIDDEN"'* ]] || return 1
+  [[ "$body" != *'"saml_failure":true'* && "$body" != *'"ip_allow_list_failure":true'* ]] ||
+    return 1
+  counts=$(printf '%s\n' "$body" | awk '
+    {
+      types += gsub(/"type":"/, "&")
+      forbidden += gsub(/"type":"FORBIDDEN"/, "&")
+      messages += gsub(/"message":"/, "&")
+      paths += gsub(/"path":\[/, "&")
+      under += gsub(/"path":\["repository","p[0-9][0-9]","commits",/, "&")
+    }
+    END { print (forbidden > 0 && types == forbidden && messages == forbidden &&
+      paths == forbidden && under == forbidden) ? "yes" : "no" }') || return 1
+  [[ "$counts" == yes ]]
 }
 
 # @brief Print the aliases a NOT_FOUND response names in its error paths.

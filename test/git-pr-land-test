@@ -217,6 +217,28 @@ if [[ "$1 $2" == "pr view" ]]; then
     dirty)
       printf '4\tOPEN\tfalse\tDIRTY\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
       ;;
+    behind)
+      printf '4\tOPEN\tfalse\tBEHIND\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
+      ;;
+    # GitHub still computing mergeability: the first read says UNKNOWN.
+    unknown-settles)
+      if [[ -f "$state_file" ]]; then
+        printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
+      elif [[ -f "$state_file.read" ]]; then
+        printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
+      else
+        : >"$state_file.read"
+        printf '4\tOPEN\tfalse\tUNKNOWN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
+      fi
+      ;;
+    merged-unknown)
+      printf 'view\n' >>"$state_file.reads"
+      printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
+      ;;
+    unknown-stays)
+      printf 'view\n' >>"$state_file.reads"
+      printf '4\tOPEN\tfalse\tUNKNOWN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
+      ;;
     merged-after-error)
       if [[ -f "$state_file" ]]; then
         printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
@@ -1612,6 +1634,75 @@ rc=0
 result=$(GH_PR_CASE=dirty GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 2>&1) || rc=$?
 _assert_contains "refuses dirty merge state" "merge state is DIRTY" "$result"
 _assert_eq "a dirty merge state exits 1" "1" "$rc"
+
+# BEHIND: refused, with the commands that bring the pull request up to date.
+behind_log=$(_tmpdir)/gh.log
+rc=0
+result=$(GH_PR_CASE=behind GH_LOG="$behind_log" PATH="$bin_dir:$PATH" \
+  _pr_land "$repo" 4 2>&1) || rc=$?
+_assert_eq "a pull request behind its base exits 1" "1" "$rc"
+_assert_contains "behind: names the update command" \
+  "next: gh pr update-branch 4 -R github.test/example/repo" "$result"
+_assert_contains "behind: names the watch to green" \
+  "next: git pr-watch --wait 4" "$result"
+_assert_contains "behind: says why it refused" "is behind its base" "$result"
+_assert_eq "behind: no merge runs" "" "$(cat "$behind_log" 2>/dev/null)"
+
+# A stack landing restacks its own pull requests: no update-branch advice.
+rc=0
+result=$(GH_PR_CASE=behind GH_LOG="$behind_log" PATH="$bin_dir:$PATH" \
+  _pr_land "$repo" 4 --expect-topology \
+  "$(printf '4\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4' \
+    "$(git -C "$repo" rev-parse refs/remotes/origin/feature)")" 2>&1) || rc=$?
+_assert_eq "behind in a stack landing exits 1" "1" "$rc"
+_assert_contains "behind in a stack landing: plain refusal" \
+  "merge state is BEHIND" "$result"
+_assert_not_contains "behind in a stack landing: no update advice" \
+  "update-branch" "$result"
+
+# UNKNOWN right after the base moved: read again until it settles.
+repo_unknown=$(_tmpdir)
+remote_unknown=$(_tmpdir)
+log_unknown=$(_tmpdir)/gh.log
+state_unknown=$(_tmpdir)/state
+_init_repo "$repo_unknown" "$remote_unknown"
+rc=0
+result=$(GH_PR_CASE=unknown-settles GH_STATE="$state_unknown" \
+  GH_LOG="$log_unknown" GIT_TOOLS_TEST_PR_LAND_MERGE_STATE_PAUSE=0 \
+  PATH="$bin_dir:$PATH" _pr_land "$repo_unknown" 4 2>&1) || rc=$?
+_assert_eq "unknown merge state that settles: lands" "0" "$rc"
+_assert_contains "unknown merge state that settles: landed" \
+  "landed PR #4" "$result"
+
+repo_unknown_stays=$(_tmpdir)
+remote_unknown_stays=$(_tmpdir)
+log_unknown_stays=$(_tmpdir)/gh.log
+state_unknown_stays=$(_tmpdir)/state
+_init_repo "$repo_unknown_stays" "$remote_unknown_stays"
+rc=0
+result=$(GH_PR_CASE=unknown-stays GH_STATE="$state_unknown_stays" \
+  GH_LOG="$log_unknown_stays" GIT_TOOLS_TEST_PR_LAND_MERGE_STATE_PAUSE=0 \
+  PATH="$bin_dir:$PATH" _pr_land "$repo_unknown_stays" 4 2>&1) || rc=$?
+_assert_eq "unknown merge state that never settles exits 1" "1" "$rc"
+_assert_contains "unknown merge state that never settles: says so" \
+  "merge state is UNKNOWN" "$result"
+# Seven merge-state reads, then the topology recheck before judging.
+_assert_eq "unknown merge state: bounded reads" "8" \
+  "$(wc -l <"$state_unknown_stays.reads" | tr -d ' ')"
+_assert_eq "unknown merge state that never settles: no merge runs" "" \
+  "$(cat "$log_unknown_stays" 2>/dev/null)"
+
+# A merged pull request also reads UNKNOWN: refused at once, with the
+# default pause, without waiting for its merge state.
+state_merged_unknown=$(_tmpdir)/state
+rc=0
+result=$(GH_PR_CASE=merged-unknown GH_STATE="$state_merged_unknown" \
+  GH_LOG="$behind_log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 2>&1) || rc=$?
+_assert_eq "merged pull request reading UNKNOWN exits 1" "1" "$rc"
+_assert_contains "merged pull request reading UNKNOWN: not open" \
+  "is not open" "$result"
+_assert_eq "merged pull request reading UNKNOWN: no extra reads" "2" \
+  "$(wc -l <"$state_merged_unknown.reads" | tr -d ' ')"
 
 rc=0
 result=$(GH_LOG="$log" PATH="$bin_dir:$PATH" _pr_land "$repo" 4 --method bad 2>&1) || rc=$?

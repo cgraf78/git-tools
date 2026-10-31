@@ -1016,6 +1016,29 @@ _stall_hint() {
     checks-unreadable) printf "this token cannot read the repository's checks; watch them another way, or grant check read access" ;;
   esac
 }
+
+# The flag the log command needs from this gh, with a trailing space, or
+# empty; set by _log_flag_load.
+_log_flag=""
+_log_flag_loaded=0
+
+# @brief Read once whether this gh needs --allow-escape-sequences for logs.
+# From 2.97.0, `gh api` refuses to print a body holding escape sequences
+# unless given --allow-escape-sequences; older gh has no such flag and prints
+# them. A version that cannot be read gets the flag, as current gh needs it.
+_log_flag_load() {
+  local version major minor
+
+  ((_log_flag_loaded == 0)) || return 0
+  _log_flag_loaded=1
+  _log_flag="--allow-escape-sequences "
+  version=$(gh --version 2>/dev/null) || version=""
+  [[ "$version" =~ ^gh\ version\ ([0-9]+)\.([0-9]+)\. ]] || return 0
+  major=$((10#${BASH_REMATCH[1]}))
+  minor=$((10#${BASH_REMATCH[2]}))
+  ((major > 2 || (major == 2 && minor >= 97))) || _log_flag=""
+}
+
 _report_action() {
   local i="$1" j shown=0 more=0 job
 
@@ -1043,8 +1066,13 @@ _report_action() {
     [[ "${_chk_kind[$j]}" == actions && "${_chk_id[$j]}" =~ ^[0-9]+$ ]] || continue
     ((shown < _max_check_lines)) || break
     shown=$((shown + 1))
-    printf 'run: gh run view --job %s --log-failed -R %s\n' \
-      "${_chk_id[$j]}" "$GT_CURRENT_REPO_SPEC"
+    _log_flag_load
+    # The jobs API serves a job's log while its run is still going, which
+    # `gh run view --log-failed` refuses. `gh api` ignores -R, so the host is
+    # pinned with --hostname. cat -v keeps escape sequences from a log that a
+    # fork's code may control inert in the terminal.
+    printf 'run: gh api --hostname %s %srepos/%s/actions/jobs/%s/logs | cat -v\n' \
+      "$GT_CURRENT_REPO_HOST" "$_log_flag" "${GT_CURRENT_REPO_SPEC#*/}" "${_chk_id[$j]}"
   done
 }
 

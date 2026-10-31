@@ -116,8 +116,14 @@ How many failing checks were not listed.
 .B suite pr=\fIn\fP conclusion=\fIconclusion\fP workflow=\fIjson\fP
 A workflow that failed to start.
 .TP
-.B run: gh run view \-\-job \fIid\fP \-\-log\-failed \-R \fIhost/owner/repo\fP
-A command that prints a failed job's log.
+.B run: gh api \-\-hostname \fIhost\fP \-\-allow\-escape\-sequences repos/\fIowner/repo\fP/actions/jobs/\fIid\fP/logs | cat \-v
+A command that prints a failed job's full log, also while its workflow run is
+still going.
+.B cat \-v
+shows escape sequences in the log as text.
+With gh older than 2.97.0, which has no
+.BR \-\-allow\-escape\-sequences ,
+the command leaves that flag out.
 .TP
 .B action: pr=\fIn\fP \fItext\fP
 What a stalled pull request is waiting for.

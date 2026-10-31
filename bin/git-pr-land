@@ -476,6 +476,29 @@ _cleanup_incomplete() {
   gt_die "PR #$_number merged; cleanup incomplete: $*"
 }
 
+# Seconds before the second try at publishing the merge.
+_publish_retry_pause=2
+
+# @brief Record the merge for watchers with a one-shot `git pr-watch`.
+# pr-watch stays the only writer of its state files, and its one-shot run
+# records a merged pull request as done, so a session waiting for the pull
+# request's checks learns that nothing is left to watch. Its read can lag the
+# merge just verified, so a run that does not report the merge is retried
+# once. The merge stands either way, so the outcome never changes this
+# command's exit status. The sibling copy runs, not a `git pr-watch` on PATH,
+# so a stack landing's tool snapshot stays one version.
+_publish_merged() {
+  local attempt result
+
+  for attempt in 1 2; do
+    ((attempt == 1)) || sleep "$_publish_retry_pause"
+    result=$("$_root/bin/git-pr-watch" "$_url" </dev/null 2>/dev/null) || true
+    result=${result##*$'\n'}
+    [[ "$result" != "result: 0 reason=merged "* ]] || return 0
+  done
+  gt_say "next: git pr-watch $_number"
+}
+
 _require_expected_topology() {
   local view
 
@@ -607,11 +630,14 @@ if [[ "$_dry_run" != 1 ]]; then
     fi
     gt_die "merge command succeeded but PR #$_number state could not be verified"
   }
+  IFS=$'\t' read -r _ _after_state _ <<<"$_after_view"
+  if [[ "$_after_state" == "MERGED" ]]; then
+    _publish_merged
+  fi
   if [[ -n "$_expected_topology" ]] &&
     ! gt_pr_record_matches_topology "$_after_view" "$_expected_topology"; then
     gt_die "PR #$_number merged; cleanup incomplete: topology changed after merge"
   fi
-  IFS=$'\t' read -r _ _after_state _ <<<"$_after_view"
   if [[ "$_after_state" != "MERGED" ]]; then
     if ((_merge_status != 0)); then
       gt_die "merge command failed for PR #$_number (state: $_after_state)"

@@ -154,7 +154,8 @@ So that other tools, such as agent hooks, can tell whether a pull request is
 being watched or has finished, `git pr-watch` keeps small state files under
 `$XDG_STATE_HOME/git-tools/pr-watch/` (`~/.local/state/...` by default); their
 layout is a stable interface described in `git-pr-watch(1)` under STATE FILES.
-`GIT_PR_WATCH_STATE=0` turns them off.
+`git pr-land` runs a one-shot `git pr-watch` after each merge, so a landed pull
+request is recorded as merged there too. `GIT_PR_WATCH_STATE=0` turns them off.
 
 With `--wait`, it keeps checking (every 60 seconds by default) until a pull
 request needs action, every pull request is done, or the ones left are stalled
@@ -423,7 +424,12 @@ head with commits the landed head lacks is kept and reported. Git has no
 portable primitive that serializes branch deletion with a checkout that already
 resolved the ref, so deletion is also refused while any worktree of the
 repository holds an index or HEAD lock, which a checkout in progress does. Use
-`--keep-branch` to keep the local head and its worktree. Remote deletion stays
+`--keep-branch` to keep the local head and its worktree. Right after the merge
+is verified, the command runs a one-shot `git pr-watch` on the PR so its state
+files record it as merged. A run that does not report the merge is retried
+once; if the merge is still not reported, the command prints
+`git pr-land: next: git pr-watch <n>` on stderr, and running that `git pr-watch`
+later records it. Neither case changes the exit status. Remote deletion stays
 manual: a repository-scoped open-PR query cannot prove that a fork head is
 unused by PRs targeting another base repository, and a new consumer can appear
 after any query.
@@ -453,7 +459,8 @@ After each restack, the next expected topology accepts the rewritten head OID
 only when it matches both the local branch and a fresh GitHub PR record.
 Each parent is landed with `--keep-branch`, because the next restack still
 needs its head; the final PR's local head is deleted as `git pr-land` would,
-and running `git cleanup-repo` afterward removes the landed parents. Remote
+and running `git cleanup-repo` afterward removes the landed parents. Each
+landing records its merge in `git pr-watch` state as `git pr-land` does. Remote
 heads are
 retained for manual cleanup. Stack topology uses
 repository identity as well as branch names, so a same-named fork head cannot

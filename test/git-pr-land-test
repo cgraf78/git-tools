@@ -260,6 +260,13 @@ if [[ "$1 $2" == "pr view" ]]; then
         printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
       fi
       ;;
+    retargeted-after-merge)
+      if [[ -f "$state_file" ]]; then
+        printf '4\tMERGED\tfalse\tUNKNOWN\tfeature\t%s\trelease\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
+      else
+        printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\texample/repo\tfalse\thttps://github.test/example/repo/pull/4\tFeature PR\n' "$GH_PR_HEAD_OID"
+      fi
+      ;;
     wrong-same-repo-head)
       printf '4\tOPEN\tfalse\tCLEAN\tfeature\t%s\tmain\tforeign/repo\tfalse\thttps://github.test/example/repo/pull/4\tWrong head repository\n' "$GH_PR_HEAD_OID"
       ;;
@@ -344,6 +351,27 @@ if [[ "$1 $2" == "pr merge" ]]; then
       : >"$state_file"
       ;;
   esac
+  exit 0
+fi
+
+# The snapshot query of the one-shot `git pr-watch` that publishes the merge.
+# Answer as gh would after applying the query's --jq program: merged once the
+# merge ran, unless GH_WATCH_CASE=pending keeps it open with checks running.
+if [[ "$1 $2" == "api graphql" ]]; then
+  number=""
+  for argument in "$@"; do
+    [[ "$argument" != n00=* ]] || number=${argument#n00=}
+  done
+  printf '%s\n' "$number" >>"${GH_WATCH_LOG:-/dev/null}"
+  state=OPEN
+  checks=pending
+  if [[ -f "$state_file" && "${GH_WATCH_CASE:-}" != pending ]]; then
+    state=MERGED
+    checks=pass
+  fi
+  printf 'HTTP/2.0 200 OK\r\nDate: Thu, 15 Oct 2026 14:14:10 GMT\r\n\r\n'
+  printf 'pr p00 num=%s state=%s mergeable=UNKNOWN mss=UNKNOWN review=- head=%s judged=%s headmatch=yes cross=false am=false checks=%s zero=- nchecks=1 ref=feature\n' \
+    "$number" "$state" "$GH_PR_HEAD_OID" "$GH_PR_HEAD_OID" "$checks"
   exit 0
 fi
 
@@ -950,6 +978,98 @@ _assert_not_contains "dry run does not claim the PR landed" "landed PR" "$result
 _assert_occurrences "dry run fetches the base once" 1 \
   "would fetch refs/heads/main" "$result"
 _assert_eq "dry run keeps branch checked out" "feature" "$(git -C "$repo_dry" branch --show-current)"
+
+# After the merge, a one-shot `git pr-watch` records it in pr-watch's state, so
+# a session that asked for a watcher learns the pull request is done. Each
+# case gets its own state root.
+publish_repo=$(_tmpdir)
+publish_remote=$(_tmpdir)
+publish_log=$(_tmpdir)/gh.log
+publish_watch_log=$(_tmpdir)/watch.log
+publish_xdg=$(_tmpdir)
+publish_err=$(_tmpdir)/stderr
+_init_repo "$publish_repo" "$publish_remote"
+publish_head=$(git -C "$publish_repo" rev-parse refs/remotes/origin/feature)
+publish_rc=0
+publish_out=$(GH_LOG="$publish_log" GH_WATCH_LOG="$publish_watch_log" \
+  XDG_STATE_HOME="$publish_xdg" PATH="$bin_dir:$PATH" \
+  _pr_land "$publish_repo" 4 2>"$publish_err") || publish_rc=$?
+publish_record=$(cat "$publish_xdg/git-tools/pr-watch/done/example_repo_4" 2>/dev/null)
+_assert_eq "publish: landing succeeds" 0 "$publish_rc"
+if [[ "$publish_record" =~ ^$publish_head\ merged\ [0-9]+$ ]]; then
+  _pass "publish: the landed PR is recorded as merged"
+else
+  _fail "publish: the landed PR is recorded as merged"
+  printf '  record: %s\n' "$publish_record" >&2
+fi
+_assert_eq "publish: one pr-watch check" 4 "$(cat "$publish_watch_log")"
+_assert_eq "publish: pr-watch writes nothing to stdout" "" "$publish_out"
+_assert_not_contains "publish: no follow-up when the merge is recorded" \
+  "next:" "$(cat "$publish_err")"
+
+publish_dry_repo=$(_tmpdir)
+publish_dry_remote=$(_tmpdir)
+publish_dry_log=$(_tmpdir)/gh.log
+publish_dry_watch_log=$(_tmpdir)/watch.log
+publish_dry_xdg=$(_tmpdir)
+_init_repo "$publish_dry_repo" "$publish_dry_remote"
+result=$(GH_LOG="$publish_dry_log" GH_WATCH_LOG="$publish_dry_watch_log" \
+  XDG_STATE_HOME="$publish_dry_xdg" PATH="$bin_dir:$PATH" \
+  _pr_land "$publish_dry_repo" 4 --dry-run 2>&1)
+_assert_eq "publish: a dry run runs no pr-watch" missing \
+  "$(cat "$publish_dry_watch_log" 2>/dev/null || printf missing)"
+_assert_eq "publish: a dry run records nothing" "" "$(ls -A "$publish_dry_xdg")"
+
+# pr-watch's read can lag the merge: one retry, then the command to repeat.
+publish_lag_repo=$(_tmpdir)
+publish_lag_remote=$(_tmpdir)
+publish_lag_log=$(_tmpdir)/gh.log
+publish_lag_watch_log=$(_tmpdir)/watch.log
+publish_lag_xdg=$(_tmpdir)
+_init_repo "$publish_lag_repo" "$publish_lag_remote"
+publish_lag_rc=0
+result=$(GH_LOG="$publish_lag_log" GH_WATCH_LOG="$publish_lag_watch_log" \
+  GH_WATCH_CASE=pending XDG_STATE_HOME="$publish_lag_xdg" \
+  PATH="$bin_dir:$PATH" _pr_land "$publish_lag_repo" 4 2>&1) ||
+  publish_lag_rc=$?
+_assert_eq "publish: an unrecorded merge still lands" 0 "$publish_lag_rc"
+_assert_contains "publish: an unrecorded merge still reports the landing" \
+  "landed PR #4 (feature -> main)" "$result"
+_assert_eq "publish: pr-watch is retried once" "4 4" \
+  "$(tr '\n' ' ' <"$publish_lag_watch_log" | sed 's/ $//')"
+_assert_contains "publish: prints the command that records the merge" \
+  "git pr-land: next: git pr-watch 4" "$result"
+_assert_eq "publish: an unrecorded merge writes no done record" missing \
+  "$(cat "$publish_lag_xdg/git-tools/pr-watch/done/example_repo_4" 2>/dev/null || printf missing)"
+
+publish_off_repo=$(_tmpdir)
+publish_off_remote=$(_tmpdir)
+publish_off_log=$(_tmpdir)/gh.log
+publish_off_xdg=$(_tmpdir)
+_init_repo "$publish_off_repo" "$publish_off_remote"
+result=$(GH_LOG="$publish_off_log" GIT_PR_WATCH_STATE=0 \
+  XDG_STATE_HOME="$publish_off_xdg" PATH="$bin_dir:$PATH" \
+  _pr_land "$publish_off_repo" 4 2>&1)
+_assert_eq "publish: GIT_PR_WATCH_STATE=0 records nothing" "" "$(ls -A "$publish_off_xdg")"
+_assert_not_contains "publish: GIT_PR_WATCH_STATE=0 needs no follow-up" "next:" "$result"
+
+# The merge is recorded before any post-merge check can stop the command.
+publish_moved_repo=$(_tmpdir)
+publish_moved_remote=$(_tmpdir)
+publish_moved_log=$(_tmpdir)/gh.log
+publish_moved_xdg=$(_tmpdir)
+_init_repo "$publish_moved_repo" "$publish_moved_remote"
+publish_moved_head=$(git -C "$publish_moved_repo" rev-parse refs/remotes/origin/feature)
+publish_moved_rc=0
+result=$(GH_LOG="$publish_moved_log" GH_PR_CASE=retargeted-after-merge \
+  XDG_STATE_HOME="$publish_moved_xdg" PATH="$bin_dir:$PATH" \
+  _pr_land "$publish_moved_repo" 4 2>&1) || publish_moved_rc=$?
+_assert_eq "publish: a topology change after the merge still fails" 1 "$publish_moved_rc"
+_assert_contains "publish: a topology change after the merge is reported" \
+  "topology changed after merge" "$result"
+_assert_contains "publish: a topology change after the merge still records it" \
+  "$publish_moved_head merged " \
+  "$(cat "$publish_moved_xdg/git-tools/pr-watch/done/example_repo_4" 2>/dev/null)"
 
 repo_dry_linked=$(_tmpdir)
 remote_dry_linked=$(_tmpdir)

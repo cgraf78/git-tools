@@ -45,7 +45,13 @@ head is deleted as
 would; run
 .BR git-cleanup-repo (1)
 afterward to remove the landed parents. Remote heads are retained for manual
-cleanup. Stack topology is
+cleanup. Each landing records its merge in
+.BR git-pr-watch (1)
+state files as
+.BR git-pr-land (1)
+does, using the copy of
+.B git-pr-watch
+in the command's tool snapshot. Stack topology is
 repository-qualified, so a
 same-named fork head is not treated as a base-repository parent. Cycles and
 ambiguous same-repository parents fail closed.
@@ -94,4 +100,5 @@ Usage or local environment error.
 .BR git-pr-ready (1),
 .BR git-pr-stack (1),
 .BR git-pr-restack (1),
-.BR git-pr-land (1)
+.BR git-pr-land (1),
+.BR git-pr-watch (1)

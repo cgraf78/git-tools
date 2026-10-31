@@ -89,6 +89,15 @@ printf '%s CLICOLOR_FORCE=%s GH_FORCE_TTY=%s GH_DEBUG=%s NO_COLOR=%s\n' "$1" \
   "${NO_COLOR-unset}" >>"$dir/env-all"
 
 case "$1 ${2:-}" in
+  "--version ")
+    [[ ! -f "$dir/gh-version-fail" ]] || exit 1
+    if [[ -f "$dir/gh-version" ]]; then
+      cat "$dir/gh-version"
+    else
+      printf 'gh version 2.97.0 (2026-07-31)\n'
+    fi
+    exit 0
+    ;;
   "auth status")
     [[ ! -f "$dir/auth-fail" ]] || exit 1
     exit 0
@@ -344,10 +353,57 @@ _watch 12
 _assert_eq "failure while the run continues exits immediately" 1 "$status"
 _assert_contains "fail-fast record" "pr=12 state=action reason=failed" "$out"
 _assert_contains "failing check line" 'check pr=12 required=yes job=21 name="build"' "$out"
-_assert_contains "log command pins the repository" \
-  "run: gh run view --job 21 --log-failed -R github.test/example/repo" "$out"
+_assert_contains "log command pins the host and repository" \
+  "run: gh api --hostname github.test --allow-escape-sequences repos/example/repo/actions/jobs/21/logs | cat -v" "$out"
 _assert_contains "next line on action" "next: git pr-watch --wait 12" "$out"
 _assert_contains "action result" "result: 1 reason=failed prs=12" "$out"
+
+_scenario
+printf 'gh version 2.96.1 (2026-07-01)\nhttps://github.com/cli/cli/releases/tag/v2.96.1\n' \
+  >"$FAKE_GH_DIR/gh-version"
+_serve 1 "$(_response "$(_pr 12 "$(_list \
+  "$(_run build COMPLETED FAILURE 1 COMPLETED 21 "$OLD")" \
+  "$(_run test COMPLETED FAILURE 1 COMPLETED 22 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 2)")")")"
+_watch 12
+_assert_contains "gh before 2.97 gets the log command without the escape flag" \
+  "run: gh api --hostname github.test repos/example/repo/actions/jobs/21/logs | cat -v" "$out"
+_assert_contains "every log command uses the same form" \
+  "run: gh api --hostname github.test repos/example/repo/actions/jobs/22/logs | cat -v" "$out"
+_assert_eq "gh's version is read once per run" 1 "$(grep -c -- '^--version' "$FAKE_GH_DIR/log")"
+
+_scenario
+printf 'gh version 2.100.0 (2027-01-01)\n' >"$FAKE_GH_DIR/gh-version"
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED FAILURE 1 COMPLETED 21 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 1)")")")"
+_watch 12
+_assert_contains "versions compare numerically" \
+  "run: gh api --hostname github.test --allow-escape-sequences repos/example/repo/actions/jobs/21/logs | cat -v" "$out"
+
+_scenario
+: >"$FAKE_GH_DIR/gh-version-fail"
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED FAILURE 1 COMPLETED 21 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 1)")")")"
+_watch 12
+_assert_eq "a failing gh version read keeps the report" 1 "$status"
+_assert_contains "a failing gh version read gets the escape flag" \
+  "run: gh api --hostname github.test --allow-escape-sequences repos/example/repo/actions/jobs/21/logs | cat -v" "$out"
+_assert_contains "a failing gh version read keeps the result line" \
+  "result: 1 reason=failed prs=12" "$out"
+
+_scenario
+printf 'gh version DEV\n' >"$FAKE_GH_DIR/gh-version"
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED FAILURE 1 COMPLETED 21 "$OLD")")" \
+  "$(_list "$(_suite 1 COMPLETED FAILURE 1)")")")"
+_watch 12
+_assert_contains "an unreadable gh version gets the escape flag" \
+  "run: gh api --hostname github.test --allow-escape-sequences repos/example/repo/actions/jobs/21/logs | cat -v" "$out"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12)")"
+_watch 12
+_assert_not_contains "a run without log commands does not read gh's version" \
+  "--version" "$(cat "$FAKE_GH_DIR/log")"
 
 _scenario
 _serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED FAILURE 1 COMPLETED 21 "$RECENT")")" \

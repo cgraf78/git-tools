@@ -44,6 +44,7 @@ _snapshot_tool_dir() {
   cp "$_root/bin/git-pr-land" "$_tool_tmp/bin/git-pr-land"
   cp "$_root/bin/git-pr-restack" "$_tool_tmp/bin/git-pr-restack"
   cp "$_root/bin/git-pr-stack" "$_tool_tmp/bin/git-pr-stack"
+  cp "$_root/bin/git-pr-watch" "$_tool_tmp/bin/git-pr-watch"
   # Every library, so a helper a snapshotted tool starts sourcing can never be
   # missing from the copy.
   cp "$_root"/lib/*.sh "$_tool_tmp/lib/"

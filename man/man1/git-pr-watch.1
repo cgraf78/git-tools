@@ -281,6 +281,12 @@ seen it.
 .B green
 is only written for checks judged on the pull request's current head. A run
 rewrites the record only when its commit or word changes.
+.BR git-pr-land (1)
+runs a one-shot
+.B git pr-watch
+right after it merges a pull request, so a landed pull request gets a
+.B merged
+record from that run.
 .PP
 Names containing
 .B ~
@@ -316,4 +322,5 @@ Where state files go; see
 .BR "STATE FILES" .
 .SH SEE ALSO
 .BR git-pr-checks (1),
+.BR git-pr-land (1),
 .BR git-pr-ready (1)

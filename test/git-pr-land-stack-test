@@ -311,6 +311,12 @@ if [[ "$1 $2" == "pr view" ]]; then
   target=${3:-}
   number=${target##*/}
   merge_state=$(_merge_state "$number")
+  # GH_MERGED_DIR/<n> marks a pull request `pr merge` merged.
+  state=OPEN
+  if [[ -n "${GH_MERGED_DIR:-}" && -e "$GH_MERGED_DIR/$number" ]]; then
+    state=MERGED
+    merge_state=UNKNOWN
+  fi
   case "$number" in
     1)
       base=main
@@ -318,7 +324,7 @@ if [[ "$1 $2" == "pr view" ]]; then
         base=release
       fi
       oid=$(git rev-parse refs/heads/feature/a)
-      printf '1\tOPEN\tfalse\tCLEAN\tfeature/a\t%s\t%s\texample/repo\tfalse\thttps://github.test/example/repo/pull/1\tRoot PR\n' "$oid" "$base"
+      printf '1\t%s\tfalse\tCLEAN\tfeature/a\t%s\t%s\texample/repo\tfalse\thttps://github.test/example/repo/pull/1\tRoot PR\n' "$state" "$oid" "$base"
       ;;
     2)
       base=feature/a
@@ -332,14 +338,14 @@ if [[ "$1 $2" == "pr view" ]]; then
         base=release
       fi
       oid=$(git rev-parse refs/heads/feature/b)
-      printf '2\tOPEN\tfalse\t%s\tfeature/b\t%s\t%s\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tChild PR\n' "$merge_state" "$oid" "$base"
+      printf '2\t%s\tfalse\t%s\tfeature/b\t%s\t%s\texample/repo\tfalse\thttps://github.test/example/repo/pull/2\tChild PR\n' "$state" "$merge_state" "$oid" "$base"
       ;;
     3)
       base=feature/b
       topology_state=${STACK_TOPOLOGY_STATE:-${STACK_LOG}.topology}
       [[ ! -e "$topology_state.3" ]] || base=main
       oid=$(git rev-parse refs/heads/feature/c)
-      printf '3\tOPEN\tfalse\t%s\tfeature/c\t%s\t%s\texample/repo\tfalse\thttps://github.test/example/repo/pull/3\tGrandchild PR\n' "$merge_state" "$oid" "$base"
+      printf '3\t%s\tfalse\t%s\tfeature/c\t%s\t%s\texample/repo\tfalse\thttps://github.test/example/repo/pull/3\tGrandchild PR\n' "$state" "$merge_state" "$oid" "$base"
       ;;
     *)
       printf 'unexpected pr view target: %s\n' "${3:-}" >&2
@@ -361,6 +367,31 @@ if [[ "$1 $2" == "pr checks" ]]; then
       printf 'none\n'
       ;;
   esac
+  exit 0
+fi
+# Only the real `git pr-land` merges; the stub never calls gh.
+if [[ "$1 $2" == "pr merge" ]]; then
+  printf 'merge %s\n' "$3" >>"${STACK_LOG:?}"
+  : >"${GH_MERGED_DIR:?}/$3"
+  exit 0
+fi
+# The snapshot query of the one-shot `git pr-watch` that `git pr-land` runs
+# after a merge, answered as gh would after applying the query's --jq program.
+if [[ "$1 $2" == "api graphql" ]]; then
+  number=""
+  for argument in "$@"; do
+    [[ "$argument" != n00=* ]] || number=${argument#n00=}
+  done
+  state=OPEN
+  [[ ! -e "${GH_MERGED_DIR:?}/$number" ]] || state=MERGED
+  case "$number" in
+    1) oid=$(git rev-parse refs/heads/feature/a) ;;
+    2) oid=$(git rev-parse refs/heads/feature/b) ;;
+    *) oid=$(git rev-parse refs/heads/feature/c) ;;
+  esac
+  printf 'HTTP/2.0 200 OK\r\nDate: Thu, 15 Oct 2026 14:14:10 GMT\r\n\r\n'
+  printf 'pr p00 num=%s state=%s mergeable=UNKNOWN mss=UNKNOWN review=- head=%s judged=%s headmatch=yes cross=false am=false checks=pass zero=- nchecks=1 ref=feature\n' \
+    "$number" "$state" "$oid" "$oid"
   exit 0
 fi
 printf 'unexpected gh call: %s\n' "$*" >&2
@@ -1144,8 +1175,57 @@ _assert_eq "dotfiles-style stack landing runs no stack tool" "" \
 _assert_eq "dotfiles-style stack landing leaves the checkout on its branch" \
   refs/heads/feature/b "$(git --git-dir="$dotfiles_gitdir" symbolic-ref HEAD)"
 
-# The orchestrator runs snapshot copies of git pr-land, pr-restack, and
-# pr-stack; every library those copies source must be in the snapshot.
+# Each landing records its merge for pr-watch through the snapshot's own copy
+# of git pr-watch. This runs the real git pr-land and git pr-watch from the
+# stack's snapshot, with the discovery and restack stubs in their place.
+publish_root=$(_tmpdir)
+publish_repo=$(_tmpdir)
+publish_remote=$(_tmpdir)
+publish_log=$(_tmpdir)/stack.log
+publish_merged=$(_tmpdir)
+publish_xdg=$(_tmpdir)
+publish_bin=$(_tmpdir)
+mkdir -p "$publish_root/bin" "$publish_root/lib"
+# git pr-land resolves the base repository's fetch remote by its configured
+# URL, which real Git would rewrite to the local bare repository.
+cat >"$publish_bin/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-} ${2:-} ${3:-}" == "remote get-url --all" ]]; then
+  /usr/bin/git config --get-all "remote.${4:-}.url"
+  exit $?
+fi
+exec "$STACK_FAKE_GIT" "$@"
+EOF
+chmod +x "$publish_bin/git"
+cp "$ROOT/bin/git-pr-land-stack" "$ROOT/bin/git-pr-land" "$ROOT/bin/git-pr-watch" \
+  "$bin_dir/git-pr-stack" "$bin_dir/git-pr-restack" "$publish_root/bin/"
+cp "$ROOT"/lib/*.sh "$publish_root/lib/"
+_git_init "$publish_repo"
+git -C "$publish_repo" branch feature/a
+git -C "$publish_repo" branch feature/b
+git -C "$publish_repo" branch feature/c
+git init -q --bare "$publish_remote"
+_add_github_remote "$publish_repo" origin "$publish_remote"
+git -C "$publish_repo" push --quiet origin main feature/a feature/b feature/c
+publish_rc=0
+publish_output=$(cd "$publish_repo" && env -u GIT_TOOLS_TOOL_DIR \
+  PATH="$publish_bin:$bin_dir:$PATH" STACK_FAKE_GIT="$bin_dir/git" STACK_LOG="$publish_log" \
+  STACK_REWRITE_REPO="$publish_repo" GH_MERGED_DIR="$publish_merged" \
+  XDG_STATE_HOME="$publish_xdg" "$publish_root/bin/git-pr-land-stack" 1 \
+  --check-interval 1 2>&1) || publish_rc=$?
+_assert_eq "publish: the stack lands" 0 "$publish_rc"
+_assert_eq "publish: the real git pr-land merges every PR" "merge 1 merge 2 merge 3" \
+  "$(grep '^merge ' "$publish_log" | tr '\n' ' ' | sed 's/ $//')"
+for publish_number in 1 2 3; do
+  _assert_contains "publish: PR #$publish_number is recorded as merged" " merged " \
+    "$(cat "$publish_xdg/git-tools/pr-watch/done/example_repo_$publish_number" 2>/dev/null)"
+done
+_assert_not_contains "publish: no PR needs a follow-up" "next:" "$publish_output"
+
+# The orchestrator runs snapshot copies of git pr-land, pr-restack, pr-stack,
+# and the git pr-watch that git pr-land runs; every library those copies
+# source must be in the snapshot.
 # shellcheck disable=SC2016,SC2154 # sed matches literal source lines; the
 # eval'd function assigns _tool_tmp
 snapshot_out=$(
@@ -1154,14 +1234,15 @@ snapshot_out=$(
   unset GIT_TOOLS_TOOL_DIR
   eval "$(sed -n '/^_snapshot_tool_dir() {/,/^}/p' "$ROOT/bin/git-pr-land-stack")"
   _snapshot_tool_dir
-  for tool in git-pr-land git-pr-restack git-pr-stack; do
+  for tool in git-pr-land git-pr-restack git-pr-stack git-pr-watch; do
+    [[ -f "$_tool_tmp/bin/$tool" ]] || printf 'missing %s\n' "$tool"
     while IFS= read -r lib; do
       [[ -f "$_tool_tmp/lib/$lib" ]] || printf 'missing %s for %s\n' "$lib" "$tool"
     done < <(sed -n 's|^\. "\$_root/lib/\(.*\)"$|\1|p' "$_tool_tmp/bin/$tool")
   done
   rm -rf "$_tool_tmp"
 )
-_assert_eq "snapshot includes every library the landing tools source" "" "$snapshot_out"
+_assert_eq "snapshot includes every landing tool and the libraries they source" "" "$snapshot_out"
 
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2

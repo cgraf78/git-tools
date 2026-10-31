@@ -40,6 +40,20 @@ and post-merge synchronization fetch only the exact refs/heads/base source and
 merge its captured OID, without trusting named-remote refspecs, tracking refs,
 colliding tags, or importing unrelated tags.
 .PP
+Once it has verified the merge, and before any later check or the base sync,
+the command runs a one-shot
+.BR git-pr-watch (1)
+on the pull request, so pr-watch's state files (see STATE FILES there) record
+it as merged and a tool waiting on that pull request sees it is done. When that
+run does not report the merge, it is retried once; if it still does not, the
+command prints
+.BI "git pr-land: next: git pr-watch " number
+on standard error; running that
+.B git pr-watch
+later records the merge. Neither case changes the exit status. A dry run skips this step, and
+.B GIT_PR_WATCH_STATE=0
+turns the records off.
+.PP
 The local base is fast-forwarded in the worktree that has it checked out. Only
 the main worktree may switch to the base; a linked worktree never does, and
 advances only the base ref, by fast-forward, when nothing has it checked out.
@@ -118,4 +132,5 @@ not installed.
 .SH SEE ALSO
 .BR git-pr-ready (1),
 .BR git-pr-stack (1),
-.BR git-pr-land-stack (1)
+.BR git-pr-land-stack (1),
+.BR git-pr-watch (1)

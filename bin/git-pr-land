@@ -478,6 +478,13 @@ _cleanup_incomplete() {
 
 # Seconds before the second try at publishing the merge.
 _publish_retry_pause=2
+# Reads of an UNKNOWN merge state, and the seconds between them.
+# GIT_TOOLS_TEST_PR_LAND_MERGE_STATE_PAUSE (test-only) sets the pause.
+_merge_state_max_reads=7
+_merge_state_pause=5
+if [[ "${GIT_TOOLS_TEST_PR_LAND_MERGE_STATE_PAUSE:-}" =~ ^[0-9]+$ ]]; then
+  _merge_state_pause=$GIT_TOOLS_TEST_PR_LAND_MERGE_STATE_PAUSE
+fi
 
 # @brief Record the merge for watchers with a one-shot `git pr-watch`.
 # pr-watch stays the only writer of its state files, and its one-shot run
@@ -532,13 +539,33 @@ esac
 _view=$(gt_pr_view_tsv "$_target") || gt_die "could not read pull request"
 IFS=$'\t' read -r _number _state _draft _merge_state _head _head_oid _base \
   _head_repo _cross_repo _url _title <<<"$_view"
+# A stack landing passes the topology it discovered and restacks its own pull
+# requests, so it gets no update-branch advice.
+_from_stack=0
 if [[ -n "$_expected_topology" ]]; then
+  _from_stack=1
   gt_pr_record_matches_topology "$_view" "$_expected_topology" ||
     gt_die "PR #$_number topology changed since stack discovery"
 else
   _expected_topology=$(gt_pr_record_topology_tsv "$_view") ||
     gt_die "could not snapshot PR #$_number topology"
 fi
+
+# GitHub computes mergeability lazily and reports UNKNOWN for a while after
+# the base moves (a sibling pull request just landed, say), so re-read before
+# judging it. Merged and closed pull requests also read UNKNOWN, and are
+# refused below without waiting.
+_merge_state_reads=1
+while [[ "$_state" == OPEN && "$_merge_state" == UNKNOWN ]] &&
+  ! gt_bool "$_draft" && ((_merge_state_reads < _merge_state_max_reads)); do
+  sleep "$_merge_state_pause"
+  _view=$(gt_pr_view_tsv "$_url") || gt_die "could not read pull request"
+  IFS=$'\t' read -r _number _state _draft _merge_state _head _head_oid _base \
+    _head_repo _cross_repo _url _title <<<"$_view"
+  gt_pr_record_matches_topology "$_view" "$_expected_topology" ||
+    gt_die "PR #$_number topology changed while its merge state settled"
+  _merge_state_reads=$((_merge_state_reads + 1))
+done
 
 _target_repo_status=0
 gt_validate_pr_url_repository "$_url" || _target_repo_status=$?
@@ -556,6 +583,10 @@ if [[ "$_state" != "OPEN" ]]; then
   gt_die "PR #$_number is not open"
 elif gt_bool "$_draft"; then
   gt_die "PR #$_number is a draft"
+elif [[ "$_merge_state" == BEHIND && "$_from_stack" == 0 ]]; then
+  gt_say "next: gh pr update-branch $_number -R $GT_CURRENT_REPO_IDENTITY"
+  gt_say "next: git pr-watch --wait $_number"
+  gt_die "PR #$_number merge state is BEHIND: it is behind its base; update it, watch its checks to green, then land it again"
 elif [[ "$_merge_state" != "CLEAN" ]]; then
   gt_die "PR #$_number merge state is $_merge_state"
 elif [[ "$_checks_state" != "pass" ]]; then

@@ -378,6 +378,10 @@ git pr-land 123 --keep-branch
 
 The default merge method is `squash`. The command refuses draft PRs, merge
 conflicts, non-passing checks, and local base branches that cannot fast-forward.
+Right after a sibling PR lands, GitHub reports the merge state as `UNKNOWN` for
+a while, so the command reads it again for up to 30 seconds. A PR that is behind
+its base is refused with `next:` lines naming the `gh pr update-branch` command
+and the `git pr-watch --wait` run to follow before landing again.
 URL targets are repository-qualified before PR lookup, so a same-number PR URL
 from another repository cannot redirect the merge. Numeric and branch targets,
 checks, merge, and post-merge verification are also pinned to the checkout

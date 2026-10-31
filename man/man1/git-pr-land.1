@@ -27,6 +27,23 @@ Numeric and branch targets, checks, merge, and post-merge verification are
 pinned to the checkout repository and host regardless of ambient GH_REPO or
 GH_HOST values.
 .PP
+GitHub computes a pull request's merge state lazily and reports
+.B UNKNOWN
+for a while after its base moves, such as right after a sibling pull request
+lands; the command reads it again, up to seven reads five seconds apart,
+before judging it. A pull request
+.B BEHIND
+its base is refused with two
+.B next:
+lines on standard error: the
+.B gh pr update\-branch
+command that brings it up to date, and the
+.B git pr\-watch \-\-wait
+run that follows its checks to green before landing it again. A stack landing
+by
+.BR git\-pr\-land\-stack (1)
+restacks its own pull requests and gets a plain refusal instead.
+.PP
 The requested pull request number, returned structured number, and canonical URL
 must agree before mutation. Draft and cross-repository fields, head repository,
 and head/base refs must also be internally consistent. Post-merge verification

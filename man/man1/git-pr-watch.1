@@ -23,10 +23,63 @@ per query. When GitHub times out a query, it is split in half and retried.
 .PP
 When the token may read the pull requests but not their checks (for example,
 a fine-grained personal access token on a private repository, which GitHub
-does not currently let you grant read access to checks), a note goes to standard error and the pull
-requests are read again without their checks. Merged and closed pull requests
-are then reported as usual; an open one cannot be judged and stalls with
-reason checks-unreadable.
+does not currently let you grant read access to checks), a note goes to
+standard error, the pull requests are read again without their checks, and
+the checks of each open pull request are read through the Actions API
+instead: its head commit's workflow runs, the jobs of each run's latest
+attempt (for a finished run, of the attempt that finished), and the commit's
+statuses. That needs Actions and commit status read access, and
+.BR jq (1).
+Those checks are judged as described below, with these limits:
+.IP \(bu 2
+Check runs created by apps other than GitHub Actions are not visible, so
+passing visible checks count as green only when GitHub's merge state, which
+counts every check, is
+.B CLEAN
+(or
+.BR HAS_HOOKS ).
+Under
+.B UNSTABLE
+(a check it still counts is failing or running),
+.BR BEHIND ,
+.BR DRAFT ,
+or
+.B UNKNOWN
+the pull request is pending with reason
+.BR checks-partial .
+Under
+.B BLOCKED
+with a review pending or changes requested, which a failing check would not
+change, it stalls with that reason at once unless auto-merge is enabled. The
+stall's
+.B action:
+line names the cause from the merge state: the required review (or the
+requested changes), a draft, a base the pull request is behind, or checks
+this token cannot see.
+.IP \(bu 2
+Whether a check is required is not known;
+.B check
+lines say
+.BR required=no .
+.IP \(bu 2
+Each open pull request takes one REST call for its runs, one per run for the
+jobs, and one for the statuses, each listing at most 100, on every check. More
+than 50 runs, or more than 100 jobs and statuses together, stall as
+.BR too-many-checks .
+A waiting run reads the jobs of a finished run once per run attempt, keeping
+them in a private temporary directory it removes on exit. A long watch of many
+pull requests can still reach GitHub's REST rate limit, which is waited out.
+.IP \(bu 2
+A rate limit or a failed call is handled like any other GitHub read, and ends
+that check's REST calls.
+.PP
+When the token may not read the Actions runs or commit statuses either, or
+.B jq
+is not installed, merged and closed pull requests are still reported as
+usual, a merge conflict still needs action, and every other open pull request
+stalls with reason
+.B checks-unreadable
+for the rest of the run.
 .PP
 A pull request is judged on its current head commit, and only that commit's
 checks count:
@@ -88,7 +141,11 @@ stalls as
 .BR blocked ;
 a pull request that auto-merge should have merged but has not after ten
 minutes stalls as
-.BR merge-pending .
+.BR merge-pending ;
+checks read through the Actions API that passed while the merge state does
+not show the others did, five minutes after the watch started (or after the
+head last changed), stall as
+.BR checks-partial .
 Once auto-merge has been seen enabled, a second check that finds it off while
 the pull request is open needs action
 .RB ( auto-merge-off ).
@@ -153,11 +210,13 @@ failed, cancelled, conflict, behind, closed, auto-merge-off
 .TP
 .B pending
 checks-running, failure-confirming, push-grace, head-settling,
-mergeable-unknown, merge-waiting, no-checks-grace, confirming, unreadable
+mergeable-unknown, merge-waiting, no-checks-grace, confirming, unreadable,
+checks-partial
 .TP
 .B stall
 approval-required, too-many-checks, review-required, changes-requested,
-no-checks, head-mismatch, blocked, merge-pending, checks-unreadable
+no-checks, head-mismatch, blocked, merge-pending, checks-unreadable,
+checks-partial
 .PP
 Error reasons in the
 .B result:

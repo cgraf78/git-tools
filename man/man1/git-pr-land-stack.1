@@ -30,6 +30,11 @@ current GitHub repository before landing begins.
 Repository-qualified pull request URLs are retained across discovery, landing,
 restacking, and post-restack readiness polling.
 .PP
+When GitHub refuses the token the pull requests' checks, they are read through
+the Actions API, as
+.BR git-pr-land (1)
+describes.
+.PP
 Every handoff revalidates the live pull request number, head, head OID, base,
 head repository, cross-repository state, and canonical URL before the next
 mutation. A child restack uses the parent's original head OID as its immutable

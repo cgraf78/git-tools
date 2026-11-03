@@ -144,6 +144,14 @@ maintainer's approval, is reported as such. Right after a push, while GitHub
 still shows the previous head, the pull request is pending. With auto-merge
 enabled, done means merged, and falling behind the base needs action.
 
+When the token cannot read checks (a fine-grained token on a private
+repository, say), `git pr-watch` reads them through the Actions API instead,
+which needs `jq` and Actions read access. Check runs from other apps are then
+invisible: passing Actions checks count as green only under a `CLEAN` merge
+state, and report `checks-partial` otherwise. Without `jq` or Actions access,
+open pull requests stall as `checks-unreadable`; `git-pr-watch(1)` lists the
+limits.
+
 Output is one `pr=<n> state=<done|action|pending|stall> reason=<reason>
 head=<oid>` line per pull request, then details for pull requests that need
 action (failing checks and a command for each failed job's log), and a final
@@ -381,7 +389,9 @@ conflicts, non-passing checks, and local base branches that cannot fast-forward.
 Right after a sibling PR lands, GitHub reports the merge state as `UNKNOWN` for
 a while, so the command reads it again for up to 30 seconds. A PR that is behind
 its base is refused with `next:` lines naming the `gh pr update-branch` command
-and the `git pr-watch --wait` run to follow before landing again.
+and the `git pr-watch --wait` run to follow before landing again. When the token
+cannot read the PR's checks, they are read through the Actions API as in
+`git pr-watch`; a failed read refuses the landing.
 URL targets are repository-qualified before PR lookup, so a same-number PR URL
 from another repository cannot redirect the merge. Numeric and branch targets,
 checks, merge, and post-merge verification are also pinned to the checkout

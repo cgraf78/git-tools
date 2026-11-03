@@ -19,6 +19,10 @@ GT_PR_CALL_TIMEOUT=0
 # 0 leaves the head commit and its checks out of snapshot queries, for a token
 # that may read the repository's pull requests but not its checks.
 GT_PR_SNAPSHOT_CHECKS=1
+# A private directory where gt_pr_actions_commit keeps the jobs of finished
+# workflow runs, so a caller that reads the same commit again skips them;
+# empty turns the cache off. The caller creates it and removes it on exit.
+GT_PR_ACTIONS_CACHE=""
 
 # @brief Run gh with color and debug output forced off.
 # Forced color (CLICOLOR_FORCE, GH_FORCE_TTY) wraps `gh api -i` header names in
@@ -606,3 +610,191 @@ GT_PR_BRANCH_JQ='
    else ($own[0].number // "") end)
 | tostring
 '
+
+# --- checks through the Actions API ------------------------------------------
+#
+# A token that may not read a repository's checks (a fine-grained personal
+# access token on a private repository, which GitHub gives no checks
+# permission) may still read its Actions runs and commit statuses. These
+# helpers rebuild, from those REST reads, the head commit the snapshot query
+# would have returned, so GT_PR_CHECKS_JQ judges it unchanged. They need a
+# standalone jq: gh applies --jq to one response at a time, and the commit is
+# assembled from several.
+#
+# Known limits: check runs created by apps other than GitHub Actions are not
+# visible this way, and whether a check is required is not known (every one
+# reads as not required).
+
+# REST projections, applied by gh to each successful response. They keep only
+# the fields the mapping below reads, so no commit message, author, or other
+# payload ever reaches the shell.
+# shellcheck disable=SC2016 # jq programs, not shell expansions.
+_GT_PR_ACTIONS_RUNS_JQ='{total_count, workflow_runs: [.workflow_runs[]? | {id, run_attempt, event, path, status, conclusion, check_suite_id, workflow_id}]} | tojson'
+# shellcheck disable=SC2016
+_GT_PR_ACTIONS_JOBS_JQ='{total_count, jobs: [.jobs[]? | {id, name, status, conclusion, completed_at}]} | tojson'
+# shellcheck disable=SC2016
+_GT_PR_ACTIONS_STATUS_JQ='{total_count, statuses: [.statuses[]? | {id, context, state, created_at}]} | tojson'
+
+# The mapping from REST reads to one snapshot head commit. Input: the runs
+# list, the combined status, then one jobs list per run in the runs list's
+# order (slurped). REST status and conclusion values are the lowercase forms
+# of the GraphQL enums. Every check reads as not required.
+#
+# - One check suite per workflow run: check_suite_id is the suite id, and stays
+#   the same when a run is re-run. Its run count is the jobs list's total, so
+#   a queued run with no jobs yet is still a zero-run suite.
+# - One CheckRun per job of the run's latest attempt (filter=latest, as the
+#   GraphQL rollup shows a re-run): a job id is its check run id.
+# - One StatusContext per entry of the combined status's list, which GitHub
+#   already keeps to the newest per context. The combined state is never
+#   read: it is "pending" when there are no statuses at all.
+# - Totals feed the classifier's too-many rule, so a list cut short by its
+#   page size is never judged as complete. More than 50 runs is too many
+#   whatever the jobs are, so their jobs are not read and no suite is listed.
+# shellcheck disable=SC2016,SC2034 # jq variables; consumed by callers.
+GT_PR_ACTIONS_JQ='
+def up: if type == "string" then ascii_upcase else null end;
+.[0] as $runs | .[1] as $status | .[2:] as $jobs
+| ($runs.total_count // 0) as $nruns
+| (if $nruns > 50 then []
+   else [($runs.workflow_runs // []) as $r | range(0; $r | length)
+     | {r: $r[.], j: ($jobs[.] // {total_count: 0, jobs: []})}] end) as $pairs
+| [($status.statuses // [])[] | objects] as $statuses
+| {oid: $sha,
+   statusCheckRollup: {contexts: {
+     totalCount: (([$pairs[].j.total_count // 0] | add // 0) + ($status.total_count // 0)),
+     nodes: ([$pairs[] | .r as $r | (.j.jobs // [])[] | {
+         __typename: "CheckRun", databaseId: .id, name: .name,
+         status: (.status | up), conclusion: (.conclusion | up),
+         completedAt: .completed_at, isRequired: false,
+         checkSuite: {databaseId: $r.check_suite_id, status: ($r.status | up),
+           conclusion: ($r.conclusion | up),
+           app: {databaseId: null, slug: "github-actions"},
+           workflowRun: {event: $r.event, file: {path: $r.path},
+             workflow: {databaseId: $r.workflow_id}}}}]
+       + [$statuses[] | {__typename: "StatusContext", context: .context,
+           state: (.state | up), createdAt: .created_at, isRequired: false}])}},
+   checkSuites: {totalCount: $nruns, nodes: [$pairs[] | .r as $r | {
+     databaseId: $r.check_suite_id, status: ($r.status | up),
+     conclusion: ($r.conclusion | up), app: {slug: "github-actions"},
+     checkRuns: {totalCount: (.j.total_count // 0)},
+     workflowRun: {event: $r.event, file: {path: $r.path}}}]}}
+'
+
+# @brief Read one REST endpoint of the current repository.
+# @param $1 Path under repos/<owner>/<name>/, with its query string.
+# @param $2 jq projection gh applies to a successful response.
+# Classifies the response into the GT_PR_RESPONSE_* globals and succeeds only
+# on `ok`. Pinned to the verified checkout identity like every snapshot call.
+_gt_pr_rest_read() {
+  GT_PR_GH_ARGV=(api "repos/${GT_CURRENT_REPO_SPEC#*/}/$1" -i
+    --hostname "$GT_CURRENT_REPO_HOST" --jq "$2")
+  gt_pr_snapshot_call || return 1
+  [[ "$GT_PR_RESPONSE_CLASS" == ok ]]
+}
+
+# @brief Print "<alias> <head commit>" for each open pull request in a
+# checks-free snapshot response (read with the `tojson` projection), in alias
+# order.
+gt_pr_actions_heads() {
+  local heads alias sha
+
+  heads=$(printf '%s\n' "$1" | jq -r '.data.repository | to_entries
+    | sort_by(.key)[] | select(.value != null and .value.state == "OPEN")
+    | "\(.key) \(.value.headRefOid)"') || return 1
+  while read -r alias sha; do
+    [[ "$alias" =~ ^p[0-9]{2}$ && "$sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] ||
+      continue
+    printf '%s %s\n' "$alias" "$sha"
+  done <<<"$heads"
+}
+
+# @brief Build the snapshot head commit for one commit from the Actions API.
+# @param $1 Head commit SHA.
+# Sets GT_PR_ACTIONS_COMMIT (compact JSON). Reads the runs list first, then
+# each run's jobs, then the statuses, so a run that finishes meanwhile shows
+# an older, unfinished status: judged pending, never green early. A run that
+# had finished has its jobs read from that exact attempt, so a re-run that
+# starts meanwhile cannot pass off a newer attempt's jobs as its; they are
+# final, so with GT_PR_ACTIONS_CACHE set they are read once. An unfinished
+# run's jobs are its latest attempt's, read every time. On failure
+# returns 1 with GT_PR_RESPONSE_CLASS naming the failed read's class (see
+# gt_pr_classify_response); `error` also covers a response this cannot map.
+# shellcheck disable=SC2034 # GT_PR_ACTIONS_COMMIT is consumed by callers.
+gt_pr_actions_commit() {
+  local sha="$1" runs status ids id attempt state cache body endpoint jobs=""
+
+  GT_PR_ACTIONS_COMMIT=""
+  _gt_pr_rest_read "actions/runs?head_sha=$sha&per_page=100" \
+    "$_GT_PR_ACTIONS_RUNS_JQ" || return 1
+  runs=$GT_PR_RESPONSE_BODY
+  if ! ids=$(printf '%s\n' "$runs" | jq -r 'if (.total_count // 0) > 50 then empty
+    else .workflow_runs[] | "\(.id) \(.run_attempt // 0) \(.status)" end' 2>/dev/null); then
+    _gt_pr_actions_unmapped
+    return 1
+  fi
+  while read -r id attempt state; do
+    [[ -n "$id" ]] || continue
+    if [[ ! "$id" =~ ^[1-9][0-9]{0,18}$ || ! "$attempt" =~ ^[0-9]{1,9}$ ]]; then
+      _gt_pr_actions_unmapped
+      return 1
+    fi
+    cache=""
+    endpoint="actions/runs/$id/jobs?filter=latest&per_page=100"
+    if [[ "$state" == completed && "$attempt" != 0 ]]; then
+      endpoint="actions/runs/$id/attempts/$attempt/jobs?per_page=100"
+      if [[ -n "$GT_PR_ACTIONS_CACHE" ]]; then
+        cache=$GT_PR_ACTIONS_CACHE/jobs-$id-$attempt
+        if [[ -f "$cache" ]] && IFS= read -r body <"$cache"; then
+          jobs+=$body$'\n'
+          continue
+        fi
+      fi
+    fi
+    _gt_pr_rest_read "$endpoint" "$_GT_PR_ACTIONS_JOBS_JQ" || return 1
+    jobs+=$GT_PR_RESPONSE_BODY$'\n'
+    # Best-effort: a write that fails only costs a read next time.
+    [[ -z "$cache" || "$GT_PR_RESPONSE_BODY" == *$'\n'* ]] ||
+      printf '%s\n' "$GT_PR_RESPONSE_BODY" 2>/dev/null >"$cache" || true
+  done <<<"$ids"
+  _gt_pr_rest_read "commits/$sha/status?per_page=100" \
+    "$_GT_PR_ACTIONS_STATUS_JQ" || return 1
+  status=$GT_PR_RESPONSE_BODY
+  if ! GT_PR_ACTIONS_COMMIT=$(printf '%s\n%s\n%s' "$runs" "$status" "$jobs" |
+    jq -cs --arg sha "$sha" "$GT_PR_ACTIONS_JQ" 2>/dev/null); then
+    GT_PR_ACTIONS_COMMIT=""
+    _gt_pr_actions_unmapped
+    return 1
+  fi
+}
+
+_gt_pr_actions_unmapped() {
+  GT_PR_RESPONSE_CLASS=error
+  GT_PR_RESPONSE_MESSAGE="unexpected Actions API response"
+}
+
+# @brief Classify a checks-free snapshot response with Actions-built commits.
+# @param $1 Snapshot response (read with the `tojson` projection).
+# @param $@ Pairs of alias and GT_PR_ACTIONS_COMMIT, one per open pull request.
+# Prints GT_PR_CHECKS_JQ's records, as gt_pr_snapshot would have.
+gt_pr_actions_classify() {
+  local response="$1" spliced
+  shift
+
+  spliced=$(
+    {
+      printf '%s\n' "$response"
+      while (($# >= 2)); do
+        if [[ "$1" =~ ^p[0-9]{2}$ ]]; then
+          printf '{"alias":"%s","commit":%s}\n' "$1" "$2"
+        fi
+        shift 2
+      done
+    } | jq -cs '.[0] as $r
+      | (reduce .[1:][] as $e ({}; .[$e.alias] = $e.commit)) as $c
+      | $r | .data.repository |= with_entries(
+          if .value != null and $c[.key] != null
+          then .value.commits = {nodes: [{commit: $c[.key]}]} else . end)'
+  ) || return 1
+  printf '%s\n' "$spliced" | jq -r "$GT_PR_CHECKS_JQ"
+}

@@ -314,6 +314,103 @@ if [[ "$1 $2" == "pr view" ]]; then
   exit 0
 fi
 
+# GH_CHECKS_CASE: this token may not read the pull request's checks, so
+# they are read through the Actions API, where they pass (actions-pass),
+# fail (actions-fail), or the read is refused (actions-forbidden) or
+# rate-limited (actions-rate-limited), or hangs (actions-hang, writing its
+# pid to GH_HANG_PID); actions-none has no runs and no statuses.
+# checks-error is a different `gh pr checks` failure while GitHub still
+# serves the checks. GH_ACTIONS_MSS sets the merge state GraphQL reports;
+# GH_FORBIDDEN_BARE=1 leaves the pull request fields out of the refusal.
+# GH_GRAPHQL_LOG gets one line per GraphQL query: checks or no-checks.
+if [[ "$1 $2" == "pr checks" && -n "${GH_CHECKS_CASE:-}" ]]; then
+  if [[ "$GH_CHECKS_CASE" == checks-error ]]; then
+    printf 'GraphQL: Something went wrong\n' >&2
+  else
+    printf 'GraphQL: Resource not accessible by personal access token (repository.pullRequest.commits.nodes.0.commit.statusCheckRollup)\n' >&2
+  fi
+  exit 1
+fi
+
+if [[ "$1 $2" == "api graphql" && -n "${GH_CHECKS_CASE:-}" &&
+  "$GH_CHECKS_CASE" != checks-error ]]; then
+  query=""
+  jq_program=""
+  number=""
+  previous=""
+  for argument in "$@"; do
+    [[ "$previous" != --jq ]] || jq_program=$argument
+    case "$argument" in
+      query=*) query=${argument#query=} ;;
+      n00=*) number=${argument#n00=} ;;
+    esac
+    previous=$argument
+  done
+  printf 'HTTP/2.0 200 OK\r\nDate: Thu, 15 Oct 2026 14:14:10 GMT\r\n\r\n'
+  state=OPEN
+  [[ ! -f "$state_file" ]] || state=MERGED
+  fields=$(printf '"number":%s,"url":"https://github.test/example/repo/pull/%s","state":"%s","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"%s","reviewDecision":null,"baseRefName":"main","headRefName":"feature","headRefOid":"%s","isCrossRepository":false,"autoMergeRequest":null' \
+    "$number" "$number" "$state" "${GH_ACTIONS_MSS:-CLEAN}" "$GH_PR_HEAD_OID")
+  if [[ "$query" == *statusCheckRollup* ]]; then
+    printf 'checks\n' >>"${GH_GRAPHQL_LOG:-/dev/null}"
+    [[ "${GH_FORBIDDEN_BARE:-0}" != 1 ]] || fields="\"number\":$number"
+    printf '{"data":{"repository":{"p00":{%s,"commits":null}}},"errors":[{"type":"FORBIDDEN","path":["repository","p00","commits","nodes",0,"commit","statusCheckRollup"],"message":"Resource not accessible by personal access token"}]}\n' "$fields"
+    exit 1
+  fi
+  printf 'no-checks\n' >>"${GH_GRAPHQL_LOG:-/dev/null}"
+  printf '{"data":{"repository":{"p00":{%s}}}}\n' "$fields" | jq -r "$jq_program"
+  exit 0
+fi
+
+# Actions API reads, with hand-written payloads: one run with one job, no
+# statuses.
+if [[ "$1" == api && "${2:-}" == repos/* ]]; then
+  jq_program=""
+  previous=""
+  for argument in "$@"; do
+    [[ "$previous" != --jq ]] || jq_program=$argument
+    previous=$argument
+  done
+  printf '%s\n' "${2#repos/example/repo/}" >>"${GH_REST_LOG:-/dev/null}"
+  conclusion=success
+  [[ "${GH_CHECKS_CASE:-}" != actions-fail ]] || conclusion=failure
+  case "${GH_CHECKS_CASE:-}:$2" in
+    actions-hang:*/actions/runs\?*)
+      printf '%s\n' "$$" >"${GH_HANG_PID:?}"
+      exec sleep 30
+      ;;
+    actions-forbidden:*/actions/runs\?*)
+      printf 'HTTP/2.0 403 Forbidden\r\nDate: Thu, 15 Oct 2026 14:14:10 GMT\r\n\r\n'
+      printf '{"message":"Resource not accessible by personal access token"}\n'
+      exit 1
+      ;;
+    actions-rate-limited:*/actions/runs\?*)
+      printf 'HTTP/2.0 403 Forbidden\r\nDate: Thu, 15 Oct 2026 14:14:10 GMT\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: 1792073710\r\n\r\n'
+      printf '{"message":"API rate limit exceeded"}\n'
+      exit 1
+      ;;
+    actions-none:*/actions/runs\?*)
+      body='{"total_count":0,"workflow_runs":[]}'
+      ;;
+    *:*/actions/runs\?*)
+      body='{"total_count":1,"workflow_runs":[{"id":300,"run_attempt":1,"name":"Test","event":"pull_request","path":".github/workflows/test.yml","status":"completed","conclusion":"'$conclusion'","check_suite_id":1,"workflow_id":7,"display_title":"Made-up title"}]}'
+      ;;
+    *:*/actions/runs/300/attempts/1/jobs\?*)
+      body='{"total_count":1,"jobs":[{"id":11,"run_id":300,"name":"build","status":"completed","conclusion":"'$conclusion'","completed_at":"2026-10-15T14:04:10Z"}]}'
+      ;;
+    *:*/status\?*)
+      body='{"state":"pending","total_count":0,"statuses":[]}'
+      ;;
+    *)
+      printf 'unexpected REST call: %s\n' "$2" >&2
+      exit 99
+      ;;
+  esac
+  printf 'HTTP/2.0 200 OK\r\nDate: Thu, 15 Oct 2026 14:14:10 GMT\r\n\r\n'
+  printf '%s\n' "$body" | jq -r "$jq_program"
+  exit 0
+fi
+
 if [[ "$1 $2" == "pr checks" ]]; then
   case "${GH_PR_CASE:-ready}" in
     pending) printf 'pending\n'; exit 8 ;;
@@ -2582,6 +2679,157 @@ _assert_contains "dry run syncs the expected base" \
   "syncing release from origin" "$result"
 _assert_contains "dry run lands into the expected base" \
   "would land PR #4 (feature -> release)" "$result"
+
+# A token that may not read the pull request's checks: they are judged
+# through the Actions API instead. The fake needs jq for gh's projections.
+if command -v jq >/dev/null 2>&1; then
+  # @brief Land PR #4 of a fresh repository under a GH_CHECKS_CASE.
+  # Sets actions_rc, actions_out, and actions_log (the merge log).
+  _land_actions() {
+    local case_repo case_remote
+
+    case_repo=$(_tmpdir)
+    case_remote=$(_tmpdir)
+    actions_log=$(_tmpdir)/gh.log
+    _init_repo "$case_repo" "$case_remote"
+    actions_rc=0
+    actions_out=$(GH_CHECKS_CASE="$1" GH_LOG="$actions_log" \
+      GIT_PR_WATCH_STATE=0 PATH="$bin_dir:$PATH" \
+      _pr_land "$case_repo" 4 2>&1) || actions_rc=$?
+  }
+
+  _land_actions actions-pass
+  _assert_eq "actions: passing checks land" 0 "$actions_rc"
+  _assert_contains "actions: the Actions API read is announced" \
+    "checks unreadable with this token; reading them through the Actions API" "$actions_out"
+  _assert_contains "actions: the pull request is merged" "pr merge 4 --squash" \
+    "$(cat "$actions_log" 2>/dev/null)"
+  _assert_not_contains "actions: pr-watch records the merge through the same fallback" \
+    "next:" "$actions_out"
+
+  _land_actions actions-fail
+  _assert_eq "actions: failing checks refuse" 1 "$actions_rc"
+  _assert_contains "actions: failing checks are reported" "PR #4 checks are fail" "$actions_out"
+  _assert_eq "actions: failing checks merge nothing" "" "$(cat "$actions_log" 2>/dev/null)"
+
+  _land_actions actions-forbidden
+  _assert_eq "actions: a refused Actions read refuses" 1 "$actions_rc"
+  _assert_contains "actions: a refused Actions read says why" \
+    "could not read checks through the Actions API (error: Resource not accessible by personal access token)" "$actions_out"
+  _assert_contains "actions: a refused Actions read cannot read checks" \
+    "could not read pull request checks" "$actions_out"
+  _assert_eq "actions: a refused Actions read merges nothing" "" "$(cat "$actions_log" 2>/dev/null)"
+
+  _land_actions actions-rate-limited
+  _assert_eq "actions: a rate-limited Actions read refuses" 1 "$actions_rc"
+  _assert_contains "actions: a rate-limited Actions read says why" \
+    "could not read checks through the Actions API (rate-limited)" "$actions_out"
+  _assert_eq "actions: a rate-limited Actions read merges nothing" "" "$(cat "$actions_log" 2>/dev/null)"
+
+  _land_actions checks-error
+  _assert_eq "actions: another checks failure still refuses" 1 "$actions_rc"
+  _assert_contains "actions: another checks failure keeps gh's message" \
+    "GraphQL: Something went wrong" "$actions_out"
+  _assert_not_contains "actions: another checks failure reads no Actions API" \
+    "Actions API" "$actions_out"
+
+  # gt_pr_checks_status itself, as every caller sees it.
+  # Args: GH_CHECKS_CASE [GH_ACTIONS_MSS]. Sets status_out and status_rc.
+  status_repo=$(_tmpdir)
+  status_remote=$(_tmpdir)
+  _init_repo "$status_repo" "$status_remote"
+  status_graphql=$(_tmpdir)/graphql.log
+  _checks_status() {
+    : >"$status_graphql"
+    status_rc=0
+    status_out=$(cd "$status_repo" && GH_CHECKS_CASE="$1" GH_ACTIONS_MSS="${2:-CLEAN}" \
+      GH_GRAPHQL_LOG="$status_graphql" \
+      GH_LOG=/dev/null GH_PR_HEAD_OID=$(git rev-parse refs/remotes/origin/feature) \
+      PATH="$bin_dir:$PATH" bash -c '
+        set -euo pipefail
+        . "$1/lib/git-tools-pr.sh"
+        gt_pr_checks_status https://github.test/example/repo/pull/4' _ "$ROOT" 2>/dev/null) ||
+      status_rc=$?
+  }
+  _checks_status actions-pass
+  _assert_eq "actions: checks status passes" "0 pass" "$status_rc $status_out"
+  _assert_eq "actions: the refusal's own fields are reused" "checks" \
+    "$(tr '\n' ' ' <"$status_graphql" | sed 's/ $//')"
+  GH_FORBIDDEN_BARE=1 _checks_status actions-pass
+  _assert_eq "actions: a refusal without the fields reads them again" \
+    "0 pass checks no-checks" "$status_rc $status_out $(tr '\n' ' ' <"$status_graphql" | sed 's/ $//')"
+  _checks_status actions-none
+  _assert_eq "actions: no runs and no statuses is none" "0 none" "$status_rc $status_out"
+  _checks_status actions-pass UNSTABLE
+  _assert_eq "actions: passing under UNSTABLE is pending" "0 pending" "$status_rc $status_out"
+  _checks_status actions-fail
+  _assert_eq "actions: checks status fails" "0 fail" "$status_rc $status_out"
+  _checks_status actions-forbidden
+  _assert_eq "actions: a refused Actions read is an error, never a state" "1 " "$status_rc $status_out"
+  _checks_status actions-rate-limited
+  _assert_eq "actions: a rate limit is an error, never a state" "1 " "$status_rc $status_out"
+
+  # A signal mid-read still removes the read's temporary directory. The
+  # caller runs in its own process group, which gets the signal as from a
+  # terminal.
+  status_tmp=$(_tmpdir)
+  hang_pid=$(_tmpdir)/hang.pid
+  (
+    set -m
+    cd "$status_repo" && TMPDIR="$status_tmp" GH_CHECKS_CASE=actions-hang \
+      GH_HANG_PID="$hang_pid" GH_LOG=/dev/null \
+      GH_PR_HEAD_OID=$(git rev-parse refs/remotes/origin/feature) \
+      PATH="$bin_dir:$PATH" bash -c '
+        . "$1/lib/git-tools-pr.sh"
+        gt_pr_checks_status https://github.test/example/repo/pull/4' _ "$ROOT" \
+      >/dev/null 2>&1 &
+    caller=$!
+    for _ in $(seq 1 100); do
+      [[ ! -s "$hang_pid" ]] || break
+      sleep 0.1
+    done
+    kill -TERM -- "-$caller" 2>/dev/null
+    wait "$caller" 2>/dev/null
+  )
+  for _ in $(seq 1 100); do
+    [[ -n "$(ls -A "$status_tmp")" ]] || break
+    sleep 0.1
+  done
+  _assert_eq "actions: the read was under way when the signal came" 1 \
+    "$([[ -s "$hang_pid" ]] && printf 1 || printf 0)"
+  _assert_eq "actions: a signal mid-read leaves no temporary directory" "" \
+    "$(ls -A "$status_tmp")"
+else
+  echo "ok - skipped: Actions API landing cases need jq"
+fi
+
+# Without jq, unreadable checks cannot be read through the Actions API: the
+# landing is refused, with a hint.
+nojq_path=""
+_old_ifs=$IFS
+IFS=:
+for _dir in $bin_dir:$PATH; do
+  if [[ -n "$_dir" && -x "$_dir/jq" ]]; then
+    _farm=$(_tmpdir)
+    find "$_dir" -mindepth 1 -maxdepth 1 ! -name jq \
+      -exec sh -c 'ln -s "$@" "$0" 2>/dev/null' "$_farm" {} + || true
+    _dir=$_farm
+  fi
+  nojq_path+=${nojq_path:+:}$_dir
+done
+IFS=$_old_ifs
+nojq_repo=$(_tmpdir)
+nojq_remote=$(_tmpdir)
+nojq_log=$(_tmpdir)/gh.log
+_init_repo "$nojq_repo" "$nojq_remote"
+nojq_rc=0
+nojq_out=$(GH_CHECKS_CASE=actions-pass GH_LOG="$nojq_log" PATH="$nojq_path" \
+  _pr_land "$nojq_repo" 4 2>&1) || nojq_rc=$?
+_assert_eq "no jq: unreadable checks refuse the landing" 1 "$nojq_rc"
+_assert_contains "no jq: the hint names jq" \
+  "checks unreadable with this token; install jq to read them through the Actions API" "$nojq_out"
+_assert_contains "no jq: the checks cannot be read" "could not read pull request checks" "$nojq_out"
+_assert_eq "no jq: nothing is merged" "" "$(cat "$nojq_log" 2>/dev/null)"
 
 if ((_failures > 0)); then
   printf '%s failure(s)\n' "$_failures" >&2

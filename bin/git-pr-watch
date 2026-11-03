@@ -117,6 +117,7 @@ _on_exit() {
   trap '' INT TERM HUP PIPE
   set +e
   [[ -z "${GT_PR_SNAPSHOT_TMP:-}" ]] || rm -rf -- "$GT_PR_SNAPSHOT_TMP"
+  [[ -z "${GT_PR_ACTIONS_CACHE:-}" ]] || rm -rf -- "$GT_PR_ACTIONS_CACHE"
   [[ "$_result_done" == 1 ]] || status=2
   [[ -z "$_state_dir" ]] || _state_finish "$status"
   [[ "$_result_done" != 1 ]] || return 0
@@ -141,6 +142,7 @@ _on_signal() {
   # shellcheck disable=SC2086 # one pid per word
   [[ -z "$pids" ]] || kill -TERM $pids 2>/dev/null || true
   [[ -z "${GT_PR_SNAPSHOT_TMP:-}" ]] || rm -rf -- "$GT_PR_SNAPSHOT_TMP"
+  [[ -z "${GT_PR_ACTIONS_CACHE:-}" ]] || rm -rf -- "$GT_PR_ACTIONS_CACHE"
   # The EXIT trap still runs after `exit` below and finishes the state files.
   _result_done=1
   printf 'result: %s reason=signal prs=%s\n' "$1" \
@@ -444,6 +446,7 @@ _reset_tick() {
   _pr_checks=()
   _pr_zero=()
   _pr_ref=()
+  _pr_actions=()
   _chk_pr=()
   _chk_class=()
   _chk_running=()
@@ -573,10 +576,14 @@ _store_records() {
 # Pull requests per query. It starts at the library's chunk size and only
 # shrinks: a size GitHub timed out on once is not tried again in this run.
 _chunk=$GT_PR_SNAPSHOT_CHUNK
-# Cleared once GitHub refuses this token the repository's checks; later
-# queries in the run then read pull request fields only, and _judge stalls
-# every pull request that is neither merged nor closed.
-_checks_readable=1
+# How this run reads checks. `readable` until GitHub refuses this token the
+# repository's checks; later queries then read pull request fields only, and
+# the checks come from the Actions API (`actions`, needs jq). Once that is
+# refused too, or without jq, they are `unreadable` for the rest of the run
+# and _judge stalls every pull request that is neither merged nor closed.
+_checks_mode=readable
+# Why the checks became unreadable, for the stall hint: jq or actions.
+_unreadable_cause=actions
 
 # @brief Set the per-call time limit for a waiting run.
 # GT_PR_CALL_TIMEOUT is read by gt_pr_snapshot_call in the shared library.
@@ -601,11 +608,55 @@ _set_call_timeout() {
   GT_PR_CALL_TIMEOUT=$left
 }
 
+# @brief Replace a checks-free chunk's response with classifier records whose
+# checks come from the Actions API.
+# Reads the open pull requests' head commits one at a time and stops at the
+# first read that fails, leaving its class in GT_PR_RESPONSE_CLASS: rate
+# limits and transient failures keep their usual handling, and any refusal
+# becomes `actions-unreadable`. A waiting run also stops (`out-of-time`) once
+# the deadline has passed and this check has had one call's time.
+_read_actions() {
+  local response=$GT_PR_RESPONSE_BODY date=$GT_PR_RESPONSE_DATE heads alias sha
+  local -a pairs=()
+
+  heads=$(gt_pr_actions_heads "$response") || {
+    GT_PR_RESPONSE_CLASS=actions-unreadable
+    GT_PR_RESPONSE_MESSAGE="unexpected pull request response"
+    return 0
+  }
+  while read -r alias sha; do
+    [[ -n "$alias" ]] || continue
+    if [[ "$_wait" == 1 ]] && (($(_now) >= _deadline && $(_now) - _check_now >= _call_timeout)); then
+      GT_PR_RESPONSE_CLASS=out-of-time
+      return 0
+    fi
+    _set_call_timeout
+    if ! gt_pr_actions_commit "$sha"; then
+      GT_PR_RESPONSE_MESSAGE=${GT_PR_RESPONSE_MESSAGE:-$GT_PR_RESPONSE_CLASS}
+      case "$GT_PR_RESPONSE_CLASS" in
+        rate-limited | transient) ;;
+        # A timeout says nothing about the chunk's size here.
+        timeout) GT_PR_RESPONSE_CLASS=transient ;;
+        *) GT_PR_RESPONSE_CLASS=actions-unreadable ;;
+      esac
+      return 0
+    fi
+    pairs+=("$alias" "$GT_PR_ACTIONS_COMMIT")
+  done <<<"$heads"
+  GT_PR_RESPONSE_BODY=$(gt_pr_actions_classify "$response" ${pairs[@]+"${pairs[@]}"}) || {
+    GT_PR_RESPONSE_CLASS=actions-unreadable
+    GT_PR_RESPONSE_MESSAGE="could not classify checks read through the Actions API"
+    return 0
+  }
+  GT_PR_RESPONSE_CLASS=ok
+  GT_PR_RESPONSE_DATE=$date
+}
+
 # @brief Snapshot every target, halving a chunk whenever GitHub times out.
 # Stops at the first chunk that cannot be read and records why in
 # _snapshot_class; _read_upto marks how many targets were read before it.
 _snapshot_all() {
-  local count attempt=0 alias
+  local count attempt=0 alias number jq_program
   local -a slice=() missing=()
 
   while ((_read_upto < ${#_numbers[@]})); do
@@ -614,13 +665,29 @@ _snapshot_all() {
     slice=("${_numbers[@]:_read_upto:count}")
     _set_call_timeout
     # shellcheck disable=SC2034 # read by the library's query builder
-    GT_PR_SNAPSHOT_CHECKS=$_checks_readable
-    gt_pr_snapshot "$GT_PR_CHECKS_JQ" "${slice[@]}" ||
+    GT_PR_SNAPSHOT_CHECKS=1
+    jq_program=$GT_PR_CHECKS_JQ
+    if [[ "$_checks_mode" != readable ]]; then
+      # shellcheck disable=SC2034
+      GT_PR_SNAPSHOT_CHECKS=0
+      # The Actions read splices the head commits into the response itself,
+      # so gh passes it through as one line of JSON.
+      [[ "$_checks_mode" != actions ]] || jq_program=tojson
+    fi
+    gt_pr_snapshot "$jq_program" "${slice[@]}" ||
       _fail environment "could not create a temporary file"
     _fail_on_class
+    # REST classes never reach _fail_on_class: a refusal there only makes the
+    # checks unreadable.
+    [[ "$GT_PR_RESPONSE_CLASS" != ok || "$_checks_mode" != actions ]] || _read_actions
     case "$GT_PR_RESPONSE_CLASS" in
       ok)
         _store_records "$GT_PR_RESPONSE_BODY" "${slice[@]}"
+        if [[ "$_checks_mode" == actions ]]; then
+          for number in "${slice[@]}"; do
+            if _index_of "$number"; then _pr_actions[_index]=1; fi
+          done
+        fi
         [[ -z "$GT_PR_RESPONSE_DATE" ]] || _server_now=$GT_PR_RESPONSE_DATE
         _read_upto=$((_read_upto + count))
         attempt=0
@@ -639,12 +706,40 @@ _snapshot_all() {
       checks-forbidden)
         # A query without checks cannot be refused its checks; failing here
         # keeps a misclassification from looping.
-        [[ "$_checks_readable" == 1 ]] ||
+        [[ "$_checks_mode" == readable ]] ||
           _fail graphql "GitHub refused the query: ${GT_PR_RESPONSE_MESSAGE:-no message}"
-        _checks_readable=0
-        printf '%s: checks unreadable with this token (%s); judging pull requests by state only\n' \
+        if command -v jq >/dev/null 2>&1; then
+          _checks_mode=actions
+          # A waiting run reads the same commits again on every check; the
+          # cache spares the jobs of finished runs. Without it, every read
+          # is fresh.
+          if [[ "$_wait" == 1 ]]; then
+            # shellcheck disable=SC2034 # read by the library
+            GT_PR_ACTIONS_CACHE=$(mktemp -d "${TMPDIR:-/tmp}/git-pr-watch-actions.XXXXXX" 2>/dev/null) ||
+              GT_PR_ACTIONS_CACHE=""
+          fi
+          printf '%s: checks unreadable with this token (%s); reading checks through the Actions API\n' \
+            "$gt_command" "${GT_PR_RESPONSE_MESSAGE:-no message}" >&2
+        else
+          _checks_mode=unreadable
+          _unreadable_cause=jq
+          printf '%s: checks unreadable with this token (%s); judging pull requests by state only (install jq to read checks through the Actions API)\n' \
+            "$gt_command" "${GT_PR_RESPONSE_MESSAGE:-no message}" >&2
+        fi
+        continue
+        ;;
+      actions-unreadable)
+        _checks_mode=unreadable
+        _unreadable_cause=actions
+        printf '%s: checks unreadable through the Actions API too (%s); judging pull requests by state only\n' \
           "$gt_command" "${GT_PR_RESPONSE_MESSAGE:-no message}" >&2
         continue
+        ;;
+      out-of-time)
+        # Retrying cannot help: this check has used its time.
+        _snapshot_class=transient
+        printf '%s: out of time reading checks through the Actions API\n' "$gt_command" >&2
+        return 0
         ;;
       rate-limited)
         _snapshot_class=rate-limited
@@ -844,8 +939,9 @@ _judge() {
       return
       ;;
   esac
-  # A checks-free read has no head commit to match.
-  if [[ "$_checks_readable" == 1 && "${_pr_headmatch[index]:-no}" != yes ]]; then
+  # A checks-free read has no head commit to match; one through the Actions
+  # API has the head it was read for.
+  if [[ "$_checks_mode" != unreadable && "${_pr_headmatch[index]:-no}" != yes ]]; then
     if (($(_elapsed "$index") >= _head_grace)); then
       _set "$index" stall head-mismatch
     else
@@ -863,7 +959,7 @@ _judge() {
   fi
   # A conflict is a pull request field, so it is still reported above; the
   # judgments below all need the checks.
-  if [[ "$_checks_readable" == 0 ]]; then
+  if [[ "$_checks_mode" == unreadable ]]; then
     _set "$index" stall checks-unreadable
     return
   fi
@@ -910,6 +1006,13 @@ _judge() {
     fi
     return
   fi
+  # The Actions API cannot see check runs from other apps, but GitHub's merge
+  # state counts them: UNSTABLE with every visible check passed means one of
+  # those is failing or still running.
+  if [[ "${_pr_actions[index]:-}" == 1 && "${_pr_mss[index]:-}" == UNSTABLE ]]; then
+    _partial "$index"
+    return
+  fi
   if [[ "${_pr_mergeable[index]:-}" != MERGEABLE ]]; then
     _set "$index" pending mergeable-unknown
     return
@@ -947,6 +1050,11 @@ _judge() {
           _set "$index" pending confirming
         fi
         return
+      elif [[ "$goal" == green && "${_pr_actions[index]:-}" == 1 ]]; then
+        # A pending review outranks a failing check in the merge state, so
+        # BLOCKED here does not show that the checks this token cannot see
+        # passed; nothing changes until someone acts.
+        _set "$index" stall checks-partial
       elif [[ "$goal" == green ]]; then
         _set "$index" "done" "$reason"
       else
@@ -962,9 +1070,31 @@ _judge() {
       fi
       ;;
     *)
+      # Only CLEAN (or HAS_HOOKS) shows that checks this token cannot see
+      # passed too; BEHIND, DRAFT, and UNKNOWN do not.
+      if [[ "${_pr_actions[index]:-}" == 1 ]]; then
+        case "${_pr_mss[index]:-}" in
+          CLEAN | HAS_HOOKS) ;;
+          *)
+            _partial "$index"
+            return
+            ;;
+        esac
+      fi
       _set "$index" "done" green
       ;;
   esac
+}
+
+# @brief Judge a pull request whose visible (Actions) checks passed while
+# GitHub's merge state does not show that the checks it cannot see did.
+# Not green; pending until the head has had time to settle, then a stall.
+_partial() {
+  if (($(_elapsed "$1") >= _head_grace)); then
+    _set "$1" stall checks-partial
+  else
+    _set "$1" pending checks-partial
+  fi
 }
 
 # @brief Judge every read target; targets past _read_upto were not read.
@@ -1003,6 +1133,9 @@ _progress() {
   done
 }
 
+# @brief Print what a stalled pull request is waiting for.
+# @param $1 Reason. @param $2 Its index, for reasons whose cause is in the
+# pull request's own fields.
 _stall_hint() {
   case "$1" in
     approval-required) printf 'a workflow is waiting for a maintainer to approve it' ;;
@@ -1013,7 +1146,28 @@ _stall_hint() {
     head-mismatch) printf "GitHub's checks are for a different commit than the pull request head" ;;
     blocked) printf 'merge is blocked with every check finished; a required check may never have reported' ;;
     merge-pending) printf 'auto-merge is enabled and the pull request is mergeable but has not merged' ;;
-    checks-unreadable) printf "this token cannot read the repository's checks; watch them another way, or grant check read access" ;;
+    checks-unreadable)
+      if [[ "$_unreadable_cause" == jq ]]; then
+        printf "this token cannot read the repository's checks; install jq to read them through the Actions API"
+      else
+        printf "this token cannot read the repository's checks, nor through the Actions API; grant it Actions read access"
+      fi
+      ;;
+    checks-partial) _partial_hint "$2" ;;
+  esac
+}
+
+# @brief Name what keeps checks this token cannot see from showing in the
+# merge state, from the pull request's merge state and review decision.
+_partial_hint() {
+  local tail="so its merge state cannot show whether checks this token cannot see passed"
+
+  case "${_pr_mss[$1]:-}:${_pr_review[$1]:-}" in
+    BLOCKED:REVIEW_REQUIRED) printf 'a review is required (review-required), %s' "$tail" ;;
+    BLOCKED:CHANGES_REQUESTED) printf 'a reviewer requested changes (changes-requested), %s' "$tail" ;;
+    DRAFT:*) printf 'the pull request is a draft, %s' "$tail" ;;
+    BEHIND:*) printf 'the pull request is behind its base, %s' "$tail" ;;
+    *) printf "some checks are not visible to this token: the Actions checks passed, but GitHub's merge state does not show that the others did" ;;
   esac
 }
 
@@ -1132,7 +1286,7 @@ _report() {
   for ((i = 0; i < ${#_numbers[@]}; i++)); do
     case "${_state[i]}" in
       action) _report_action "$i" ;;
-      stall) printf 'action: pr=%s %s\n' "${_numbers[$i]}" "$(_stall_hint "${_reason[i]}")" ;;
+      stall) printf 'action: pr=%s %s\n' "${_numbers[$i]}" "$(_stall_hint "${_reason[i]}" "$i")" ;;
     esac
   done
   if [[ "$exit" != 0 ]] && ((${#unfinished[@]} > 0)); then

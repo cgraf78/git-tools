@@ -23,6 +23,10 @@ _root=$(cd -P -- "$(dirname -- "$_script_path")/.." && pwd)
 . "$_root/lib/git-tools-pr.sh"
 # shellcheck disable=SC1091
 . "$_root/lib/git-tools-base.sh"
+# Loaded now, not on demand by gt_pr_checks_status during the readiness wait,
+# so a branch switch by a landing or restack cannot mix library versions.
+# shellcheck disable=SC1091
+. "$_root/lib/git-tools-pr-snapshot.sh"
 
 _tool_tmp=""
 _cleanup_tools() {

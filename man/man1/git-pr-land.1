@@ -27,6 +27,21 @@ Numeric and branch targets, checks, merge, and post-merge verification are
 pinned to the checkout repository and host regardless of ambient GH_REPO or
 GH_HOST values.
 .PP
+When GitHub refuses the token the pull request's checks (for example, a
+fine-grained personal access token on a private repository), they are read
+through the Actions API instead, as
+.BR git-pr-watch (1)
+describes, if
+.BR jq (1)
+is installed: they pass when every workflow job and commit status passed,
+fail when one failed (or there are too many to judge), and are pending while
+any is running or waiting.
+Check runs from apps other than GitHub Actions are not visible this way;
+the required
+.B CLEAN
+merge state still counts them. When that read fails too
+(refused, rate-limited, or unreachable), the pull request is not landed.
+.PP
 GitHub computes a pull request's merge state lazily and reports
 .B UNKNOWN
 for a while after its base moves, such as right after a sibling pull request

@@ -6,6 +6,8 @@ _gt_lib_dir=${BASH_SOURCE[0]%/*}
 [[ "$_gt_lib_dir" != "${BASH_SOURCE[0]}" ]] || _gt_lib_dir=.
 # shellcheck source=lib/git-tools-git.sh
 . "$_gt_lib_dir/git-tools-git.sh" || return 1
+# gt_pr_checks_status loads the snapshot library from here when it needs it.
+_gt_pr_lib_dir=$_gt_lib_dir
 unset _gt_lib_dir
 
 gt_command=${gt_command:-git-tools}
@@ -798,9 +800,12 @@ gt_find_pr_head_remote() {
   GT_PR_HEAD_REMOTE_URL=$match_url
 }
 
+# @brief Print a pull request's checks as none, fail, pending, or pass.
+# When this token may not read the checks, judges them through the Actions API
+# instead (see _gt_pr_checks_actions_status).
 gt_pr_checks_status() {
   local target="$1"
-  local output status
+  local output status fallback
   local -a args=(checks)
   # shellcheck disable=SC2016 # `$buckets` is jq state inside gh's --jq filter.
   local check_state_filter='[.[].bucket] as $buckets | if any($buckets[]; . != "pass" and . != "skipping" and . != "fail" and . != "cancel" and . != "pending") then error("unknown check bucket") elif ($buckets | length) == 0 then "none" elif any($buckets[]; . == "fail" or . == "cancel") then "fail" elif any($buckets[]; . == "pending") then "pending" else "pass" end'
@@ -828,11 +833,111 @@ gt_pr_checks_status() {
           return 0
           ;;
       esac
+      fallback=0
+      _gt_pr_checks_actions_status "$target" || fallback=$?
+      [[ "$fallback" != 0 ]] || return 0
       printf '%s\n' "$output" >&2
+      [[ "$fallback" != 1 ]] || return 1
       return "$status"
       ;;
   esac
 }
+
+# @brief Judge one pull request's checks through the Actions API when GitHub
+# refuses this token its checks.
+# Only the snapshot query's structured `checks-forbidden` class turns this
+# on, never gh's error text. Prints none, fail, pending, or pass and returns
+# 0. Returns 1 when the checks are forbidden but the Actions read failed (a
+# rate limit or a refusal included: never a guess), 2 when the checks are not
+# forbidden or that could not be told, so the caller keeps its own failure.
+#
+# The mapping is stateless: a failure is final at once, and anything still
+# running is pending. Check runs from other apps are invisible here, so `pass`
+# under an UNSTABLE merge state is reported as pending; callers that land
+# also require a CLEAN merge state, which counts every check.
+#
+# Runs in a subshell: the snapshot library, its temporary directory, and the
+# traps that remove that directory on exit and on signals stay out of the
+# caller.
+_gt_pr_checks_actions_status() (
+  target="$1"
+  trap '[[ -z "${GT_PR_SNAPSHOT_TMP:-}" ]] || rm -rf -- "$GT_PR_SNAPSHOT_TMP"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  case "$target" in
+    http://* | https://*)
+      gt_parse_pr_url "$target" || exit 2
+      number=$GT_PR_URL_NUMBER
+      ;;
+    *)
+      [[ "$target" =~ ^[1-9][0-9]{0,9}$ ]] || exit 2
+      number=$target
+      ;;
+  esac
+  gt_load_current_repo_identity >/dev/null 2>&1 || exit 2
+  if ! declare -F gt_pr_actions_commit >/dev/null; then
+    # shellcheck source=lib/git-tools-pr-snapshot.sh
+    . "$_gt_pr_lib_dir/git-tools-pr-snapshot.sh" || exit 2
+  fi
+  # shellcheck disable=SC2034 # read by the snapshot library
+  GT_PR_CALL_TIMEOUT=0
+  GT_PR_SNAPSHOT_CHECKS=1
+  gt_pr_snapshot tojson "$number" || exit 2
+  [[ "$GT_PR_RESPONSE_CLASS" == checks-forbidden ]] || exit 2
+  if ! command -v jq >/dev/null 2>&1; then
+    gt_say "checks unreadable with this token; install jq to read them through the Actions API"
+    exit 1
+  fi
+  gt_say "checks unreadable with this token; reading them through the Actions API"
+  # The refusal still carries the pull request's own fields; only when it
+  # lacks one this needs are they read again, without the checks.
+  response=$GT_PR_RESPONSE_BODY
+  if ! printf '%s\n' "$response" | jq -e '.data.repository.p00
+    | (.state | type == "string") and (.headRefOid | type == "string")
+      and (.mergeStateStatus | type == "string")' >/dev/null 2>&1; then
+    # shellcheck disable=SC2034 # read by the library's query builder
+    GT_PR_SNAPSHOT_CHECKS=0
+    gt_pr_snapshot tojson "$number" || exit 1
+    if [[ "$GT_PR_RESPONSE_CLASS" != ok ]]; then
+      gt_say "could not read pull request #$number ($GT_PR_RESPONSE_CLASS)"
+      exit 1
+    fi
+    response=$GT_PR_RESPONSE_BODY
+  fi
+  heads=$(gt_pr_actions_heads "$response") || exit 1
+  pairs=()
+  if [[ -n "$heads" ]]; then
+    read -r alias sha <<<"$heads"
+    if ! gt_pr_actions_commit "$sha"; then
+      gt_say "could not read checks through the Actions API ($GT_PR_RESPONSE_CLASS${GT_PR_RESPONSE_MESSAGE:+: $GT_PR_RESPONSE_MESSAGE})"
+      exit 1
+    fi
+    pairs=("$alias" "$GT_PR_ACTIONS_COMMIT")
+  fi
+  records=$(gt_pr_actions_classify "$response" ${pairs[@]+"${pairs[@]}"}) || exit 1
+  record=${records%%$'\n'*}
+  [[ "$record" == "pr p00 "* && " $record " == *" num=$number "* ]] || exit 1
+  checks="" zero="" mss=""
+  read -r -a tokens <<<"$record"
+  for token in "${tokens[@]}"; do
+    case "$token" in
+      checks=*) checks=${token#checks=} ;;
+      zero=*) zero=${token#zero=} ;;
+      mss=*) mss=${token#mss=} ;;
+    esac
+  done
+  case "$checks:$zero" in
+    fail-running:* | fail-completed:* | too-many:* | *:fail) state=fail ;;
+    pending:* | *:pending | *:approval) state=pending ;;
+    pass:-) state=pass ;;
+    none:-) state=none ;;
+    *) exit 1 ;;
+  esac
+  [[ "$state:$mss" != pass:UNSTABLE ]] || state=pending
+  printf '%s\n' "$state"
+)
 
 gt_checks_ready_state() {
   local state="$1"

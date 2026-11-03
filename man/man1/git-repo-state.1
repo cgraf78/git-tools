@@ -18,6 +18,16 @@ pull request fields are left empty.
 When GitHub data is available, view and checks queries are pinned to the current
 checkout repository rather than ambient GitHub CLI routing.
 .PP
+When GitHub refuses the token the pull request's checks, they are read through
+the Actions API, as in
+.BR git-pr-land (1).
+Check runs from apps other than GitHub Actions are then invisible, and this
+report has no merge-state gate to catch them: a pull request whose only
+failing or pending checks come from such an app can read as passing, unless
+GitHub reports its merge state
+.BR UNSTABLE ,
+which reads as pending.
+.PP
 The repository identity lookup is cached for one hour under
 .B $XDG_CACHE_HOME/git-tools/repo-identity
 (or

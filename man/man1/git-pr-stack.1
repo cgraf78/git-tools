@@ -24,6 +24,11 @@ Repository identity is derived with ambient GH_REPO and GH_HOST routing
 removed. List, view, and checks requests are pinned to that exact host and
 owner/repository, and every returned canonical pull request URL is validated.
 .PP
+When GitHub refuses the token the pull requests' checks, they are read through
+the Actions API, as
+.BR git-pr-land (1)
+describes.
+.PP
 Each structured record must have matching pull request numbers and canonical
 URLs, exact boolean fields, well-formed head and base refs, and a head repository
 consistent with its cross-repository flag. Its head OID must be a canonical

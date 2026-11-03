@@ -83,6 +83,9 @@ _write_gh_stub() {
 set -uo pipefail
 
 dir=${FAKE_GH_DIR:?}
+# FAKE_JQ lets the fake keep working when the command under test runs on a
+# PATH without jq.
+jq=${FAKE_JQ:-jq}
 printf '%s\n' "$*" >>"$dir/log"
 printf '%s CLICOLOR_FORCE=%s GH_FORCE_TTY=%s GH_DEBUG=%s NO_COLOR=%s\n' "$1" \
   "${CLICOLOR_FORCE-unset}" "${GH_FORCE_TTY-unset}" "${GH_DEBUG-unset}" \
@@ -113,6 +116,7 @@ case "$1 ${2:-}" in
       exit 4
     fi
     ;;
+  "api repos/"*) ;;
   *)
     printf 'unexpected gh call: %s\n' "$*" >&2
     exit 99
@@ -136,9 +140,45 @@ for arg in "$@"; do
   prev=$arg
 done
 
+# REST reads (the Actions API) are served from rest/<name>, where the name is
+# runs-<sha>, jobs-<run id>, or status-<sha>; rest/<name>-<k> answers the k-th
+# read of that name when present. A rest-403 marker refuses every REST read.
 # Branch lookups have their own fixtures so snapshot calls number from 1:
 # branch-<m> for the m-th lookup when present, else branch.
-if [[ "$query" == *PrWatchBranch* ]]; then
+if [[ "$2" == repos/* ]]; then
+  endpoint=${2#repos/example/repo/}
+  case "$endpoint" in
+    "actions/runs?head_sha="*"&per_page=100")
+      name=${endpoint#*head_sha=}
+      name=runs-${name%%&*}
+      ;;
+    actions/runs/*"/jobs?filter=latest&per_page=100" | actions/runs/*/attempts/*"/jobs?per_page=100")
+      name=${endpoint#actions/runs/}
+      name=jobs-${name%%/*}
+      ;;
+    commits/*"/status?per_page=100")
+      name=${endpoint#commits/}
+      name=status-${name%%/*}
+      ;;
+    *)
+      printf 'unexpected REST call: %s\n' "$2" >&2
+      exit 99
+      ;;
+  esac
+  printf '%s\n' "$name" >>"$dir/rest-log"
+  if [[ -f "$dir/rest-403" ]]; then
+    printf 'HTTP/2.0 403 X\r\nDate: Thu, 15 Oct 2026 14:14:10 GMT\r\n\r\n'
+    printf '{"message":"Resource not accessible by personal access token","status":"403"}\n'
+    exit 1
+  fi
+  k=$(($(grep -cx -- "$name" "$dir/rest-log") + 0))
+  base="$dir/rest/$name"
+  [[ ! -e "$base-$k.json" && ! -e "$base-$k.status" ]] || base="$base-$k"
+  if [[ ! -e "$base.json" && ! -e "$base.status" ]]; then
+    printf 'unexpected REST call: %s\n' "$2" >&2
+    exit 99
+  fi
+elif [[ "$query" == *PrWatchBranch* ]]; then
   m=$(($(cat "$dir/bn" 2>/dev/null || printf 0) + 1))
   printf '%s\n' "$m" >"$dir/bn"
   base="$dir/branch"
@@ -184,11 +224,11 @@ if [[ ! -f "$base.json" ]]; then
   exit 1
 fi
 # gh skips --jq and prints the raw body for errors and non-2xx statuses.
-if [[ "$status" != 200 ]] || jq -e 'has("errors")' "$base.json" >/dev/null 2>&1; then
+if [[ "$status" != 200 ]] || "$jq" -e 'has("errors")' "$base.json" >/dev/null 2>&1; then
   cat "$base.json"
   exit 1
 fi
-jq -r "$jq_program" "$base.json"
+"$jq" -r "$jq_program" "$base.json"
 EOF
   chmod +x "$bin"
 }
@@ -1075,16 +1115,22 @@ _watch 12
 _assert_eq "closed pull request with unreadable checks needs action" 1 "$status"
 _assert_contains "closed record despite unreadable checks" "pr=12 state=action reason=closed" "$out"
 
+# The open pull requests below cannot be read through the Actions API either
+# (rest-403); the Actions scenarios further down can.
 _scenario
+: >"$FAKE_GH_DIR/rest-403"
 _serve 1 "$(_checks_forbidden "$(_green_pr 12)")"
 _serve 2 "$(_response "$(_green_pr 12)")"
 _watch 12
 _assert_eq "open pull request with unreadable checks stalls" 8 "$status"
 _assert_contains "open pull request with unreadable checks record" "pr=12 state=stall reason=checks-unreadable" "$out"
-_assert_contains "open pull request stall says why" "action: pr=12 this token cannot read the repository's checks" "$out"
+_assert_contains "open pull request stall says why" "action: pr=12 this token cannot read the repository's checks, nor through the Actions API; grant it Actions read access" "$out"
 _assert_not_contains "open pull request is not judged green" "reason=green" "$out"
+_assert_contains "a refused Actions read is reported" \
+  "checks unreadable through the Actions API too (Resource not accessible by personal access token)" "$err"
 
 _scenario
+: >"$FAKE_GH_DIR/rest-403"
 _serve 1 "$(_checks_forbidden "$(_green_pr 12 '{"mergeable":"CONFLICTING"}')")"
 _serve 2 "$(_response "$(_green_pr 12 '{"mergeable":"CONFLICTING"}')")"
 _watch 12
@@ -1092,6 +1138,7 @@ _assert_eq "a conflict is reported without readable checks" 1 "$status"
 _assert_contains "conflict record without readable checks" "pr=12 state=action reason=conflict" "$out"
 
 _scenario
+: >"$FAKE_GH_DIR/rest-403"
 _serve 1 "$(_response "$(_green_pr 12 '{"state":"MERGED"}')" "$(_green_pr 13)" |
   jq -c '.errors = [range(2) | {type: "FORBIDDEN",
     path: ["repository", "p0\(.)", "commits", "nodes", 0, "commit", "checkSuites", "nodes", 0],
@@ -2162,6 +2209,407 @@ _assert_eq "pruning removes old exit records" "example_repo_12" "$(_state_ls exi
 _assert_eq "pruning removes only old watcher files of gone watchers" "example_repo_5.$$
 example_repo_7.$_dead
 stray.$_dead" "$(_state_ls watchers)"
+
+# --- checks through the Actions API -----------------------------------------
+
+# Hand-written REST payloads with made-up values, shaped like GitHub's. Each
+# carries a field the projections drop, as real payloads carry many.
+
+# A workflow run. Args: id status conclusion check-suite-id [path] [event].
+_wrun() {
+  jq -cn --argjson id "$1" --arg status "$2" --arg conclusion "$3" \
+    --argjson suite "$4" --arg path "${5:-.github/workflows/test.yml}" \
+    --arg event "${6:-pull_request}" --arg head "$HEAD" '
+    {id: $id, name: "Test", event: $event, path: $path, status: $status,
+     conclusion: (if $conclusion == "" then null else $conclusion end),
+     check_suite_id: $suite, workflow_id: 7, run_attempt: 1, head_sha: $head,
+     display_title: "Made-up title"}'
+}
+
+# A job. Args: id name status conclusion [completed_at].
+_job() {
+  jq -cn --argjson id "$1" --arg name "$2" --arg status "$3" \
+    --arg conclusion "$4" --arg completed "${5:-}" '
+    {id: $id, run_id: 300, name: $name, status: $status,
+     conclusion: (if $conclusion == "" then null else $conclusion end),
+     completed_at: (if $completed == "" then null else $completed end),
+     steps: [{name: "Made-up step", number: 1}]}'
+}
+
+# A commit status. Args: id context state created_at.
+_cstatus() {
+  jq -cn --argjson id "$1" --arg context "$2" --arg state "$3" --arg created "$4" '
+    {id: $id, context: $context, state: $state, created_at: $created,
+     description: "Made-up description"}'
+}
+
+# Lists of runs, jobs, and statuses. The combined status's own `state` is
+# always "pending", as GitHub reports it for a commit with no statuses: the
+# command must never read it.
+_runs() {
+  printf '%s\n' "$@" | jq -cs 'map(select(. != null))
+    | {total_count: length, workflow_runs: .}'
+}
+_jobs() {
+  printf '%s\n' "$@" | jq -cs 'map(select(. != null)) | {total_count: length, jobs: .}'
+}
+_statuses() {
+  printf '%s\n' "$@" | jq -cs --arg head "$HEAD" 'map(select(. != null))
+    | {state: "pending", sha: $head, total_count: length, statuses: .}'
+}
+
+# Serve a REST payload by name (see the fake gh). Optional status and headers.
+_rest() {
+  local name="$1" body="$2" status="${3:-}"
+  shift 3 2>/dev/null || shift $#
+
+  mkdir -p "$FAKE_GH_DIR/rest"
+  printf '%s\n' "$body" >"$FAKE_GH_DIR/rest/$name.json"
+  [[ -z "$status" ]] || printf '%s\n' "$status" >"$FAKE_GH_DIR/rest/$name.status"
+  if (($# > 0)); then
+    printf '%s\n' "$@" >"$FAKE_GH_DIR/rest/$name.headers"
+  fi
+}
+
+# One passing job in a finished run, and no statuses.
+_rest_green() {
+  _rest "runs-$HEAD" "$(_runs "$(_wrun 300 completed success 1)")"
+  _rest jobs-300 "$(_jobs "$(_job 11 build completed success "$OLD")")"
+  _rest "status-$HEAD" "$(_statuses)"
+}
+
+# A pull request as the checks-free query returns it. Args: number [overrides].
+_bare_pr() {
+  _green_pr "$1" "${2:-}" | jq -c 'del(.commits)'
+}
+
+# Start a scenario where GitHub refuses the checks of one pull request, and
+# the checks-free query that follows returns it. Args: number [overrides].
+_actions_scenario() {
+  _scenario
+  _serve 1 "$(_checks_forbidden "$(_green_pr "$1" "${2:-}")")"
+  _serve 2 "$(_response "$(_bare_pr "$1" "${2:-}")")"
+}
+
+_rest_calls() {
+  [[ ! -f "$FAKE_GH_DIR/rest-log" ]] || tr '\n' ' ' <"$FAKE_GH_DIR/rest-log" | sed 's/ $//'
+}
+
+# Print PATH with every directory that holds jq replaced by a copy (of
+# symlinks) without it.
+_path_without_jq() {
+  local dir farm out="" IFS=:
+
+  for dir in $1; do
+    if [[ -n "$dir" && -x "$dir/jq" ]]; then
+      farm=$(_tmpdir)
+      find "$dir" -mindepth 1 -maxdepth 1 ! -name jq \
+        -exec sh -c 'ln -s "$@" "$0" 2>/dev/null' "$farm" {} + || true
+      dir=$farm
+    fi
+    out+=${out:+:}$dir
+  done
+  printf '%s\n' "$out"
+}
+
+_actions_scenario 12
+_rest_green
+_watch 12
+_assert_eq "checks read through the Actions API pass" 0 "$status"
+_assert_contains "Actions API green record" "pr=12 state=done reason=green head=aaaaaaaaaaaa" "$out"
+_assert_contains "the Actions API read is announced" \
+  "checks unreadable with this token (Resource not accessible by personal access token); reading checks through the Actions API" "$err"
+_assert_eq "runs, then jobs, then statuses are read" "runs-$HEAD jobs-300 status-$HEAD" "$(_rest_calls)"
+_assert_contains "REST reads are pinned to the checkout's repository and host" \
+  "api repos/example/repo/actions/runs?head_sha=$HEAD&per_page=100 -i --hostname github.test --jq" \
+  "$(cat "$FAKE_GH_DIR/log")"
+_assert_eq "the Actions API read adds no GraphQL query" 2 "$(_calls)"
+_assert_eq "REST reads run with color and debug output scrubbed" \
+  "" "$(grep '^api repos' "$FAKE_GH_DIR/env-all" | grep -v 'CLICOLOR_FORCE=unset GH_FORCE_TTY=unset GH_DEBUG=unset NO_COLOR=1')"
+
+_actions_scenario 12
+_rest "runs-$HEAD" "$(_runs "$(_wrun 300 completed failure 1)")"
+_rest jobs-300 "$(_jobs "$(_job 21 build completed failure "$OLD")" \
+  "$(_job 22 lint completed success "$OLD")")"
+_rest "status-$HEAD" "$(_statuses)"
+_watch 12
+_assert_eq "a failed job read through the Actions API needs action" 1 "$status"
+_assert_contains "Actions API failure record" "pr=12 state=action reason=failed" "$out"
+_assert_contains "Actions API failing job line" 'check pr=12 required=no job=21 name="build"' "$out"
+_assert_contains "Actions API failing job log command" \
+  "run: gh api --hostname github.test --allow-escape-sequences repos/example/repo/actions/jobs/21/logs | cat -v" "$out"
+
+_actions_scenario 12
+_rest "runs-$HEAD" "$(_runs "$(_wrun 300 in_progress "" 1)")"
+_rest jobs-300 "$(_jobs "$(_job 11 build in_progress "")")"
+_rest "status-$HEAD" "$(_statuses)"
+_watch 12
+_assert_eq "a running job read through the Actions API is pending" 8 "$status"
+_assert_contains "Actions API running record" "pr=12 state=pending reason=checks-running" "$out"
+
+_actions_scenario 12
+_rest "runs-$HEAD" "$(_runs "$(_wrun 300 queued "" 1)")"
+_rest jobs-300 "$(_jobs)"
+_rest "status-$HEAD" "$(_statuses)"
+_watch 12
+_assert_eq "a queued run with no jobs yet is pending" 8 "$status"
+_assert_contains "Actions API queued record" "pr=12 state=pending reason=checks-running" "$out"
+
+_actions_scenario 12
+_rest "runs-$HEAD" "$(_runs)"
+_rest "status-$HEAD" "$(_statuses "$(_cstatus 41 ci/external failure "$OLD")")"
+_watch 12
+_assert_eq "a failing commit status needs action" 1 "$status"
+_assert_contains "commit status failure line" 'check pr=12 required=no job=- name="ci/external"' "$out"
+_assert_eq "no runs means no jobs read" "runs-$HEAD status-$HEAD" "$(_rest_calls)"
+
+_actions_scenario 12
+_rest_green
+_rest "status-$HEAD" "$(_statuses "$(_cstatus 41 ci/external pending "$OLD")")"
+_watch 12
+_assert_eq "a passing job beside a pending status is pending" 8 "$status"
+_assert_not_contains "a pending status keeps it from green" "reason=green" "$out"
+
+_actions_scenario 12
+_rest_green
+_rest "status-$HEAD" "$(_statuses "$(_cstatus 41 ci/external failure "$OLD")")"
+_watch 12
+_assert_contains "a passing job beside a failing status fails" "pr=12 state=action reason=failed" "$out"
+
+_actions_scenario 12
+_rest "runs-$HEAD" "$(_runs "$(_wrun 300 completed failure 1)" "$(_wrun 301 completed success 2)")"
+_rest jobs-300 "$(_jobs "$(_job 21 build completed failure "$OLD")")"
+_rest jobs-301 "$(_jobs "$(_job 31 build completed success "$OLD")")"
+_rest "status-$HEAD" "$(_statuses)"
+_watch 12
+_assert_contains "a newer passing run of a workflow replaces an older failed one" \
+  "pr=12 state=done reason=green" "$out"
+
+_actions_scenario 12
+_rest "runs-$HEAD" "$(_runs "$(_wrun 300 completed action_required 1)")"
+_rest jobs-300 "$(_jobs)"
+_rest "status-$HEAD" "$(_statuses)"
+_watch 12
+_assert_contains "a run awaiting approval with no jobs stalls for approval" \
+  "pr=12 state=stall reason=approval-required" "$out"
+
+_actions_scenario 12
+_rest "runs-$HEAD" "$(_runs "$(_wrun 300 waiting "" 1)")"
+_rest jobs-300 "$(_jobs)"
+_rest "status-$HEAD" "$(_statuses)"
+_watch 12
+_assert_contains "a waiting run with no jobs is pending" "pr=12 state=pending reason=checks-running" "$out"
+
+_actions_scenario 12
+_rest "runs-$HEAD" "$(_runs "$(_wrun 300 completed success 1)" | jq -c '.total_count = 50')"
+_rest jobs-300 "$(_jobs "$(_job 11 build completed success "$OLD")")"
+_rest "status-$HEAD" "$(_statuses)"
+_watch 12
+_assert_contains "exactly 50 runs is not too many" "pr=12 state=done reason=green" "$out"
+
+_actions_scenario 12
+_rest "runs-$HEAD" "$(_runs "$(_wrun 300 completed success 1)")"
+_rest jobs-300 "$(_jobs "$(_job 11 build completed success "$OLD")" | jq -c '.total_count = 99')"
+_rest "status-$HEAD" "$(_statuses "$(_cstatus 41 ci/external success "$OLD")")"
+_watch 12
+_assert_contains "exactly 100 jobs and statuses is not too many" "pr=12 state=done reason=green" "$out"
+
+_actions_scenario 12 '{"mergeStateStatus":"BLOCKED","reviewDecision":"REVIEW_REQUIRED"}'
+_rest_green
+_watch 12
+_assert_eq "a pending review under Actions checks stalls" 8 "$status"
+_assert_contains "a pending review under Actions checks is not done" \
+  "pr=12 state=stall reason=checks-partial" "$out"
+_assert_contains "a pending review under Actions checks names the review" \
+  "action: pr=12 a review is required (review-required), so its merge state cannot show" "$out"
+_assert_not_contains "a pending review under Actions checks is never green" "state=done" "$out"
+
+_actions_scenario 12 '{"mergeStateStatus":"BEHIND"}'
+_rest_green
+_watch 12
+_assert_contains "BEHIND under Actions checks is not green" "pr=12 state=pending reason=checks-partial" "$out"
+
+_actions_scenario 12 '{"mergeStateStatus":"BEHIND"}'
+_rest_green
+_wait_watch 12
+_assert_contains "BEHIND under Actions checks names the cause" \
+  "action: pr=12 the pull request is behind its base, so its merge state cannot show" "$out"
+
+_actions_scenario 12 '{"mergeStateStatus":"DRAFT"}'
+_rest_green
+_wait_watch 12
+_assert_contains "DRAFT under Actions checks names the cause" \
+  "action: pr=12 the pull request is a draft, so its merge state cannot show" "$out"
+
+_actions_scenario 12 '{"mergeStateStatus":"BLOCKED","reviewDecision":"CHANGES_REQUESTED"}'
+_rest_green
+_watch 12
+_assert_contains "requested changes under Actions checks name the review" \
+  "action: pr=12 a reviewer requested changes (changes-requested), so its merge state cannot show" "$out"
+
+_actions_scenario 12
+_rest "runs-$HEAD" "$(_runs "$(_wrun 300 completed success 1)" | jq -c '.total_count = 51')"
+_rest "status-$HEAD" "$(_statuses)"
+_watch 12
+_assert_contains "more runs than one page judges too many" "pr=12 state=stall reason=too-many-checks" "$out"
+_assert_eq "too many runs reads no jobs" "runs-$HEAD status-$HEAD" "$(_rest_calls)"
+
+_actions_scenario 12
+_rest "runs-$HEAD" "$(_runs "$(_wrun 300 completed success 1)")"
+_rest jobs-300 "$(_jobs "$(_job 11 build completed success "$OLD")" | jq -c '.total_count = 101')"
+_rest "status-$HEAD" "$(_statuses)"
+_watch 12
+_assert_contains "more jobs than one page judges too many" "pr=12 state=stall reason=too-many-checks" "$out"
+
+_actions_scenario 12 '{"state":"MERGED"}'
+_watch 12
+_assert_contains "a merged pull request is judged without the Actions API" "pr=12 state=done reason=merged" "$out"
+_assert_eq "a merged pull request reads nothing through the Actions API" "" "$(_rest_calls)"
+
+# Two open pull requests with different heads in one chunk.
+_two_forbidden() {
+  _response "$(_green_pr 12)" "$(_green_pr 13 "{\"headRefOid\":\"$OTHER\"}")" |
+    jq -c '.errors = [range(2) | {type: "FORBIDDEN",
+      path: ["repository", "p0\(.)", "commits", "nodes", 0, "commit", "checkSuites", "nodes", 0],
+      message: "Resource not accessible by personal access token"}]'
+}
+
+_scenario
+_serve 1 "$(_two_forbidden)"
+_serve 2 "$(_response "$(_bare_pr 12)" "$(_bare_pr 13 "{\"headRefOid\":\"$OTHER\"}")")"
+_rest "runs-$HEAD" '{"message":"Resource not accessible by personal access token"}' 403
+_watch 12 13
+_assert_eq "a refused Actions read stalls" 8 "$status"
+_assert_contains "a refused Actions read stalls the first pull request" "pr=12 state=stall reason=checks-unreadable" "$out"
+_assert_contains "a refused Actions read stalls the rest" "pr=13 state=stall reason=checks-unreadable" "$out"
+_assert_eq "a refused Actions read is not tried again" "runs-$HEAD" "$(_rest_calls)"
+_assert_eq "a refused Actions read rereads the chunk without checks" 3 "$(_calls)"
+
+_actions_scenario 12
+_rest_green
+_rest jobs-300 '{"message":"Not Found","status":"404"}' 404
+_watch 12
+_assert_contains "a missing Actions resource makes checks unreadable" "pr=12 state=stall reason=checks-unreadable" "$out"
+_assert_contains "a missing Actions resource is reported" "checks unreadable through the Actions API too (Not Found)" "$err"
+
+_scenario
+_serve 1 "$(_two_forbidden)"
+_serve 2 "$(_response "$(_bare_pr 12)" "$(_bare_pr 13 "{\"headRefOid\":\"$OTHER\"}")")"
+_rest "runs-$HEAD" '{"message":"API rate limit exceeded"}' 403 \
+  "X-Ratelimit-Remaining: 0" "X-Ratelimit-Reset: 1792073710"
+_watch 12 13
+_assert_eq "a rate-limited Actions read exits 3" 3 "$status"
+_assert_contains "a rate-limited Actions read result" "result: 3 reason=rate-limited prs=12,13" "$out"
+_assert_eq "a rate limit stops the Actions reads" "runs-$HEAD" "$(_rest_calls)"
+_assert_not_contains "a rate limit does not make checks unreadable" "checks-unreadable" "$out"
+
+_scenario
+_serve 1 "$(_two_forbidden)"
+_serve 2 "$(_response "$(_bare_pr 12)" "$(_bare_pr 13 "{\"headRefOid\":\"$OTHER\"}")")"
+_rest_green
+_rest "runs-$OTHER" "$(_runs "$(_wrun 301 completed failure 2)")"
+_rest jobs-301 "$(_jobs "$(_job 31 build completed failure "$OLD")")"
+_rest "status-$OTHER" "$(_statuses)"
+_watch 12 13
+_assert_eq "two pull requests read through the Actions API: one needs action" 1 "$status"
+_assert_contains "the green one is done" "pr=12 state=done reason=green" "$out"
+_assert_contains "the failed one needs action" "pr=13 state=action reason=failed" "$out"
+_assert_contains "the failed one's job is listed" 'check pr=13 required=no job=31 name="build"' "$out"
+
+_scenario
+_serve 1 "$(_two_forbidden)"
+_serve 2 "$(_response "$(_bare_pr 12)" "$(_bare_pr 13 "{\"headRefOid\":\"$OTHER\"}")")"
+_rest_green
+_rest "runs-$OTHER" '{"message":"API rate limit exceeded"}' 403 \
+  "X-Ratelimit-Remaining: 0" "X-Ratelimit-Reset: 1792073710"
+_watch 12 13
+_assert_contains "a rate limit on the second read exits 3" "result: 3 reason=rate-limited prs=12,13" "$out"
+_assert_eq "the first pull request's reads come before the rate limit" \
+  "runs-$HEAD jobs-300 status-$HEAD runs-$OTHER" "$(_rest_calls)"
+
+_actions_scenario 12
+_rest_green
+_rest "status-$HEAD-1" "$(_statuses "$(_cstatus 41 ci/external pending "$OLD")")"
+_cache_tmp=$(_tmpdir)
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" TMPDIR="$_cache_tmp" PATH="$bin_dir:$PATH" \
+  git -C "$repo" pr-watch --wait 12 2>/dev/null)
+status=$?
+_assert_eq "a waiting run sees the status pass" 0 "$status"
+_assert_eq "a finished run's jobs are read once per run" \
+  "runs-$HEAD jobs-300 status-$HEAD runs-$HEAD status-$HEAD" "$(_rest_calls)"
+_assert_contains "a finished run's jobs are read from its exact attempt" \
+  "api repos/example/repo/actions/runs/300/attempts/1/jobs?per_page=100 " "$(cat "$FAKE_GH_DIR/log")"
+_assert_not_contains "a finished run's jobs are not read as the latest attempt" \
+  "actions/runs/300/jobs?filter=latest" "$(cat "$FAKE_GH_DIR/log")"
+_assert_eq "the jobs cache is removed on exit" "" "$(ls -A "$_cache_tmp")"
+
+_actions_scenario 12
+_rest_green
+_rest "runs-$HEAD-1" "$(_runs "$(_wrun 300 in_progress "" 1)")"
+_rest jobs-300-1 "$(_jobs "$(_job 11 build in_progress "")")"
+_wait_watch 12
+_assert_eq "a waiting run sees the run finish" 0 "$status"
+_assert_eq "an unfinished run's jobs are read again" \
+  "runs-$HEAD jobs-300 status-$HEAD runs-$HEAD jobs-300 status-$HEAD" "$(_rest_calls)"
+_assert_contains "an unfinished run's jobs are its latest attempt's" \
+  "api repos/example/repo/actions/runs/300/jobs?filter=latest&per_page=100 " "$(cat "$FAKE_GH_DIR/log")"
+
+_actions_scenario 12
+_rest_green
+_rest "runs-$HEAD-1" '{"message":"API rate limit exceeded"}' 403 \
+  "X-Ratelimit-Remaining: 0" "X-Ratelimit-Reset: 1792073710"
+_wait_watch 12
+_assert_eq "a waiting run waits out an Actions rate limit" 0 "$status"
+_assert_eq "the Actions rate limit wait used the reset time" 1060 "$(cat "$_clock")"
+_assert_eq "the Actions read resumes after the rate limit" \
+  "runs-$HEAD runs-$HEAD jobs-300 status-$HEAD" "$(_rest_calls)"
+
+_actions_scenario 12
+_rest_green
+_rest "runs-$HEAD" "" 502
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$bin_dir:$PATH" git -C "$repo" pr-watch 12 2>/dev/null)
+status=$?
+_assert_contains "a failing Actions read is retried, then reported" "result: 3 reason=transient prs=12" "$out"
+_assert_eq "a failing Actions read is tried three times" \
+  "runs-$HEAD runs-$HEAD runs-$HEAD" "$(_rest_calls)"
+
+_actions_scenario 12
+_rest_green
+_nojq_path=$(_path_without_jq "$bin_dir:$PATH")
+_jq=$(command -v jq)
+out=$(PATH="$_nojq_path" FAKE_JQ="$_jq" git -C "$repo" pr-watch 12 2>"$FAKE_GH_DIR/stderr")
+status=$?
+err=$(cat "$FAKE_GH_DIR/stderr")
+_assert_eq "without jq unreadable checks stall" 8 "$status"
+_assert_contains "without jq the pull request stalls" "pr=12 state=stall reason=checks-unreadable" "$out"
+_assert_contains "without jq the hint names jq" \
+  "judging pull requests by state only (install jq to read checks through the Actions API)" "$err"
+_assert_eq "without jq nothing is read through the Actions API" "" "$(_rest_calls)"
+_assert_contains "without jq the stall hint names jq" \
+  "action: pr=12 this token cannot read the repository's checks; install jq to read them through the Actions API" "$out"
+
+_actions_scenario 12 '{"mergeStateStatus":"UNSTABLE"}'
+_rest_green
+_watch 12
+_assert_eq "visible checks passed under UNSTABLE is pending" 8 "$status"
+_assert_contains "UNSTABLE with Actions checks passed record" "pr=12 state=pending reason=checks-partial" "$out"
+
+_actions_scenario 12 '{"mergeStateStatus":"UNSTABLE"}'
+_rest_green
+_wait_watch 12
+_assert_eq "checks-partial stalls after the head grace" 8 "$status"
+_assert_contains "checks-partial stall record" "pr=12 state=stall reason=checks-partial" "$out"
+_assert_contains "checks-partial hint" "action: pr=12 some checks are not visible to this token" "$out"
+_assert_eq "checks-partial was checked until the grace passed" 1300 "$(cat "$_clock")"
+
+_scenario
+_serve 1 "$(_response "$(_green_pr 12 '{"mergeStateStatus":"UNSTABLE"}')")"
+_watch 12
+_assert_contains "readable checks passed under UNSTABLE stay green" "pr=12 state=done reason=green" "$out"
 
 # --- time conversion ---------------------------------------------------------
 

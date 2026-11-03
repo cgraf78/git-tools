@@ -354,6 +354,14 @@ if [[ "$1 $2" == "pr view" ]]; then
   esac
   exit 0
 fi
+# GH_CHECK_CASE=actions: this token may not read any pull request's checks;
+# the Actions API serves one passing run with one job and no statuses
+# (hand-written payloads).
+if [[ "$1 $2" == "pr checks" && "${GH_CHECK_CASE:-}" == actions ]]; then
+  printf 'checks %s\n' "$*" >>"${STACK_LOG:?}"
+  printf 'GraphQL: Resource not accessible by personal access token (repository.pullRequest.commits.nodes.0.commit.statusCheckRollup)\n' >&2
+  exit 1
+fi
 if [[ "$1 $2" == "pr checks" ]]; then
   printf 'checks %s\n' "$*" >>"${STACK_LOG:?}"
   case "${GH_CHECK_CASE:-pass}" in
@@ -373,6 +381,62 @@ fi
 if [[ "$1 $2" == "pr merge" ]]; then
   printf 'merge %s\n' "$3" >>"${STACK_LOG:?}"
   : >"${GH_MERGED_DIR:?}/$3"
+  exit 0
+fi
+if [[ "$1 $2" == "api graphql" && "${GH_CHECK_CASE:-}" == actions ]]; then
+  query=""
+  jq_program=""
+  number=""
+  previous=""
+  for argument in "$@"; do
+    [[ "$previous" != --jq ]] || jq_program=$argument
+    case "$argument" in
+      query=*) query=${argument#query=} ;;
+      n00=*) number=${argument#n00=} ;;
+    esac
+    previous=$argument
+  done
+  printf 'HTTP/2.0 200 OK\r\nDate: Thu, 15 Oct 2026 14:14:10 GMT\r\n\r\n'
+  if [[ "$query" == *statusCheckRollup* ]]; then
+    printf '{"data":{"repository":{"p00":{"number":%s,"commits":null}}},"errors":[{"type":"FORBIDDEN","path":["repository","p00","commits","nodes",0,"commit","statusCheckRollup"],"message":"Resource not accessible by personal access token"}]}\n' "$number"
+    exit 1
+  fi
+  state=OPEN
+  [[ ! -e "${GH_MERGED_DIR:?}/$number" ]] || state=MERGED
+  case "$number" in
+    1) oid=$(git rev-parse refs/heads/feature/a) ;;
+    2) oid=$(git rev-parse refs/heads/feature/b) ;;
+    *) oid=$(git rev-parse refs/heads/feature/c) ;;
+  esac
+  printf '{"data":{"repository":{"p00":{"number":%s,"state":"%s","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","reviewDecision":null,"baseRefName":"main","headRefName":"feature","headRefOid":"%s","isCrossRepository":false,"autoMergeRequest":null}}}}\n' \
+    "$number" "$state" "$oid" | jq -r "$jq_program"
+  exit 0
+fi
+if [[ "$1" == api && "${2:-}" == repos/* ]]; then
+  jq_program=""
+  previous=""
+  for argument in "$@"; do
+    [[ "$previous" != --jq ]] || jq_program=$argument
+    previous=$argument
+  done
+  printf 'rest %s\n' "${2#repos/example/repo/}" >>"${STACK_LOG:?}"
+  case "$2" in
+    */actions/runs\?*)
+      body='{"total_count":1,"workflow_runs":[{"id":300,"run_attempt":1,"name":"Test","event":"pull_request","path":".github/workflows/test.yml","status":"completed","conclusion":"success","check_suite_id":1,"workflow_id":7}]}'
+      ;;
+    */actions/runs/300/attempts/1/jobs\?*)
+      body='{"total_count":1,"jobs":[{"id":11,"name":"build","status":"completed","conclusion":"success","completed_at":"2026-10-15T14:04:10Z"}]}'
+      ;;
+    */status\?*)
+      body='{"state":"pending","total_count":0,"statuses":[]}'
+      ;;
+    *)
+      printf 'unexpected REST call: %s\n' "$2" >&2
+      exit 99
+      ;;
+  esac
+  printf 'HTTP/2.0 200 OK\r\nDate: Thu, 15 Oct 2026 14:14:10 GMT\r\n\r\n'
+  printf '%s\n' "$body" | jq -r "$jq_program"
   exit 0
 fi
 # The snapshot query of the one-shot `git pr-watch` that `git pr-land` runs
@@ -1222,6 +1286,36 @@ for publish_number in 1 2 3; do
     "$(cat "$publish_xdg/git-tools/pr-watch/done/example_repo_$publish_number" 2>/dev/null)"
 done
 _assert_not_contains "publish: no PR needs a follow-up" "next:" "$publish_output"
+
+# The same landing when the token may not read any pull request's checks:
+# git pr-land and the stack's readiness wait judge them through the Actions
+# API.
+if command -v jq >/dev/null 2>&1; then
+  actions_repo=$(_tmpdir)
+  actions_remote=$(_tmpdir)
+  actions_log=$(_tmpdir)/stack.log
+  actions_merged=$(_tmpdir)
+  _git_init "$actions_repo"
+  git -C "$actions_repo" branch feature/a
+  git -C "$actions_repo" branch feature/b
+  git -C "$actions_repo" branch feature/c
+  git init -q --bare "$actions_remote"
+  _add_github_remote "$actions_repo" origin "$actions_remote"
+  git -C "$actions_repo" push --quiet origin main feature/a feature/b feature/c
+  actions_rc=0
+  actions_output=$(cd "$actions_repo" && env -u GIT_TOOLS_TOOL_DIR \
+    PATH="$publish_bin:$bin_dir:$PATH" STACK_FAKE_GIT="$bin_dir/git" STACK_LOG="$actions_log" \
+    STACK_REWRITE_REPO="$actions_repo" GH_MERGED_DIR="$actions_merged" \
+    GH_CHECK_CASE=actions GIT_PR_WATCH_STATE=0 "$publish_root/bin/git-pr-land-stack" 1 \
+    --check-interval 1 2>&1) || actions_rc=$?
+  _assert_eq "actions: the stack lands" 0 "$actions_rc"
+  _assert_eq "actions: the real git pr-land merges every PR" "merge 1 merge 2 merge 3" \
+    "$(grep '^merge ' "$actions_log" | tr '\n' ' ' | sed 's/ $//')"
+  _assert_contains "actions: checks are read through the Actions API" \
+    "reading them through the Actions API" "$actions_output"
+  _assert_contains "actions: the Actions API reads the runs" "rest actions/runs?head_sha=" \
+    "$(cat "$actions_log")"
+fi
 
 # The orchestrator runs snapshot copies of git pr-land, pr-restack, pr-stack,
 # and the git pr-watch that git pr-land runs; every library those copies

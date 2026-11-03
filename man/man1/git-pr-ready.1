@@ -13,6 +13,11 @@ branch.
 .PP
 Pull request and checks lookups are pinned to the repository derived from the
 current checkout, independent of ambient GitHub CLI routing.
+.PP
+When GitHub refuses the token the pull request's checks, they are read through
+the Actions API, as
+.BR git-pr-land (1)
+describes.
 .SH OPTIONS
 .TP
 .B \-\-porcelain

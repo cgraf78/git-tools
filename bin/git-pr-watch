@@ -1327,7 +1327,6 @@ _state_pending=""
 _state_done=()
 # Wall-clock time when the current check started, for done/ records: the
 # test clock does not apply to files other tools compare with their own clock.
-_state_wall_base=""
 _state_check_wall=""
 # Start of the check whose judgments are the current ones, for exit records.
 _state_judged_wall=""
@@ -1477,17 +1476,15 @@ _state_targets() {
   fi
 }
 
-# @brief Note the wall-clock time a check starts. Only the first call starts
-# a process (date); later ones add the shell's elapsed SECONDS.
+# @brief Note the wall-clock time a check starts. Read the clock fresh on
+# every check: deriving it from the shell's SECONDS can be off by a second
+# (the wall-clock second boundary and the SECONDS tick are unrelated
+# phases), which misdates the judgment a done record claims. One date fork
+# per check is cheap next to the GraphQL call that follows.
 _state_check_start() {
   [[ -n "$_state_dir" ]] || return 0
-  if [[ -z "$_state_wall_base" ]]; then
-    _state_wall_base=$(date +%s 2>/dev/null) || _state_wall_base=""
-    [[ "$_state_wall_base" =~ ^[1-9][[:digit:]]*$ ]] || _state_wall_base=x
-    [[ "$_state_wall_base" == x ]] || _state_wall_base=$((_state_wall_base - SECONDS))
-  fi
-  _state_check_wall=-
-  [[ "$_state_wall_base" == x ]] || _state_check_wall=$((_state_wall_base + SECONDS))
+  _state_check_wall=$(date +%s 2>/dev/null) || _state_check_wall=-
+  [[ "$_state_check_wall" =~ ^[1-9][[:digit:]]*$ ]] || _state_check_wall=-
 }
 
 # @brief Record pull requests this check found finished.

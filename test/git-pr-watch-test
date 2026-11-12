@@ -2058,6 +2058,39 @@ _exit_epoch=""
 { read -r _ _ _ _exit_epoch <"$_state/exited/example_repo_12"; } 2>/dev/null
 _assert_eq "an exit epoch is the judging check's start, not the exit" "$_epoch" "$_exit_epoch"
 
+# A done epoch comes from a fresh wall-clock read on every check: the
+# scripted date jumps 100 seconds once the first check's call ends, so a
+# stamp derived from the shell's SECONDS (a second or two after the first
+# read) cannot satisfy the assertion. The delay shim above writes t-end-1
+# when the first call ends; the date shim answers T until then, T+100 after.
+_dateshim=$(_tmpdir)
+_real_date=$(command -v date)
+cat >"$_dateshim/date" <<EOF
+#!/bin/sh
+if [ "\$*" = "+%s" ] && [ -e "\$FAKE_GH_DIR/t-end-1" ]; then
+  printf '%s\n' 1794470100
+elif [ "\$*" = "+%s" ]; then
+  printf '%s\n' 1794470000
+else
+  exec "$_real_date" "\$@"
+fi
+EOF
+chmod +x "$_dateshim/date"
+_state_scenario
+_serve 1 "$(_response "$(_running_pr 12)")"
+_serve 2 "$(_response "$(_green_pr 12)")"
+printf '1000\n' >"$_clock"
+out=$(GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" PATH="$_dateshim:$_delay:$bin_dir:$PATH" \
+  git -C "$repo" pr-watch --wait 12 2>/dev/null)
+_epoch=""
+{ read -r _ _ _epoch <"$_state/done/example_repo_12"; } 2>/dev/null
+_assert_eq "a done epoch reads the wall clock fresh on every check" \
+  1794470100 "$_epoch"
+_exit_epoch=""
+{ read -r _ _ _ _exit_epoch <"$_state/exited/example_repo_12"; } 2>/dev/null
+_assert_eq "a scripted-date exit epoch is the judging check's start" \
+  "$_epoch" "$_exit_epoch"
+
 # A pull request still pending when another one ends the run got no final
 # result: its exit record has no epoch, while the one needing action has one.
 _state_scenario

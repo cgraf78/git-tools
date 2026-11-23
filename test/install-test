@@ -2,7 +2,7 @@
 
 set -uo pipefail
 
-ROOT=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
 # shellcheck source=lib/test-temp.sh
 . "$ROOT/test/lib/test-temp.sh"

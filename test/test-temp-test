@@ -2,7 +2,7 @@
 
 set -uo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # Signal cases below need INT and TERM deliverable; see default-signals.sh.
 # shellcheck source=test/lib/default-signals.sh
 . "$ROOT/test/lib/default-signals.sh"

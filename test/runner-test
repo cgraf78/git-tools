@@ -2,7 +2,7 @@
 
 set -uo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # Signal cases below need INT and TERM deliverable; see default-signals.sh.
 # shellcheck source=test/lib/default-signals.sh
 . "$ROOT/test/lib/default-signals.sh"
@@ -149,8 +149,12 @@ else
   fail "runner rejects partial command inventory before starting any suite"
 fi
 
-if TMPDIR="$runner_tmp" RUNNER_STATE="$state" GIT_TOOLS_SKIP_SHELLCHECK=1 \
-  GIT_TOOLS_TEST_JOBS=2 "$fixture/test/run" >"$output" 2>&1; then
+# Exercise a relative entry point even when caller cd prints the directory.
+if (
+  cd "$fixture" || exit 1
+  CDPATH=. TMPDIR="$runner_tmp" RUNNER_STATE="$state" GIT_TOOLS_SKIP_SHELLCHECK=1 \
+    GIT_TOOLS_TEST_JOBS=2 "$BASH" test/run >"$output" 2>&1
+); then
   if [[ -z "$(find "$runner_tmp" -name 'git-tools-run.*' -print)" ]]; then
     pass "runner overlaps suites and removes private logs"
   else
@@ -158,6 +162,7 @@ if TMPDIR="$runner_tmp" RUNNER_STATE="$state" GIT_TOOLS_SKIP_SHELLCHECK=1 \
   fi
 else
   fail "runner overlaps suites and removes private logs"
+  cat "$output" >&2
 fi
 
 previous=0

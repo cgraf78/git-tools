@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 # The tools run Git's own binary rather than `git` on PATH (lib/git-tools-git.sh).
 # Suites put fake `git` programs on PATH to inject failures, so ask the tools to

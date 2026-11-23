@@ -2,7 +2,7 @@
 
 set -uo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SHELL_LIBRARY="$ROOT/share/git-tools/shell.sh"
 
 # shellcheck source=test/lib/test-temp.sh

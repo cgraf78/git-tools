@@ -550,7 +550,7 @@ _assert_contains "cleanup dry-run works with read-only object storage" \
   "would delete readonly-squash at " "$readonly_result"
 
 objects_before=$(_object_ids "$readonly_repo")
-result=$(git -C "$readonly_repo" cleanup-repo --base main --dry-run 2>&1)
+result=$(CDPATH=. git -C "$readonly_repo" cleanup-repo --base main --dry-run 2>&1)
 objects_after=$(_object_ids "$readonly_repo")
 readonly_remote_main_oid=$(git -C "$readonly_repo" ls-remote origin \
   refs/heads/main | awk '{ print $1 }')
@@ -4929,7 +4929,7 @@ rm -rf "$lock_dir"
 git -C "$lock_repo" worktree add --quiet --detach "$lock_dir" main
 lock_admin=$(cd -P -- "$(git -C "$lock_dir" rev-parse --git-dir)" && pwd -P)
 : >"$lock_admin/index.lock"
-result=$(git -C "$lock_repo" cleanup-repo --porcelain 2>&1)
+result=$(CDPATH=. git -C "$lock_repo" cleanup-repo --porcelain 2>&1)
 _assert_contains "a checkout lock in any worktree keeps a proven branch" \
   $'keep-branch\tlocked-merged\tcheckout-in-flight\t'"$lock_admin/index.lock" "$result"
 rm -f "$lock_admin/index.lock"

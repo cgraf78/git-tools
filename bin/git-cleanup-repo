@@ -295,7 +295,8 @@ _enable_dry_object_store() {
   if [[ -z "$source_objects" ]]; then
     source_objects=$(git rev-parse --git-path objects) ||
       _die "could not resolve local object storage"
-    source_objects=$(cd -P -- "$source_objects" && pwd -P) ||
+    # Git may return a relative path, but Git's alternates need one pathname.
+    source_objects=$(CDPATH='' cd -P -- "$source_objects" && pwd -P) ||
       _die "could not resolve absolute local object storage"
   fi
   _dry_object_root=""

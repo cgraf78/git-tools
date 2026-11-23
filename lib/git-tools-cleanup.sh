@@ -502,7 +502,7 @@ _gt_cleanup_checkout_in_flight() {
 
   GT_CLEANUP_LOCK=""
   common=$(git rev-parse --git-common-dir 2>/dev/null) || return 0
-  common=$(cd -P -- "$common" 2>/dev/null && pwd -P) || return 0
+  common=$(CDPATH='' cd -P -- "$common" 2>/dev/null && pwd -P) || return 0
   for lock in "$common/index.lock" "$common/HEAD.lock" \
     "$common"/worktrees/*/index.lock "$common"/worktrees/*/HEAD.lock; do
     if [[ -e "$lock" ]]; then

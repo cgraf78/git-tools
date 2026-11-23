@@ -61,10 +61,12 @@ if ! awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" '
   exit 1
 fi
 
+command_listing=$(git_tools_commands "$ROOT") || exit "$?"
 commands=()
 while IFS= read -r command; do
+  [[ -n "$command" ]] || continue
   commands+=("$command")
-done < <(git_tools_commands "$ROOT")
+done <<<"$command_listing"
 
 if ((${#commands[@]} == 0)); then
   printf 'error: no executable bin/git-* launchers found\n' >&2

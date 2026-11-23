@@ -15,10 +15,12 @@ export GIT_TOOLS_TEST_PATH_GIT=1
 
 git_tools_validate_commands "$ROOT"
 
+command_listing=$(git_tools_commands "$ROOT") || exit "$?"
 commands=()
 while IFS= read -r command; do
+  [[ -n "$command" ]] || continue
   commands+=("$command")
-done < <(git_tools_commands "$ROOT")
+done <<<"$command_listing"
 test_files=(
   "$ROOT/test/runner-test"
   "$ROOT/test/launcher-bootstrap-test"

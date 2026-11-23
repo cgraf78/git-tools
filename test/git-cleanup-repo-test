@@ -16,7 +16,7 @@ fi
 _term_ignored=0
 [[ -z "$(trap -p TERM)" ]] || _term_ignored=1
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PATH="$ROOT/bin:$PATH"
 export NO_COLOR=1
 GIT_TOOLS_TEST_REAL_GIT=${GIT_TOOLS_TEST_REAL_GIT:-$(type -a -p git | tail -n 1)}

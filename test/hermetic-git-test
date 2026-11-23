@@ -2,7 +2,7 @@
 
 set -uo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 helper="$ROOT/test/lib/hermetic-git.sh"
 # Probe children below compare exact output; only the hostile case sets its own.
 unset BASH_ENV

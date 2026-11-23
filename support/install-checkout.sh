@@ -17,10 +17,12 @@ ROOT=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 git_tools_validate_commands "$ROOT"
 
+command_listing=$(git_tools_commands "$ROOT") || exit "$?"
 COMMANDS=()
 while IFS= read -r command; do
+  [[ -n "$command" ]] || continue
   COMMANDS+=("$command")
-done < <(git_tools_commands "$ROOT")
+done <<<"$command_listing"
 
 _require_file() {
   local source="$1"

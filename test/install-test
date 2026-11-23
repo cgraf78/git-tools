@@ -45,10 +45,12 @@ assert_link() {
   assert_eq "$description" "$expected" "$actual"
 }
 
+command_listing=$(git_tools_commands "$ROOT") || exit "$?"
 commands=()
 while IFS= read -r command; do
+  [[ -n "$command" ]] || continue
   commands+=("$command")
-done < <(git_tools_commands "$ROOT")
+done <<<"$command_listing"
 if ((${#commands[@]} > 0)); then
   pass "installer inventory: discovers public commands"
 else

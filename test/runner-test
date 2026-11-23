@@ -70,7 +70,14 @@ cp "$ROOT/test/run" "$fixture/test/run"
 
 cat >"$fixture/lib/git-tools-inventory.sh" <<'EOF'
 git_tools_validate_commands() { :; }
-git_tools_commands() { printf '%s\n' one two; }
+git_tools_commands() {
+  printf '%s\n' one
+  if [[ ${DISCOVERY_FAIL:-} == 1 ]]; then
+    printf '%s\n' 'fixture command discovery failed' >&2
+    return 77
+  fi
+  printf '%s\n' two
+}
 EOF
 cat >"$fixture/support/sync-launcher-bootstrap" <<'EOF'
 #!/usr/bin/env bash
@@ -128,8 +135,20 @@ for suite in runner launcher-bootstrap install extras shell-integration \
 done
 
 state="$sandbox/state"
+discovery_state="$sandbox/discovery-state"
 output="$sandbox/output"
-mkdir "$state"
+mkdir "$state" "$discovery_state"
+discovery_status=0
+TMPDIR="$runner_tmp" RUNNER_STATE="$discovery_state" GIT_TOOLS_SKIP_SHELLCHECK=1 \
+  GIT_TOOLS_TEST_JOBS=2 DISCOVERY_FAIL=1 "$fixture/test/run" >"$output" 2>&1 ||
+  discovery_status=$?
+if [[ "$discovery_status" == 77 && ! -e "$discovery_state/runner.started" &&
+  ! -e "$discovery_state/one.started" ]] && grep -Fxq 'fixture command discovery failed' "$output"; then
+  pass "runner rejects partial command inventory before starting any suite"
+else
+  fail "runner rejects partial command inventory before starting any suite"
+fi
+
 if TMPDIR="$runner_tmp" RUNNER_STATE="$state" GIT_TOOLS_SKIP_SHELLCHECK=1 \
   GIT_TOOLS_TEST_JOBS=2 "$fixture/test/run" >"$output" 2>&1; then
   if [[ -z "$(find "$runner_tmp" -name 'git-tools-run.*' -print)" ]]; then

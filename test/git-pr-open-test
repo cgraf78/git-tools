@@ -38,6 +38,18 @@ _assert_contains() {
   fi
 }
 
+_assert_no_pr_create() {
+  local name="$1" log="$2" requests=''
+
+  if [[ -e "$log" ]] && ! requests=$(cat "$log"); then
+    _fail "$name (could not read the mock GitHub request log)"
+  elif [[ "$requests" == *'pr create'* ]]; then
+    _fail "$name"
+  else
+    _pass "$name"
+  fi
+}
+
 _assert_eq() {
   local name="$1"
   local expected="$2"
@@ -497,12 +509,7 @@ fi
 _assert_contains "pre-create remote-head race is diagnosed" \
   "feature remote head changed before pull request creation" \
   "$precreate_race_output"
-if [[ -e "$precreate_race_log" ]] &&
-  rg -q 'pr create' "$precreate_race_log"; then
-  _fail "pre-create remote-head race stops before PR creation"
-else
-  _pass "pre-create remote-head race stops before PR creation"
-fi
+_assert_no_pr_create "pre-create remote-head race stops before PR creation" "$precreate_race_log"
 
 # A base branch tracking upstream must not choose upstream as the feature push
 # target when the feature branch explicitly selects a fork.
@@ -568,11 +575,7 @@ else
 fi
 _assert_contains "pushurl race reports tracking incomplete" \
   "pushed but upstream tracking is incomplete" "$push_race_output"
-if [[ -f "$push_race_log" ]] && rg -q 'pr create' "$push_race_log"; then
-  _fail "tracking race does not create a pull request"
-else
-  _pass "tracking race does not create a pull request"
-fi
+_assert_no_pr_create "tracking race does not create a pull request" "$push_race_log"
 
 # Repository and exact-transport URL parsers reject credential material,
 # query/fragment suffixes, unsafe git-config key bytes, and invalid GitHub path

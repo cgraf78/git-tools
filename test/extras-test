@@ -228,6 +228,23 @@ if git_tools_validate_commands "$inventory_root" >/dev/null 2>&1; then
 else
   _fail 'command inventory accepts executable launchers'
 fi
+inventory_sort=$(type -P sort) || exit 1
+mkdir "$inventory_root/mock-bin"
+cat >"$inventory_root/mock-bin/sort" <<'EOF'
+#!/bin/sh
+"$INVENTORY_REAL_SORT" "$@" || exit $?
+exit 77
+EOF
+chmod +x "$inventory_root/mock-bin/sort"
+inventory_status=0
+inventory_partial=$(PATH="$inventory_root/mock-bin:$PATH" INVENTORY_REAL_SORT="$inventory_sort" \
+  git_tools_commands "$inventory_root") || inventory_status=$?
+_assert_eq 'command discovery preserves the sort failure' 77 "$inventory_status"
+_assert_eq 'command discovery emits nothing after partial sort output' '' "$inventory_partial"
+inventory_status=0
+PATH="$inventory_root/mock-bin:$PATH" INVENTORY_REAL_SORT="$inventory_sort" \
+  git_tools_validate_commands "$inventory_root" || inventory_status=$?
+_assert_eq 'launcher validation does not accept partial sort output' 77 "$inventory_status"
 ln -s git-alpha "$inventory_root/bin/git-live-link"
 ln -s missing "$inventory_root/bin/git-dangling-link"
 if git_tools_validate_commands "$inventory_root" >/dev/null 2>&1; then
@@ -245,10 +262,12 @@ else
   _pass "command inventory does not leak nullglob state"
 fi
 
+_command_listing=$(git_tools_commands "$ROOT") || exit "$?"
 _commands=()
 while IFS= read -r command; do
+  [[ -n "$command" ]] || continue
   _commands+=("$command")
-done < <(git_tools_commands "$ROOT")
+done <<<"$_command_listing"
 
 echo "=== extras ==="
 

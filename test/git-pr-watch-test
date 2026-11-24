@@ -1655,24 +1655,39 @@ _signal_case TERM 143 sleep
 
 # @brief Signal the parent while it is evaluating a particular watch helper.
 _signal_in_helper() {
-  local helper="$1" caller="$2" description="$3" status
+  local helper="$1" description="$2" probe status
 
-  cat >"$FAKE_GH_DIR/signal-env" <<'EOF'
-if [[ "${0##*/}" == git-pr-watch ]]; then
-  set -T
-  trap '
-    if [[ "${FUNCNAME[0]:-}" == "$FAKE_WATCH_SIGNAL_HELPER" &&
-      "${FUNCNAME[1]:-}" == "$FAKE_WATCH_SIGNAL_CALLER" ]]; then
-      trap - DEBUG
-      printf "%s\n" "$FAKE_WATCH_SIGNAL_HELPER" >"$FAKE_GH_DIR/signal-phase"
-      # $$ still names the watcher when the helper uses a substitution.
-      kill -TERM "$$"
-    fi' DEBUG
-fi
-EOF
-  (cd "$repo" && PATH="$bin_dir:$PATH" BASH_ENV="$FAKE_GH_DIR/signal-env" \
-    FAKE_WATCH_SIGNAL_HELPER="$helper" FAKE_WATCH_SIGNAL_CALLER="$caller" \
-    exec bash "$ROOT/bin/git-pr-watch" --wait --timeout 30 12 \
+  if ! probe=$(_tmpdir) || ! mkdir "$probe/bin" || ! ln -s "$ROOT/lib" "$probe/lib"; then
+    _fail "$description could not create the private watcher"
+    return
+  fi
+  # Instrument a private copy at an exact function boundary. Bash versions
+  # expose different DEBUG stacks. Arm the clock probe only for the interval
+  # predicate, since earlier reads use the same helper to get the time.
+  if ! awk -v helper="$helper" '
+    /^_sleep_until_next\(\) \{$/ { in_wait = 1 }
+    in_wait && /^\}/ { in_wait = 0 }
+    helper == "_test_clock" && in_wait && /^  if _test_clock / {
+      print "  local fixture_interval_clock=1"
+      armed++
+    }
+    { print }
+    $0 == helper "() {" {
+      if (helper == "_test_clock")
+        print "  if [[ ${fixture_interval_clock:-0} == 1 ]]; then"
+      print "    printf \"%s\\n\" \"$FAKE_WATCH_SIGNAL_HELPER\" >\"$FAKE_GH_DIR/signal-phase\""
+      print "    kill -TERM \"$$\""
+      if (helper == "_test_clock") print "  fi"
+      injected++
+    }
+    END {
+      if (injected != 1 || (helper == "_test_clock" && armed != 1)) exit 1
+    }' "$ROOT/bin/git-pr-watch" >"$probe/bin/git-pr-watch"; then
+    _fail "$description could not instrument $helper"
+    return
+  fi
+  (cd "$repo" && PATH="$bin_dir:$PATH" FAKE_WATCH_SIGNAL_HELPER="$helper" fixture_interval_clock=0 \
+    exec bash "$probe/bin/git-pr-watch" --wait --timeout 30 12 \
     >"$FAKE_GH_DIR/out" 2>"$FAKE_GH_DIR/err")
   status=$?
   _assert_eq "$description reaches the helper" "$helper" \
@@ -1684,12 +1699,12 @@ EOF
 
 _scenario
 _serve 1 "$(_response "$(_running_pr 12)")"
-_signal_in_helper _test_clock _sleep_until_next "TERM while checking the interval clock"
+_signal_in_helper _test_clock "TERM while checking the interval clock"
 
 _scenario
 _serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED CANCELLED 1 COMPLETED 21)")" \
   "$(_list "$(_suite 1 COMPLETED CANCELLED 1)")")")"
-_signal_in_helper _first_seen _confirmed_failure "TERM while recording a cancellation timestamp"
+_signal_in_helper _first_seen "TERM while recording a cancellation timestamp"
 
 # A rate limit while resolving a branch target is waited out in a waiting run.
 _scenario

@@ -1588,41 +1588,50 @@ _descendants() {
     }'
 }
 
-# @brief Start the watcher on a hung call, signal it, and check its status and
-# that nothing it started is left running. Runs the script itself, not through
-# `git`, so the status asserted is the script's own.
+# @brief Signal the watcher during a specific child and check its cleanup.
+# Runs the script itself, so the status asserted is the script's own.
 _signal_case() {
   local signal="$1" expected="$2" when="$3" watcher deadline children pid left=""
+  local ready_file ready_pid='' signal_path="$bin_dir:$PATH" real_sleep=''
 
   _scenario
   if [[ "$when" == call ]]; then
+    ready_file="$FAKE_GH_DIR/hang.pid"
     touch "$FAKE_GH_DIR/call-1.hang"
     printf '200\n' >"$FAKE_GH_DIR/call-1.status"
   else
+    ready_file="$FAKE_GH_DIR/sleep.pid"
     _serve 1 "$(_response "$(_running_pr 12)")"
+    real_sleep=$(type -P sleep) || return 1
+    # The call watchdog sleeps in one-second slices. Only the watcher's
+    # actual interval sleep may publish readiness for this scenario.
+    cat >"$FAKE_GH_DIR/sleep" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" =~ ^[0-9]+$ ]] && (($1 >= 15)); then
+  printf '%s\n' "$$" >"$FAKE_GH_DIR/sleep.pid"
+fi
+exec "$FAKE_WATCH_REAL_SLEEP" "$@"
+EOF
+    chmod +x "$FAKE_GH_DIR/sleep"
+    signal_path="$FAKE_GH_DIR:$signal_path"
   fi
-  (cd "$repo" && PATH="$bin_dir:$PATH" exec bash "$ROOT/bin/git-pr-watch" --wait \
+  (cd "$repo" && PATH="$signal_path" FAKE_WATCH_REAL_SLEEP="$real_sleep" \
+    exec bash "$ROOT/bin/git-pr-watch" --wait \
     --interval 15 12 >"$FAKE_GH_DIR/out" 2>"$FAKE_GH_DIR/err") &
   watcher=$!
   deadline=$((SECONDS + 20))
-  if [[ "$when" == call ]]; then
-    while [[ ! -s "$FAKE_GH_DIR/hang.pid" ]] && ((SECONDS < deadline)); do sleep 0.1; done
-  else
-    while ! grep -q 'checks-running' "$FAKE_GH_DIR/err" 2>/dev/null && ((SECONDS < deadline)); do
-      sleep 0.1
-    done
-  fi
-  # Wait until the watcher has started its child (the hung call, or the
-  # sleep between checks) so the leftover check has something to check.
-  children=$(_descendants "$watcher")
-  while [[ -z "$children" ]] && ((SECONDS < deadline)); do
+  while [[ ! -s "$ready_file" ]] && kill -0 "$watcher" 2>/dev/null && ((SECONDS < deadline)); do
     sleep 0.1
-    children=$(_descendants "$watcher")
   done
-  if [[ -n "$children" ]]; then
-    _pass "$signal during the $when: the watcher's processes were found"
+  if [[ -s "$ready_file" ]]; then
+    read -r ready_pid <"$ready_file"
+  fi
+  children=$(_descendants "$watcher")
+  if [[ "$ready_pid" =~ ^[0-9]+$ && $'\n'"$children"$'\n' == *$'\n'"$ready_pid"$'\n'* ]]; then
+    _pass "$signal during the $when: the intended child belongs to the watcher"
   else
-    _fail "$signal during the $when: the watcher's processes were found"
+    _fail "$signal during the $when: the intended child belongs to the watcher"
+    printf '  watcher %s, ready child %s, descendants: %s\n' "$watcher" "$ready_pid" "$children" >&2
   fi
   kill "-$signal" "$watcher" 2>/dev/null
   wait "$watcher"
@@ -1643,6 +1652,59 @@ _signal_case() {
 _signal_case TERM 143 call
 _signal_case HUP 129 call
 _signal_case TERM 143 sleep
+
+# @brief Signal the parent while it is evaluating a particular watch helper.
+_signal_in_helper() {
+  local helper="$1" description="$2" probe status
+
+  if ! probe=$(_tmpdir) || ! mkdir "$probe/bin" || ! ln -s "$ROOT/lib" "$probe/lib"; then
+    _fail "$description could not create the private watcher"
+    return
+  fi
+  # Instrument a private copy at an exact function boundary. Bash versions
+  # expose different DEBUG stacks. Arm the clock probe only for the interval
+  # predicate, since earlier reads use the same helper to get the time.
+  if ! awk -v helper="$helper" '
+    /^_sleep_until_next\(\) \{$/ { in_wait = 1 }
+    in_wait && /^\}/ { in_wait = 0 }
+    helper == "_test_clock" && in_wait && /^  if _test_clock / {
+      print "  local fixture_interval_clock=1"
+      armed++
+    }
+    { print }
+    $0 == helper "() {" {
+      if (helper == "_test_clock")
+        print "  if [[ ${fixture_interval_clock:-0} == 1 ]]; then"
+      print "    printf \"%s\\n\" \"$FAKE_WATCH_SIGNAL_HELPER\" >\"$FAKE_GH_DIR/signal-phase\""
+      print "    kill -TERM \"$$\""
+      if (helper == "_test_clock") print "  fi"
+      injected++
+    }
+    END {
+      if (injected != 1 || (helper == "_test_clock" && armed != 1)) exit 1
+    }' "$ROOT/bin/git-pr-watch" >"$probe/bin/git-pr-watch"; then
+    _fail "$description could not instrument $helper"
+    return
+  fi
+  (cd "$repo" && PATH="$bin_dir:$PATH" FAKE_WATCH_SIGNAL_HELPER="$helper" fixture_interval_clock=0 \
+    exec bash "$probe/bin/git-pr-watch" --wait --timeout 30 12 \
+    >"$FAKE_GH_DIR/out" 2>"$FAKE_GH_DIR/err")
+  status=$?
+  _assert_eq "$description reaches the helper" "$helper" \
+    "$(cat "$FAKE_GH_DIR/signal-phase" 2>/dev/null)"
+  _assert_eq "$description exits 143" 143 "$status"
+  _assert_eq "$description prints the result to the caller" \
+    "result: 143 reason=signal prs=12" "$(cat "$FAKE_GH_DIR/out")"
+}
+
+_scenario
+_serve 1 "$(_response "$(_running_pr 12)")"
+_signal_in_helper _test_clock "TERM while checking the interval clock"
+
+_scenario
+_serve 1 "$(_response "$(_pr 12 "$(_list "$(_run build COMPLETED CANCELLED 1 COMPLETED 21)")" \
+  "$(_list "$(_suite 1 COMPLETED CANCELLED 1)")")")"
+_signal_in_helper _first_seen "TERM while recording a cancellation timestamp"
 
 # A rate limit while resolving a branch target is waited out in a waiting run.
 _scenario

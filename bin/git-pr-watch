@@ -196,13 +196,15 @@ gt_die() {
 
 # GIT_TOOLS_TEST_PR_WATCH_CLOCK names a test clock file (test-only): when it
 # exists, _now reads it and _pause advances it instead of sleeping.
+# Use --quiet for a status-only check. Redirecting a function's stdout
+# would also redirect the caller's signal trap while the function runs.
 _test_clock() {
   local clock=${GIT_TOOLS_TEST_PR_WATCH_CLOCK:-} now
 
   [[ -n "$clock" && -f "$clock" ]] || return 1
   read -r now <"$clock" || now=""
   [[ "$now" =~ ^[0-9]+$ ]] || return 1
-  printf '%s\n' "$now"
+  [[ "${1:-}" == --quiet ]] || printf '%s\n' "$now"
 }
 
 _now() {
@@ -827,19 +829,19 @@ _push_race() {
 _first_seen_key=()
 _first_seen_at=()
 
-# @brief The server epoch when this failing check was first seen.
+# @brief Record the first sighting and return its server epoch in REPLY.
 _first_seen() {
   local key="$1" i
 
   for ((i = 0; i < ${#_first_seen_key[@]}; i++)); do
     if [[ "${_first_seen_key[$i]}" == "$key" ]]; then
-      printf '%s\n' "${_first_seen_at[$i]}"
+      REPLY=${_first_seen_at[$i]}
       return
     fi
   done
   _first_seen_key+=("$key")
   _first_seen_at+=("$_server_now")
-  printf '%s\n' "$_server_now"
+  REPLY=$_server_now
 }
 
 # @brief Judge whether this PR's failures are final.
@@ -847,7 +849,7 @@ _first_seen() {
 # inside the confirmation window. It sets a global rather than printing so the
 # first-sighting record survives (a command substitution would discard it).
 _confirmed_failure() {
-  local index="$1" i epoch class result=""
+  local index="$1" i epoch class result="" REPLY
 
   for ((i = 0; i < ${#_chk_pr[@]}; i++)); do
     [[ "${_chk_pr[$i]}" == "$index" ]] || continue
@@ -860,8 +862,8 @@ _confirmed_failure() {
     fi
     if [[ "${_chk_done[$i]}" == - ]]; then
       [[ "${_chk_id[$i]}" =~ ^[0-9]+$ ]] || continue
-      _first_seen "${_numbers[$index]}:${_chk_id[$i]}" >/dev/null
-      epoch=$(_first_seen "${_numbers[$index]}:${_chk_id[$i]}")
+      _first_seen "${_numbers[$index]}:${_chk_id[$i]}"
+      epoch=$REPLY
     else
       epoch=$(gt_iso_epoch "${_chk_done[$i]}" 2>/dev/null) || continue
     fi
@@ -1555,7 +1557,7 @@ _sleep_until_next() {
   left=$((_deadline - $(_now)))
   ((seconds <= left)) || seconds=$left
   ((seconds > 0)) || return 0
-  if _test_clock >/dev/null; then
+  if _test_clock --quiet; then
     _pause "$seconds"
     return 0
   fi
@@ -1580,7 +1582,7 @@ _rate_wait() {
 }
 
 _jitter() {
-  if _test_clock >/dev/null; then
+  if _test_clock --quiet; then
     printf '0\n'
   else
     printf '%s\n' $((RANDOM % (_jitter_max + 1)))

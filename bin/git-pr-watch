@@ -116,7 +116,7 @@ _on_exit() {
   # the state files short. What is left is bounded and makes no network call.
   trap '' INT TERM HUP PIPE
   set +e
-  [[ -z "${GT_PR_SNAPSHOT_TMP:-}" ]] || rm -rf -- "$GT_PR_SNAPSHOT_TMP"
+  gt_pr_clear_gh_capture
   [[ -z "${GT_PR_ACTIONS_CACHE:-}" ]] || rm -rf -- "$GT_PR_ACTIONS_CACHE"
   [[ "$_result_done" == 1 ]] || status=2
   [[ -z "$_state_dir" ]] || _state_finish "$status"
@@ -129,7 +129,7 @@ _on_exit() {
 
 # shellcheck disable=SC2329 # invoked by signal traps
 _on_signal() {
-  local pids
+  local pid pids
 
   # PIPE too: with the output's reader gone, printing the result line would
   # otherwise kill the shell with SIGPIPE, losing the signal's exit status
@@ -137,11 +137,19 @@ _on_signal() {
   trap '' INT TERM HUP PIPE
   # A failed write (EPIPE) must not end the handler early under errexit.
   set +e
-  # Background jobs: a gh call, its watchdog, or the sleep between checks.
+  # The snapshot call and its watchdog own separate process groups. The
+  # interval sleep is a single process. Stop every job, allow a short grace
+  # period, then kill anything still alive and reap our direct children.
   pids=$(jobs -p 2>/dev/null) || pids=""
-  # shellcheck disable=SC2086 # one pid per word
-  [[ -z "$pids" ]] || kill -TERM $pids 2>/dev/null || true
-  [[ -z "${GT_PR_SNAPSHOT_TMP:-}" ]] || rm -rf -- "$GT_PR_SNAPSHOT_TMP"
+  for pid in $pids; do
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  done
+  [[ -z "$pids" ]] || sleep 1
+  for pid in $pids; do
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+  done
+  gt_pr_clear_gh_capture
   [[ -z "${GT_PR_ACTIONS_CACHE:-}" ]] || rm -rf -- "$GT_PR_ACTIONS_CACHE"
   # The EXIT trap still runs after `exit` below and finishes the state files.
   _result_done=1
@@ -315,18 +323,6 @@ type -P gh >/dev/null 2>&1 ||
 gh() {
   gt_pr_gh "$@"
 }
-
-# This command only reads, so it may use the cached repository identity: most
-# runs then make no network call before the query itself, which classifies
-# authentication and single sign-on failures on its own.
-_toplevel=$(git rev-parse --show-toplevel 2>/dev/null) || _toplevel=""
-if [[ -n "$_toplevel" ]]; then
-  gt_load_current_repo_identity_cached "$_toplevel" 2>/dev/null ||
-    _fail environment "could not resolve the current GitHub repository"
-else
-  gt_load_current_repo_identity 2>/dev/null ||
-    _fail environment "could not resolve the current GitHub repository"
-fi
 
 # @brief Stop on a response class that retrying cannot fix.
 _fail_on_class() {
@@ -608,6 +604,22 @@ _set_call_timeout() {
   ((left <= _call_timeout)) || left=$_call_timeout
   ((left >= _call_floor)) || left=$_call_floor
   GT_PR_CALL_TIMEOUT=$left
+}
+
+# @brief Fetch the repository identity without hiding the gh job in a subshell.
+_capture_repo_identity() {
+  local destination="$1" identity_body rc=0
+  shift
+
+  _set_call_timeout
+  if gt_pr_capture_gh "$@" && [[ ! -e "$GT_PR_SNAPSHOT_TMP/timed-out" ]]; then
+    identity_body=$(cat "$GT_PR_SNAPSHOT_TMP/out") || rc=$?
+  else
+    rc=1
+  fi
+  gt_pr_clear_gh_capture
+  ((rc == 0)) || return "$rc"
+  printf -v "$destination" '%s' "$identity_body"
 }
 
 # @brief Replace a checks-free chunk's response with classifier records whose
@@ -1591,6 +1603,20 @@ _jitter() {
 
 _started=$(_now)
 _deadline=$((_started + _cap))
+# Even one-shot queries must be interruptible, without acquiring a deadline.
+# shellcheck disable=SC2034 # read by gt_pr_capture_gh in the shared library
+GT_PR_CALL_ASYNC=1
+
+# Read-only watchers can reuse the cached repository identity. Cold lookups
+# use the same supervision and timeout policy as subsequent snapshot calls.
+_toplevel=$(git rev-parse --show-toplevel 2>/dev/null) || _toplevel=""
+if [[ -n "$_toplevel" ]]; then
+  gt_load_current_repo_identity_cached "$_toplevel" _capture_repo_identity 2>/dev/null ||
+    _fail environment "could not resolve the current GitHub repository"
+else
+  gt_load_current_repo_identity _capture_repo_identity 2>/dev/null ||
+    _fail environment "could not resolve the current GitHub repository"
+fi
 _failed_checks=0
 _rate_reset=""
 _rate_date=""

@@ -344,14 +344,22 @@ gt_pr_repo_identity_from_url() {
   printf '%s\n' "$GT_PR_URL_IDENTITY"
 }
 
-# @brief Print the raw gh-resolved repository identity TSV for this checkout.
-_gt_fetch_repo_identity_tsv() {
-  (
+# @brief Capture the raw gh-resolved repository identity into a caller variable.
+# An optional capture function runs in the caller so it can supervise gh
+# jobs and handle signals while waiting for them.
+_gt_fetch_repo_identity() {
+  local destination="$1" capture="${2:-}" identity_tsv
+  local -a args=(repo view --json 'nameWithOwner,url' --jq '[.nameWithOwner,.url] | @tsv')
+
+  if [[ -n "$capture" ]]; then
+    "$capture" "$destination" "${args[@]}"
+    return
+  fi
+  identity_tsv=$(
     unset GH_REPO GH_HOST
-    gh repo view \
-      --json nameWithOwner,url \
-      --jq '[.nameWithOwner,.url] | @tsv'
-  )
+    gh "${args[@]}"
+  ) || return 1
+  printf -v "$destination" '%s' "$identity_tsv"
 }
 
 # @brief Validate one raw identity TSV record and publish the globals.
@@ -376,7 +384,7 @@ gt_load_current_repo_identity() {
   local output
 
   [[ -z "${GT_CURRENT_REPO_IDENTITY:-}" ]] || return 0
-  output=$(_gt_fetch_repo_identity_tsv) || return 1
+  _gt_fetch_repo_identity output "${1:-}" || return 1
   _gt_apply_repo_identity_tsv "$output"
 }
 
@@ -395,7 +403,7 @@ GT_REPO_IDENTITY_CACHE_TTL=3600
 # filename collision cannot poison another repository. Only successful
 # resolutions are cached; every cache failure falls back to live resolution.
 gt_load_current_repo_identity_cached() {
-  local repo_root="$1"
+  local repo_root="$1" capture="${2:-}"
   local cache_base cache_dir remotes key_material key_hash cache_file now
   local output
 
@@ -405,18 +413,18 @@ gt_load_current_repo_identity_cached() {
     cache_base="$HOME/.cache"
   fi
   if [[ -z "$cache_base" || "$repo_root" == *$'\n'* ]]; then
-    gt_load_current_repo_identity
+    gt_load_current_repo_identity "$capture"
     return "$?"
   fi
   remotes=$(git remote -v 2>/dev/null | LC_ALL=C sort -u) || {
-    gt_load_current_repo_identity
+    gt_load_current_repo_identity "$capture"
     return "$?"
   }
   key_material="$repo_root"$'\n'"$remotes"
   key_hash=$(printf '%s' "$key_material" | cksum) || key_hash=""
   key_hash=${key_hash%% *}
   [[ "$key_hash" =~ ^[0-9]+$ ]] || {
-    gt_load_current_repo_identity
+    gt_load_current_repo_identity "$capture"
     return "$?"
   }
   cache_dir="$cache_base/git-tools/repo-identity"
@@ -428,7 +436,7 @@ gt_load_current_repo_identity_cached() {
     _gt_apply_repo_identity_tsv "$output"
     return "$?"
   fi
-  output=$(_gt_fetch_repo_identity_tsv) || return 1
+  _gt_fetch_repo_identity output "$capture" || return 1
   _gt_apply_repo_identity_tsv "$output" || return 1
   if [[ "$now" =~ ^[0-9]+$ ]] &&
     { [[ -d "$cache_dir" ]] || mkdir -p "$cache_dir" 2>/dev/null; }; then

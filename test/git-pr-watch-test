@@ -106,6 +106,11 @@ case "$1 ${2:-}" in
     exit 0
     ;;
   "repo view")
+    if [[ -f "$dir/identity.hang" ]]; then
+      trap '' TERM
+      printf '%s\n' "$$" >"$dir/hang.pid"
+      exec sleep 12
+    fi
     printf 'example/repo\thttps://github.test/example/repo\n'
     exit 0
     ;;
@@ -195,9 +200,15 @@ else
   fi
 fi
 
-# A hanging call: record this process for the leftover-process check, then
+# A hanging call: record its processes for the leftover-process checks, then
 # stay silent until killed.
+if [[ -f "$base.child-hang" ]]; then
+  trap 'exit 143' TERM
+  bash -c 'trap "" TERM; printf "%s\n" "$$" >"$1"; exec sleep 30' _ "$dir/child.pid" &
+  wait "$!"
+fi
 if [[ -f "$base.hang" ]]; then
+  [[ ! -f "$base.ignore-term" ]] || trap '' TERM
   printf '%s\n' "$$" >"$dir/hang.pid"
   exec sleep 30
 fi
@@ -1523,7 +1534,7 @@ _assert_eq "a rate limit is waited out" 0 "$status"
 _assert_eq "the wait matched the reset" 1120 "$(cat "$_clock")"
 
 _scenario
-touch "$FAKE_GH_DIR/call-1.hang"
+touch "$FAKE_GH_DIR/call-1.hang" "$FAKE_GH_DIR/call-1.ignore-term"
 printf '200\n' >"$FAKE_GH_DIR/call-1.status"
 _serve 2 "$(_response "$(_green_pr 12)")"
 _clock=$(_tmpdir)/clock
@@ -1535,9 +1546,9 @@ out=$(GIT_TOOLS_TEST_PR_WATCH_CALL_TIMEOUT=1 GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_cl
 status=$?
 # The fake's hang lasts 30 seconds; the watchdog must cut it off well before.
 if ((SECONDS - _started < 15)); then
-  _pass "the watchdog cut the hung call off"
+  _pass "the watchdog cut the TERM-resistant call off"
 else
-  _fail "the watchdog cut the hung call off"
+  _fail "the watchdog cut the TERM-resistant call off"
 fi
 _assert_eq "a call that hangs is cut off and retried" 0 "$status"
 _assert_eq "the watchdog path scrubs gh's environment" 0 \
@@ -1591,23 +1602,48 @@ _descendants() {
 # @brief Signal the watcher during a specific child and check its cleanup.
 # Runs the script itself, so the status asserted is the script's own.
 _signal_case() {
-  local signal="$1" expected="$2" when="$3" watcher deadline children pid left=""
-  local ready_file ready_pid='' signal_path="$bin_dir:$PATH" real_sleep=''
+  local signal="$1" expected="$2" when="$3" resistance="${4:-}" watcher deadline children pid left=""
+  local ready_file ready_pid='' signal_path="$bin_dir:$PATH" real_sleep='' real_mktemp='' prs=12 options=$-
+  local -a watch_options=(--wait --interval 15)
 
   _scenario
-  if [[ "$when" == call ]]; then
+  mkdir "$FAKE_GH_DIR/tmp" || return 1
+  if [[ "$when" == capture ]]; then
+    ready_file="$FAKE_GH_DIR/mktemp.pid"
+    prs=''
+    real_mktemp=$(type -P mktemp) || return 1
+    cat >"$FAKE_GH_DIR/mktemp" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" != *git-pr-snapshot* ]]; then
+  exec "$FAKE_WATCH_REAL_MKTEMP" "$@"
+fi
+path=$("$FAKE_WATCH_REAL_MKTEMP" "$@") || exit
+printf '%s\n' "$$" >"$FAKE_GH_DIR/mktemp.pid"
+deadline=$((SECONDS + 10))
+while [[ ! -e "$FAKE_GH_DIR/release-mktemp" ]] && ((SECONDS < deadline)); do sleep 0.01; done
+printf '%s\n' "$path"
+EOF
+    chmod +x "$FAKE_GH_DIR/mktemp"
+    signal_path="$FAKE_GH_DIR:$signal_path"
+  elif [[ "$when" == identity ]]; then
+    ready_file="$FAKE_GH_DIR/hang.pid"
+    touch "$FAKE_GH_DIR/identity.hang"
+    prs=''
+  elif [[ "$when" == call || "$when" == one-shot ]]; then
     ready_file="$FAKE_GH_DIR/hang.pid"
     touch "$FAKE_GH_DIR/call-1.hang"
+    [[ "$resistance" != hard ]] || touch "$FAKE_GH_DIR/call-1.ignore-term"
     printf '200\n' >"$FAKE_GH_DIR/call-1.status"
+    [[ "$when" != one-shot ]] || watch_options=()
   else
     ready_file="$FAKE_GH_DIR/sleep.pid"
     _serve 1 "$(_response "$(_running_pr 12)")"
     real_sleep=$(type -P sleep) || return 1
-    # The call watchdog sleeps in one-second slices. Only the watcher's
-    # actual interval sleep may publish readiness for this scenario.
+    # The interval is 15 seconds plus up to 10 seconds of jitter. The
+    # watchdog is given a separate deadline so only the interval qualifies.
     cat >"$FAKE_GH_DIR/sleep" <<'EOF'
 #!/usr/bin/env bash
-if [[ "${1:-}" =~ ^[0-9]+$ ]] && (($1 >= 15)); then
+if [[ "${1:-}" =~ ^[0-9]+$ ]] && (($1 >= 15 && $1 <= 25)); then
   printf '%s\n' "$$" >"$FAKE_GH_DIR/sleep.pid"
 fi
 exec "$FAKE_WATCH_REAL_SLEEP" "$@"
@@ -1615,10 +1651,19 @@ EOF
     chmod +x "$FAKE_GH_DIR/sleep"
     signal_path="$FAKE_GH_DIR:$signal_path"
   fi
+  if [[ "$when" == capture ]]; then
+    # Model terminal cancellation for both the watcher and the process
+    # creating its temporary directory. Own a separate fixture group.
+    set +m
+    set -m
+  fi
   (cd "$repo" && PATH="$signal_path" FAKE_WATCH_REAL_SLEEP="$real_sleep" \
-    exec bash "$ROOT/bin/git-pr-watch" --wait \
-    --interval 15 12 >"$FAKE_GH_DIR/out" 2>"$FAKE_GH_DIR/err") &
+    FAKE_WATCH_REAL_MKTEMP="$real_mktemp" TMPDIR="$FAKE_GH_DIR/tmp" \
+    XDG_CACHE_HOME="$FAKE_GH_DIR/cache" GIT_TOOLS_TEST_PR_WATCH_CALL_TIMEOUT=60 \
+    exec bash "$ROOT/bin/git-pr-watch" ${watch_options[@]+"${watch_options[@]}"} \
+    12 >"$FAKE_GH_DIR/out" 2>"$FAKE_GH_DIR/err") &
   watcher=$!
+  [[ "$options" == *m* ]] || set +m
   deadline=$((SECONDS + 20))
   while [[ ! -s "$ready_file" ]] && kill -0 "$watcher" 2>/dev/null && ((SECONDS < deadline)); do
     sleep 0.1
@@ -1633,25 +1678,97 @@ EOF
     _fail "$signal during the $when: the intended child belongs to the watcher"
     printf '  watcher %s, ready child %s, descendants: %s\n' "$watcher" "$ready_pid" "$children" >&2
   fi
-  kill "-$signal" "$watcher" 2>/dev/null
+  if [[ "$when" == capture ]]; then
+    kill "-$signal" -- "-$watcher" 2>/dev/null
+    : >"$FAKE_GH_DIR/release-mktemp"
+  else
+    kill "-$signal" "$watcher" 2>/dev/null
+  fi
+  deadline=$((SECONDS + 8))
+  while kill -0 "$watcher" 2>/dev/null && ((SECONDS < deadline)); do sleep 0.1; done
+  if kill -0 "$watcher" 2>/dev/null; then
+    _fail "$signal during the $when did not stop the watcher promptly"
+    # Only the fixture tree is ours. Stop it even if the readiness marker
+    # was missing or another fixture process stopped the watcher exiting.
+    for pid in $(_descendants "$watcher") $children; do
+      kill -KILL "$pid" 2>/dev/null
+    done
+    kill -KILL "$watcher" 2>/dev/null
+  fi
   wait "$watcher"
   _assert_eq "$signal during the $when exits $expected" "$expected" "$?"
   _assert_contains "$signal during the $when reports the signal" \
-    "result: $expected reason=signal prs=12" "$(cat "$FAKE_GH_DIR/out")"
+    "result: $expected reason=signal prs=$prs" "$(cat "$FAKE_GH_DIR/out")"
   deadline=$((SECONDS + 10))
   for pid in $children; do
     while kill -0 "$pid" 2>/dev/null && ((SECONDS < deadline)); do sleep 0.1; done
     if kill -0 "$pid" 2>/dev/null; then
       left="$left $pid"
-      kill "$pid" 2>/dev/null
+      kill -KILL "$pid" 2>/dev/null
     fi
   done
-  _assert_eq "$signal during the $when leaves nothing running" "" "$left"
+  _assert_eq "$signal during the $when${resistance:+ ($resistance)} leaves nothing running" "" "$left"
+  if [[ "$when" == capture ]]; then
+    _assert_eq "$signal during capture leaves no temporary directory" "" "$(ls -A "$FAKE_GH_DIR/tmp")"
+  fi
 }
 
 _signal_case TERM 143 call
+_signal_case TERM 143 call hard
 _signal_case HUP 129 call
 _signal_case TERM 143 sleep
+_signal_case TERM 143 identity
+_signal_case TERM 143 one-shot hard
+_signal_case TERM 143 capture
+
+_scenario
+touch "$FAKE_GH_DIR/identity.hang"
+_started=$SECONDS
+out=$(XDG_CACHE_HOME="$FAKE_GH_DIR/cache" GIT_TOOLS_TEST_PR_WATCH_CALL_TIMEOUT=1 \
+  PATH="$bin_dir:$PATH" git -C "$repo" pr-watch --wait --timeout 0 12 2>/dev/null)
+status=$?
+_assert_eq "a timed-out identity lookup exits with a repository error" 2 "$status"
+_assert_contains "a timed-out identity lookup records the repository error" \
+  "result: 2 reason=environment prs=" "$out"
+if ((SECONDS - _started < 8)); then
+  _pass "the watchdog cut the cold identity lookup off"
+else
+  _fail "the watchdog cut the cold identity lookup off"
+fi
+
+# A leader may exit on TERM while a descendant in its group ignores TERM.
+# The watchdog needs to finish escalation even after wait reaps that leader.
+_scenario
+touch "$FAKE_GH_DIR/call-1.child-hang"
+printf '200\n' >"$FAKE_GH_DIR/call-1.status"
+_serve 2 "$(_response "$(_green_pr 12)")"
+_clock=$(_tmpdir)/clock
+printf '1000\n' >"$_clock"
+out=$(GIT_TOOLS_TEST_PR_WATCH_CALL_TIMEOUT=1 GIT_TOOLS_TEST_PR_WATCH_CLOCK="$_clock" \
+  PATH="$bin_dir:$PATH" git -C "$repo" pr-watch --wait 12 2>/dev/null)
+status=$?
+_assert_eq "a call with a TERM-resistant descendant times out and is retried" 0 "$status"
+_hang_pid=$(cat "$FAKE_GH_DIR/child.pid" 2>/dev/null) || _hang_pid=""
+# A killed grandchild can await reaping by the system's init. The watcher
+# cannot reap a process it did not start, but the process must be stopped.
+_hang_state=""
+if [[ "$_hang_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$_hang_pid" 2>/dev/null; then
+  if [[ -r "/proc/$_hang_pid/stat" ]]; then
+    { IFS= read -r _hang_details <"/proc/$_hang_pid/stat"; } 2>/dev/null || _hang_details=unknown
+    _hang_details=${_hang_details##*) }
+    _hang_state=${_hang_details%% *}
+  else
+    _hang_state=$(ps -p "$_hang_pid" -o stat= 2>/dev/null) || _hang_state=unknown
+  fi
+fi
+if [[ "$_hang_pid" =~ ^[1-9][0-9]*$ && (-z "$_hang_state" || "$_hang_state" == *Z*) ]]; then
+  _pass "the watchdog stopped the TERM-resistant descendant"
+else
+  _fail "the watchdog stopped the TERM-resistant descendant (pid: $_hang_pid state: $_hang_state)"
+  if [[ "$_hang_pid" =~ ^[1-9][0-9]*$ ]]; then
+    kill -KILL "$_hang_pid" 2>/dev/null
+  fi
+fi
 
 # @brief Signal the parent while it is evaluating a particular watch helper.
 _signal_in_helper() {

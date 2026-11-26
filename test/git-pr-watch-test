@@ -1602,7 +1602,7 @@ _descendants() {
 # @brief Signal the watcher during a specific child and check its cleanup.
 # Runs the script itself, so the status asserted is the script's own.
 _signal_case() {
-  local signal="$1" expected="$2" when="$3" resistance="${4:-}" watcher deadline children pid left=""
+  local signal="$1" expected="$2" when="$3" resistance="${4:-}" watcher deadline children pid left="" watcher_status=""
   local ready_file ready_pid='' signal_path="$bin_dir:$PATH" real_sleep='' real_mktemp='' prs=12 options=$-
   local -a watch_options=(--wait --interval 15)
 
@@ -1664,13 +1664,45 @@ EOF
     12 >"$FAKE_GH_DIR/out" 2>"$FAKE_GH_DIR/err") &
   watcher=$!
   [[ "$options" == *m* ]] || set +m
-  deadline=$((SECONDS + 20))
+  # The ready marker is written only once the watcher reaches the call, after
+  # its cold identity lookup and target resolution. That startup is a dozen
+  # process spawns, and on the Termux emulator it can take longer than the
+  # old 20s bound: the TERM-during-the-call case in run 45779464674 was
+  # signalled while the watcher was still resolving its identity, so the
+  # ready child was empty and the result line had no targets yet. (Every
+  # case pays the same cold lookup; that run's first case met the slowest
+  # emulator load.) The 60s bound is the ceiling the watcher itself allows:
+  # the identity lookup is a supervised call under the same 60s watchdog, so
+  # a watcher that has not reached the snapshot call ~60s after spawn is
+  # within seconds of its own identity timeout and can never reach the call;
+  # waiting longer is pointless.
+  deadline=$((SECONDS + 60))
   while [[ ! -s "$ready_file" ]] && kill -0 "$watcher" 2>/dev/null && ((SECONDS < deadline)); do
     sleep 0.1
   done
-  if [[ -s "$ready_file" ]]; then
-    read -r ready_pid <"$ready_file"
+  if [[ ! -s "$ready_file" ]]; then
+    # Every assertion below only holds once the watcher is in the call: the
+    # ready child is the hanging call, and the result line names the targets
+    # resolved before it. Signalling a watcher still in startup would fail
+    # them for a reason unrelated to signal handling, so stop here with what
+    # is known instead of reporting the downstream confusion.
+    if kill -0 "$watcher" 2>/dev/null; then
+      _fail "$signal during the $when: the watcher never reached the call"
+      kill -KILL "$watcher" 2>/dev/null || true
+      wait "$watcher" 2>/dev/null || true
+    else
+      # The watcher died before reaching the call: its own exit status and
+      # stderr are the cause, not the wait.
+      wait "$watcher" 2>/dev/null
+      watcher_status=$?
+      _fail "$signal during the $when: the watcher died before reaching the call (exit $watcher_status)"
+      if [[ -s "$FAKE_GH_DIR/err" ]]; then
+        tail -n 5 "$FAKE_GH_DIR/err" | sed 's/^/  /' >&2
+      fi
+    fi
+    return 1
   fi
+  read -r ready_pid <"$ready_file"
   children=$(_descendants "$watcher")
   if [[ "$ready_pid" =~ ^[0-9]+$ && $'\n'"$children"$'\n' == *$'\n'"$ready_pid"$'\n'* ]]; then
     _pass "$signal during the $when: the intended child belongs to the watcher"

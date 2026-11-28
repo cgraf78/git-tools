@@ -1602,7 +1602,7 @@ _descendants() {
 # @brief Signal the watcher during a specific child and check its cleanup.
 # Runs the script itself, so the status asserted is the script's own.
 _signal_case() {
-  local signal="$1" expected="$2" when="$3" resistance="${4:-}" watcher deadline children pid left="" watcher_status=""
+  local signal="$1" expected="$2" when="$3" resistance="${4:-}" watcher deadline ready_bound children pid left="" watcher_status=""
   local ready_file ready_pid='' signal_path="$bin_dir:$PATH" real_sleep='' real_mktemp='' prs=12 options=$-
   local -a watch_options=(--wait --interval 15)
 
@@ -1675,8 +1675,21 @@ EOF
   # the identity lookup is a supervised call under the same 60s watchdog, so
   # a watcher that has not reached the snapshot call ~60s after spawn is
   # within seconds of its own identity timeout and can never reach the call;
-  # waiting longer is pointless.
-  deadline=$((SECONDS + 60))
+  # waiting longer is pointless. The sleep case is the exception: its
+  # marker is the interval sleep, which the watcher reaches only after a
+  # second supervised call (the snapshot) completes, so its bound is the
+  # sum of both ceilings plus the uncapped spawn overhead on the path:
+  # 60s for the identity lookup, 60s for the snapshot, and ~30s for the
+  # ~20 process spawns in between (startup, target resolution, the calls'
+  # own setup), which run 45779464674 measured at over 1.3s per spawn on
+  # the emulator. The TERM-during-the-sleep case in run 46123694154 failed
+  # on the 60s bound while its watcher was still alive and working through
+  # those two calls on the Termux emulator. This bound assumes each
+  # supervised call succeeds on its first attempt: a timed-out snapshot
+  # retried up to three times would run past it.
+  ready_bound=60
+  [[ "$when" == sleep ]] && ready_bound=150
+  deadline=$((SECONDS + ready_bound))
   while [[ ! -s "$ready_file" ]] && kill -0 "$watcher" 2>/dev/null && ((SECONDS < deadline)); do
     sleep 0.1
   done
@@ -1688,6 +1701,18 @@ EOF
     # is known instead of reporting the downstream confusion.
     if kill -0 "$watcher" 2>/dev/null; then
       _fail "$signal during the $when: the watcher never reached the call"
+      # Show how far the watcher got: the fake-gh log records every call it
+      # made, so the next slow-start failure says whether the watcher was
+      # still in its identity lookup or already in the snapshot call. Only
+      # the first line of each invocation is shown: the log records the
+      # whole command line, and a GraphQL call's --jq program spans many
+      # lines of its own.
+      if [[ -s "$FAKE_GH_DIR/log" ]]; then
+        grep -E '^(repo view|api |auth status|--version)' "$FAKE_GH_DIR/log" |
+          tail -n 5 | sed 's/^/  gh: /' >&2
+      else
+        printf '  (no gh calls logged)\n' >&2
+      fi
       kill -KILL "$watcher" 2>/dev/null || true
       wait "$watcher" 2>/dev/null || true
     else
